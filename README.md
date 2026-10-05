@@ -47,8 +47,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.1/scripts/install.sh
-head -40 install.sh && bash install.sh v0.2.1
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.2/scripts/install.sh
+head -40 install.sh && bash install.sh v0.2.2
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -81,7 +81,7 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 
 ## Tests
 
-`make test` runs 37 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs 40 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 

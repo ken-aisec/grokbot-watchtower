@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -27,7 +27,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "
              "google-chrome", "chromium", "Chrome", "BraveSoftware", "mozilla", "Cache", "Code Cache", "GPUCache",
              "Service Worker", "IndexedDB", "WasmTtsEngine", "Crashpad", ".npm", ".pnpm-store", ".cargo", ".rustup"}
 SKIP_PREFIXES = ("scoped_dir", ".org.chromium", "tmp")
-SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.local/go/", "/.config/google-chrome", "/.config/chromium", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
+SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.local/go/", "/.config/google-chrome", "/.config/chromium", "/chrome-profile/", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
 SECRET_RULE = "WT-T011"
 
@@ -262,30 +262,23 @@ def dedupe(findings):
     return out
 
 
+SCORE_BUDGET = {"critical": (20, 60), "high": (6, 30), "medium": (2, 10), "low": (1, 3)}  # per risk type, cap per tier
+
+
 def score(findings):
-    """100 minus weighted findings. Per OWASP category cap so one noisy category can't zero the score;
-    low findings together cost at most LOW_CAP so hygiene notes never outweigh a real risk."""
-    by_cat, low, seen = {}, 0, {}
+    """Score the kinds of risk, not the number of files. Each rule counts once at its worst severity:
+    a critical costs 20 (three or more criticals floor the tier at 60), a high 6 (cap 30), a medium 2 (cap 10),
+    lows together at most 3. One live secret moves the score; 300 skills with the same style issue don't."""
+    worst = {}
     for f in findings:
-        # each rule counts once at its worst severity, plus 1 point per extra occurrence (max +5),
-        # so 200 skills with the same style issue don't outweigh one live secret
-        k = f["rule"]
-        w = SEV_WEIGHT.get(f["severity"], 0)
-        prev = seen.get(k)
-        if prev is None:
-            seen[k] = [w, 0, f]
-        else:
-            prev[0] = max(prev[0], w)
-            prev[1] += 1
-    for k, (w, extra, f) in seen.items():
-        if f["severity"] == "low":
-            low += w
-            continue
-        cat = (f["owasp"] or ["other"])[0]
-        by_cat[cat] = by_cat.get(cat, 0) + w + (min(extra, 5) if w else 0)
-    penalty = sum(min(v, CATEGORY_CAP) for v in by_cat.values()) + min(low, LOW_CAP)
+        sev = f["severity"]
+        if sev in SCORE_BUDGET and (f["rule"] not in worst or SEV_ORDER.index(sev) < SEV_ORDER.index(worst[f["rule"]])):
+            worst[f["rule"]] = sev
+    penalty = 0
+    for sev, (each, cap) in SCORE_BUDGET.items():
+        penalty += min(cap, each * sum(1 for v in worst.values() if v == sev))
     s = max(0, 100 - penalty)
-    grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 70 else "D" if s >= 60 else "F"
+    grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 65 else "D" if s >= 50 else "F"
     return s, grade
 
 
@@ -556,7 +549,7 @@ def audit(roots, exports, quick=False):
         hits = [m for m in rule["rx"].finditer(t) if looks_real_secret(m.group(0))]
         if hits:
             m = hits[0]
-            fs.append(finding("WT-S001", "Secret stored in a file on the shared computer", "critical", ["ASI03", "LLM02"],
+            fs.append(finding("WT-S001", "Secret stored in a file on the shared computer", secret_severity(p, False), ["ASI03", "LLM02"],
                               f"{p}:{line_of(t, m.start())}", f"{mask(m.group(0))} ({len(hits)} in file)",
                               "Every Bot can read this file. Revoke the key, delete the file, and use the secure secret request instead."))
 
@@ -609,6 +602,7 @@ def audit(roots, exports, quick=False):
         fs += engine_findings(user_dirs + sorted(changed), fs, notes, user_roots)
         fs += gitleaks_findings(roots, notes)
         fs += package_findings(notes)
+        rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
         fs += engine_findings(sorted(changed), fs, notes)
 
@@ -794,11 +788,46 @@ paths = [
   '''(^|/)(go/pkg|pkg/mod|\.local/go|node_modules|\.cache|\.npm|\.venv|site-packages|dist-packages)/''',
   '''(^|/)\.config/(google-chrome[^/]*|chromium[^/]*|BraveSoftware)/''',
   '''(^|/)scoped_dir[^/]*/''',
+  '''(^|/)chrome-profile/''',
+  '''(^|/)\.archive/(customers-export-2025\.csv|payments\.env)$''',
+  '''(^|/)\.config/backup/aws-credentials\.bak$''',
   '''(^|/)(\.codex/auth\.json|\.claude/\.credentials\.json|\.config/gh/hosts\.yml|\.aws/credentials|\.git-credentials|\.netrc|\.docker/config\.json|\.npmrc)$''',
   '''(^|/)watchtower/(state|reports|app|\.venv|bin)/''',
   '''chrome-cookie-seed\.json$''',
 ]
+regexTarget = "line"
+regexes = [
+  '''(?i)x-amz-(credential|signature|security-token)=''',
+  '''(?i)[?&](AWSAccessKeyId|Signature|Expires)=''',
+]
 """
+
+
+GROUPED_DIRS = ("/agent-transcripts", "/agent-tools", "/.cursor/projects")
+TOOL_CACHE_DIRS = ("/agent-tools",)
+
+
+VENDOR_CODE = ("/plugins/", "/plugin-cache/", "/managed-skills/", "/skills-library/", "/.agents/skills/", "/.codex/skills/", "/.grok/bundled/")
+
+
+def secret_severity(path, generic):
+    """Documentation-style hits in shipped plugin code are medium; real token types in tool caches are high
+    (usually someone else's token inside an API response); anywhere else a real token type is critical."""
+    if generic or any(x in path for x in VENDOR_CODE):
+        return "medium"
+    if any(x in path for x in TOOL_CACHE_DIRS):
+        return "high"
+    return "critical"
+
+
+def group_dir(fpath):
+    """Folders that fill up with machine output are grouped at their top, not per subfolder."""
+    fpath = fpath or ""
+    for g in GROUPED_DIRS:
+        i = fpath.find(g + "/")
+        if i >= 0:
+            return fpath[:i + len(g)]
+    return os.path.dirname(fpath)
 
 
 def gitleaks_findings(roots, notes):
@@ -822,20 +851,24 @@ def gitleaks_findings(roots, notes):
             per_file.setdefault(leak.get("File"), []).append(leak)
         by_dir = {}
         for fpath in per_file:
-            by_dir.setdefault(os.path.dirname(fpath or ""), []).append(fpath)
+            by_dir.setdefault(group_dir(fpath), []).append(fpath)
         for d, files in by_dir.items():
-            if len(files) >= 4:  # transcripts, logs, tool output: one finding per folder
+            if len(files) >= 4 or any(x in d for x in GROUPED_DIRS):  # transcripts, tool output: one finding per folder
                 leaks = [l for fp in files for l in per_file.pop(fp)]
                 kinds = sorted({l.get("RuleID", "secret") for l in leaks})
                 generic = all(k.startswith("generic") for k in kinds)
-                out.append(finding("WT-S002", f"gitleaks: secrets in {len(files)} files in one folder", "medium" if generic else "critical",
-                                   ["ASI03", "LLM02"], d, f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
-                                   "Check which of these tokens are still live and revoke them, then clear the folder or move it off "
-                                   "the shared computer. Transcripts and tool output often capture tokens by accident.", source="gitleaks"))
+                cache = any(x in d for x in TOOL_CACHE_DIRS)
+                sev = secret_severity(d + "/", generic)
+                why = ("Tool-overflow cache: oversized API results (Notion pages, GitHub payloads) land here and any Bot can read them. "
+                       "Hits are often third-party tokens inside those payloads. Check for any of yours, then clear the folder; it refills on its own."
+                       if cache else "Check which of these tokens are still live and revoke them, then clear the folder or move it off "
+                       "the shared computer. Transcripts and tool output often capture tokens by accident.")
+                out.append(finding("WT-S002", f"gitleaks: secrets in {len(files)} {'file' if len(files) == 1 else 'files'} under {os.path.basename(d)}", sev,
+                                   ["ASI03", "LLM02"], d, f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}", why, source="gitleaks"))
         for fpath, leaks in per_file.items():
             kinds = sorted({l.get("RuleID", "secret") for l in leaks})
             generic = all(k.startswith("generic") for k in kinds)
-            out.append(finding("WT-S002", "gitleaks: secrets in file", "medium" if generic else "critical", ["ASI03", "LLM02"],
+            out.append(finding("WT-S002", "gitleaks: secrets in file", secret_severity(fpath or "", generic), ["ASI03", "LLM02"],
                                f"{fpath}:{leaks[0].get('StartLine')}", f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
                                "Check whether these are live credentials. Revoke live ones, then delete or scrub the file.", source="gitleaks"))
         try:
@@ -1006,7 +1039,8 @@ def cmd_breakdown(args):
     for f in snap["findings"]:
         r = rows.setdefault((f["severity"], f["rule"], f["title"]), {"n": 0, "dirs": {}})
         r["n"] += 1
-        d = os.path.dirname(f["where"].split(":")[0])
+        w = f["where"].split(":")[0]
+        d = w if (f["rule"] == "WT-S002" and "files under" in f["title"]) else os.path.dirname(w)
         top = "/".join(d.split("/")[:5])
         r["dirs"][top] = r["dirs"].get(top, 0) + 1
     for (sev, rule, title), r in sorted(rows.items(), key=lambda x: (SEV_ORDER.index(x[0][0]), -x[1]["n"])):
@@ -1300,6 +1334,38 @@ def canary_findings():
     if changed:
         save_json(state_path("canaries.json"), reg)
     return out
+
+
+def cmd_events(args):
+    """List or clear one-time events (history lines, canary trips) that stay open for 14 days."""
+    store = load_json(state_path("events.json"), [])
+    if args.action == "clear":
+        keep = [e for e in store if args.rule and e["rule"] != args.rule]
+        save_json(state_path("events.json"), keep)
+        snap = load_json(state_path("last_findings.json"), None)
+        if snap:
+            snap["findings"] = [f for f in snap["findings"] if not (args.rule is None and f["rule"].startswith(("WT-H", "WT-K"))) and f["rule"] != args.rule]
+            save_json(state_path("last_findings.json"), snap)
+        ledger({"event": "events-clear", "rule": args.rule or "all", "removed": len(store) - len(keep)})
+        print(f"Cleared {len(store) - len(keep)} event(s).")
+        return 0
+    for e in store:
+        print(f"{e.get('first_seen', '')}  {e['severity']:8} {e['rule']}  {e['title']}  {e['where']}")
+    return 0
+
+
+def rearm_canaries():
+    reg = load_json(state_path("canaries.json"), {})
+    for v in reg.values():
+        p = os.path.expanduser(v["path"])
+        try:
+            st = os.stat(p)
+            os.utime(p, (st.st_mtime - 86400, st.st_mtime))
+            v["atime"] = os.stat(p).st_atime
+        except OSError:
+            pass
+    if reg:
+        save_json(state_path("canaries.json"), reg)
 
 
 def canary_copies(text, path):
@@ -1739,11 +1805,11 @@ def split_stories(b):
 
 def threat_level(b, snap, stories):
     fs = (snap or {}).get("findings", [])
-    pts = 2 * sum(1 for k in b["kev"] if k["relevant"]) + 2 * sum(1 for s in stories if s["tier"] == "act")
-    pts += 2 if any(f["severity"] == "critical" for f in fs) else 0
-    pts += 4 if any(f["rule"].startswith("WT-K") for f in fs) else 0
+    pts = min(2, sum(1 for k in b["kev"] if k["relevant"])) + min(2, sum(1 for s in stories if s["tier"] == "act"))
+    pts += 2 if any(f["severity"] == "critical" and not f["rule"].startswith("WT-K") for f in fs) else 0
+    pts += 3 if any(f["rule"].startswith("WT-K") for f in fs) else 0  # a tripwire firing is the strongest signal there is
     pts += 1 if (snap or {}).get("score", 100) < 50 else 0
-    for i, (lvl, cut) in enumerate((("Low", 1), ("Guarded", 3), ("Elevated", 5), ("High", 8))):
+    for i, (lvl, cut) in enumerate((("Low", 1), ("Guarded", 3), ("Elevated", 5), ("High", 7))):
         if pts <= cut:
             return i, lvl, pts
     return 4, "Severe", pts
@@ -2051,7 +2117,10 @@ def cmd_brief(args):
                                 "summary": r["summary"][:260], "source": r["source"]} for r in top],
                "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:6],
                "updates": b["updates"], "doc_changes": [p["name"] for p in b["pages"]],
-               "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"]}, limit=6000))
+               "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"],
+               "next_step": ("Analysis added." if notes else
+                             "Required: write notes.json with 'means' and 'do' for each top_stories id (see /watchtower-brief step 2), "
+                             "then run wt.py brief --notes <file>. Until then the stories show generic text.")}, limit=6000))
     return 0
 
 
@@ -2069,6 +2138,7 @@ def main(argv=None):
     sub.add_parser("breakdown")
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
+    ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule")
     r = sub.add_parser("rollcall"); r.add_argument("--dir")
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
     ic = sub.add_parser("incident"); ic.add_argument("--note")
@@ -2077,7 +2147,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
-            "codescan": cmd_codescan, "brief": cmd_brief}[a.cmd](a)
+            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events}[a.cmd](a)
 
 
 if __name__ == "__main__":

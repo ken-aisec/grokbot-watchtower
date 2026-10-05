@@ -7,7 +7,7 @@ description: Build this week's Watchtower watch report, a polished HTML threat b
 
 1. Run `python3 /workspace/watchtower/app/watchtower/wt.py brief`. It fetches the sources in `rules/feeds.json`, ranks stories by how directly they touch a Grok Bot account, and writes `/workspace/watchtower/reports/threat-brief-<year>-W<week>.html`. Its JSON lists the threat level, the top stories (with ids and summaries), relevant exploited CVEs, tool updates and any sources that were down.
 
-2. Add your analysis to the top stories. This is what makes the report worth reading. For each story in `top_stories`, write two short fields, using only that story's summary and what you know about this account (its Bots, connectors, routines, the latest audit):
+2. Add your analysis to the top stories. Don't skip this step: without it the stories show generic text, and this is what makes the report worth reading. For each story in `top_stories`, write two short fields, using only that story's summary and what you know about this account (its Bots, connectors, routines, the latest audit):
    - `means`: what this specific story means for this account, in 1–2 sentences. Name the connector, Bot or setting it touches when you can.
    - `do`: the one action to take, in one sentence, with the exact place to click or command to run.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.2 — 2026-10-05 (fairness pass after a real account run)
+- Canaries are re-armed after Watchtower's own scanners run and are excluded from gitleaks, so they only trip on other readers. `wt.py events clear --rule WT-K001` clears false trips from earlier versions.
+- Score counts kinds of risk: a critical type costs 20, a high 6, a medium 2 (with caps), so a real account with a few issues isn't pinned at 0. Grades: A 90, B 80, C 65, D 50.
+- Threat level weighs your own setup above the news: at most 2 points from stories and 2 from exploited CVEs; a tripwire firing adds 3.
+- gitleaks ignores signed cloud-storage links (Notion and S3 file URLs), skips other browser profiles, and groups agent transcripts, tool-overflow folders and Cursor project mirrors. Severity: real token types are critical, high inside tool caches, medium in shipped plugin docs or when generic.
+- The brief's output tells the Bot the analysis step is required until it's done.
+
 ## v0.2.1 — 2026-10-05 (watch report redesign; first full-engine audit on a real box)
 - Threat brief redesigned as a watch report: threat level, bottom line, ordered actions, ranked stories with what happened, what it means for this account (using its own numbers) and what to do, exposure by area, exploited vulnerabilities, folded source list. Light, dark, mobile and print layouts; no external fonts or requests.
 - Stories are scored and categorized (MCP and connectors, agent hijacking, supply chain, credentials, browser, platform). Podcasts, webinars and how-we-built posts drop out; agent misbehavior ranks up. Summaries end on full sentences.
