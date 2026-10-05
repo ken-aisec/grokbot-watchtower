@@ -1,0 +1,1 @@
+Every weekday at 8:00 AM, run the Daily customer-risk skill against the current account list. Post a linked watch list in this conversation. Do not contact customers; drafts only, ask me first before anything leaves this chat. If the source data is unavailable, report the failure instead of using old data.

@@ -1,0 +1,3 @@
+Allow automatically: everything in the browser
+Ask first: before sending any external email
+Allow automatically when running git status in /workspace/reports

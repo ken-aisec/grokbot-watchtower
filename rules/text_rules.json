@@ -1,0 +1,179 @@
+{
+ "version": "0.1.0",
+ "rules": [
+  {
+   "id": "WT-T001",
+   "title": "Instruction override",
+   "severity": "critical",
+   "owasp": [
+    "AST05",
+    "LLM01"
+   ],
+   "pattern": "(?i)\\b(ignore|disregard|forget|override)\\s+(all\\s+|any\\s+|your\\s+|the\\s+)?(previous|prior|above|earlier|system|safety|standing)?\\s*(instructions|rules|boundaries|guidelines|restrictions)",
+   "fix": "Do not install. A skill that tells the Bot to ignore its rules is prompt injection."
+  },
+  {
+   "id": "WT-T002",
+   "title": "Hidden or bidirectional Unicode",
+   "severity": "high",
+   "owasp": [
+    "AST04",
+    "AST05"
+   ],
+   "pattern": "[\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+   "fix": "Open the text in a hex viewer; invisible characters can hide instructions. Remove them or reject the skill."
+  },
+  {
+   "id": "WT-T003",
+   "title": "Long encoded blob",
+   "severity": "high",
+   "owasp": [
+    "AST01"
+   ],
+   "pattern": "(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{160,}={0,2}(?![A-Za-z0-9+/])",
+   "fix": "Decode it before trusting the skill. Encoded payloads are how ClawHavoc-style skills hid their code."
+  },
+  {
+   "id": "WT-T004",
+   "title": "Reads credential stores",
+   "severity": "high",
+   "owasp": [
+    "ASI03",
+    "AST03"
+   ],
+   "pattern": "(?i)(~/\\.ssh|\\bid_rsa\\b|\\bid_ed25519\\b|\\.aws/credentials|\\.netrc\\b|\\.git-credentials|Login Data|cookies\\.sqlite|\\bprintenv\\b|/proc/self/environ|\\bcat\\s+\\S*\\.env\\b|security\\s+find-(generic|internet)-password|1password|op\\s+item\\s+get|bitwarden\\s+(export|unlock))",
+   "fix": "A skill should never need SSH keys, cloud credentials, cookies or the environment. Remove the step or reject the skill."
+  },
+  {
+   "id": "WT-T005",
+   "title": "Known exfiltration or tunnel host",
+   "severity": "critical",
+   "owasp": [
+    "ASI04",
+    "AST01"
+   ],
+   "pattern": "(?i)(webhook\\.site|pastebin\\.com|paste\\.ee|hastebin|ngrok\\.(io|app)|requestbin|pipedream\\.net|transfer\\.sh|discord(app)?\\.com/api/webhooks|hooks\\.slack\\.com/services|burpcollaborator|interact\\.sh|oast\\.(pro|live|fun))",
+   "fix": "Do not install. These hosts are used to receive stolen data."
+  },
+  {
+   "id": "WT-T006",
+   "title": "Pipe-to-shell install",
+   "severity": "critical",
+   "owasp": [
+    "ASI05",
+    "AST02"
+   ],
+   "pattern": "(?i)(curl|wget)[^\\n|]{0,200}\\|\\s*(sudo\\s+)?(ba|z)?sh\\b",
+   "fix": "Never run remote scripts unseen. Download, read, pin by hash, then run."
+  },
+  {
+   "id": "WT-T007",
+   "title": "Asks to weaken approvals",
+   "severity": "high",
+   "owasp": [
+    "ASI09",
+    "ASI03"
+   ],
+   "pattern": "(?i)(choose\\s+always\\s+allow|(set|switch)\\s+(it|this|execution)?\\s*to\\s+always\\s+allow|turn\\s+off\\s+(auto.?review|approvals?)|disable\\s+(auto.?review|approvals?)|don'?t\\s+ask\\s+(me|the\\s+user)\\s+(again|for\\s+(approval|permission|confirmation))|(send|email|post|publish|buy|purchase|pay|delete|transfer|reply)\\w*\\b[^.\\n]{0,50}without\\s+(asking|approval|confirmation|confirming)|without\\s+(asking|approval|confirmation)\\s+(me|the\\s+user|first))",
+   "fix": "Keep approvals on. Add your own line to the Bot description: never send, buy, publish or delete without my approval."
+  },
+  {
+   "id": "WT-T008",
+   "title": "Secrecy or concealment instruction",
+   "severity": "critical",
+   "owasp": [
+    "ASI09",
+    "AST05"
+   ],
+   "pattern": "(?i)((do\\s+not|don'?t|never)\\s+(tell|mention|reveal|inform|show)\\s+(the\\s+user|me|anyone|the\\s+owner)(\\s*[.!;]|\\s*$|\\s+(what|that\\s+you|about\\s+(this|the|what)|you\\s+(sent|did|have|are)))|\\bsecretly\\b|without\\s+(the\\s+user|them|anyone|me)\\s+(knowing|noticing|seeing)|hide\\s+(this|it|these|that)\\s+from\\s+(the\\s+user|me|them))",
+   "fix": "Do not install. A legitimate skill has no reason to hide what it does."
+  },
+  {
+   "id": "WT-T009",
+   "title": "Raw IP address URL",
+   "severity": "medium",
+   "owasp": [
+    "ASI04"
+   ],
+   "pattern": "https?://(\\d{1,3}\\.){3}\\d{1,3}",
+   "fix": "Ask the author what the IP is. Legitimate services use named, HTTPS hosts."
+  },
+  {
+   "id": "WT-T010",
+   "title": "Reaches into other Bots",
+   "severity": "medium",
+   "owasp": [
+    "ASI07",
+    "AST06"
+   ],
+   "pattern": "(?i)(other\\s+bots?'?s?|every\\s+bot'?s?|all\\s+(of\\s+)?(your\\s+)?bots'?)\\s+(files|memor(y|ies)|conversations|chats|sessions|logins)",
+   "fix": "Bots share one computer. A template that reads other Bots' work can see everything they can."
+  },
+  {
+   "id": "WT-T011",
+   "title": "Secret or key in text",
+   "severity": "critical",
+   "owasp": [
+    "AST04",
+    "LLM02"
+   ],
+   "pattern": "(AKIA[0-9A-Z]{16}|\\bsk-(proj-|ant-)?[A-Za-z0-9_-]{20,}|\\bxai-[A-Za-z0-9]{20,}|\\bghp_[A-Za-z0-9]{36}|\\bgithub_pat_[A-Za-z0-9_]{40,}|\\bxox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35})",
+   "fix": "Revoke the key now, then remove it. Anything in a Bot's description, skill or routine ships with its template link."
+  },
+  {
+   "id": "WT-T012",
+   "title": "Dynamic code execution",
+   "severity": "medium",
+   "owasp": [
+    "ASI05"
+   ],
+   "pattern": "(?i)(\\beval\\s*\\(|\\bexec\\s*\\(|os\\.system\\s*\\(|subprocess\\.(run|call|Popen)\\([^)]*shell\\s*=\\s*True|__import__\\s*\\()",
+   "fix": "Check what the code runs. Dynamic execution is where skill payloads hide."
+  },
+  {
+   "id": "WT-T014",
+   "title": "Broad event listener",
+   "severity": "medium",
+   "owasp": [
+    "ASI02",
+    "ASI08"
+   ],
+   "pattern": "(?i)\\b(every|each|any|all)\\s+(new\\s+)?(incoming\\s+)?(messages?|emails?|events?|notifications?)\\b",
+   "fix": "xAI's docs warn against broad listeners: narrow the trigger to a channel and a phrase."
+  },
+  {
+   "id": "WT-T015",
+   "title": "Shadows a built-in command",
+   "severity": "medium",
+   "owasp": [
+    "AST04"
+   ],
+   "pattern": "(?im)^\\s*name:\\s*(help|settings|login|logout|approve|allow|deny|reset|update|security|admin)\\s*$",
+   "fix": "A skill named like a built-in can be invoked by accident. Rename it."
+  },
+  {
+   "id": "WT-T016",
+   "title": "Quiet-action wording",
+   "severity": "low",
+   "owasp": [
+    "ASI09"
+   ],
+   "pattern": "(?i)\\b(silently|quietly|in\\s+the\\s+background)\\b",
+   "fix": "Usually harmless (\"silently skip\"); check that nothing external happens without you seeing it."
+  }
+ ],
+ "write_verbs": "(?i)\\b(send|sends|email|emails|post|posts|publish|publishes|purchase|buy|buys|pay|pays|delete|deletes|remove|removes|transfer|transfers|submit|submits|merge|deploy|invite|reply)\\b",
+ "approval_terms": "(?i)(approval|approve|ask\\s+(me\\s+)?first|ask\\s+me|my\\s+(exact\\s+)?yes|confirm\\s+with\\s+me|wait\\s+for\\s+(my|the user's)|draft[s]?\\s+only|never\\s+(send|post|publish|buy|pay|delete))",
+ "draft_terms": "(?i)\\b(draft|drafts|recommend|propose|suggest)\\b",
+ "schedule_terms": "(?i)\\b(every\\s+\\d+\\s+(minutes?|hours?|days?)|every\\s+(day|weekday|week|morning|hour|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|daily|weekly|hourly|routine|cron|schedule[d]?)\\b",
+ "nodata_terms": "(?i)(if\\s+(the\\s+)?(source|data|input|site|tool|connector|script)s?\\s+(is|are)?\\s*(unavailable|missing|down|empty|fails?)|report\\s+the\\s+failure|if\\s+nothing|send\\s+nothing|no\\s+new\\s+findings)",
+ "high_freq": "(?i)(\\bhourly\\b|every\\s+\\d+\\s+minutes?|every\\s+(30|15|10|5)\\s*min|every\\s+hour)",
+ "context_guard": "(?i)(\\bnever\\b|don'?t|do\\s+not|\\bnot\\b|avoid|refuse|warn|inject|attack|malicious|treat\\s+(it|this|them)\\s+as\\s+data|e\\.g\\.|for\\s+example|such\\s+as|data,\\s+never\\s+instructions)",
+ "guarded_rules": [
+  "WT-T001",
+  "WT-T007",
+  "WT-T005",
+  "WT-T006",
+  "WT-T004"
+ ]
+}
