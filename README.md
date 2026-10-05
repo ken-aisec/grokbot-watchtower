@@ -49,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.0/scripts/install.sh
-head -40 install.sh && bash install.sh v0.5.0
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.1/scripts/install.sh
+head -40 install.sh && bash install.sh v0.5.1
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -72,6 +72,7 @@ wt.py events list|clear        one-time detections
 wt.py canary plant|status|remove
 wt.py incident --note "..."   evidence pack + containment checklist
 wt.py codescan PATH           OWASP Top 10 code review
+wt.py status                  what a running audit is doing and how long each stage took
 wt.py breakdown | show RULE   findings by rule; evidence with context
 wt.py baseline                accept current skills as reviewed
 ```
@@ -88,7 +89,7 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 
 ## Tests
 
-`make test` runs 44 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs 61 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 

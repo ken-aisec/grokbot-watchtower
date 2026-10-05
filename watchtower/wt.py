@@ -13,9 +13,9 @@ Commands
 
 State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
-import argparse, datetime as dt, hashlib, html, json, math, os, re, shutil, subprocess, sys
+import argparse, datetime as dt, hashlib, html, json, math, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -618,15 +618,16 @@ def audit(roots, exports, quick=False):
     user_dirs = [os.path.dirname(x) for x in inv["skills"] if skill_tier(x) == "user"]
     user_roots = sorted({x.split("/workflows/")[0] + "/workflows" for x in user_dirs if "/workflows/" in x})
     if not quick:
-        fs += engine_findings(user_dirs + sorted(changed), fs, notes, user_roots)
-        fs += gitleaks_findings(roots, notes)
-        fs += package_findings(notes)
-        fs += osv_findings(roots, notes)
+        fs += timed("SkillSpector and husk", engine_findings, user_dirs + sorted(changed), fs, notes, user_roots)
+        fs += timed("gitleaks (keys in files)", gitleaks_findings, roots, notes)
+        fs += timed("pip-audit (installed Python packages)", package_findings, notes)
+        fs += timed("OSV-Scanner (project dependencies)", osv_findings, roots, notes)
         secret_paths = [f["where"].split(":")[0] for f in fs if f["rule"] in ("WT-S001", "WT-S002")]
-        fs = apply_key_status(fs, trufflehog_status(secret_paths, notes), ran=bool(tool("trufflehog")))
+        fs = apply_key_status(fs, timed("TruffleHog (which keys still work)", trufflehog_status, secret_paths, notes), ran=bool(tool("trufflehog")))
+        set_progress("finishing", 0, 0)
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
-        fs += engine_findings(sorted(changed), fs, notes)
+        fs += engine_findings(sorted(changed), fs, notes, budget=min(ENGINE_BUDGET, 120))
     if quick:
         ks = load_json(state_path("key_status.json"), {}) or {}
         fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
@@ -727,74 +728,176 @@ def tool(name):
     return None
 
 
-def skillspector_scan(dirs, notes):
-    """Run SkillSpector (static, no LLM) over skill folders. Returns {skill_dir: summary}."""
-    exe = tool("skillspector")
-    if not exe:
-        notes.append("SkillSpector not installed: run install.sh --scanners for a second engine.")
-        return {}
-    res = {}
-    tmp = state_path("skillspector.json")
-    for d in dirs:
-        run([exe, "scan", d, "--recursive", "--no-llm", "--format", "json", "--output", tmp], 600)
-        data = load_json(tmp, None)
-        if not isinstance(data, dict):
-            continue
-        skills = data.get("skills") if data.get("multi_skill") else [dict(data, path=".")]
-        for sk in skills or []:
-            ra = sk.get("risk_assessment") or {}
-            issues = [i for i in sk.get("issues") or [] if isinstance(i, dict)]
-            path = os.path.normpath(os.path.join(d, sk.get("path") or "."))
-            res[path] = {"score": ra.get("score", sk.get("risk_score")), "recommendation": ra.get("recommendation", ""),
-                         "issues": len(issues),
-                         "top": sorted({f"{i.get('category')}: {i.get('pattern')}" for i in issues
-                                        if i.get("severity") in ("CRITICAL", "HIGH")})[:4]}
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    return res
+ENGINE_BUDGET = int(os.environ.get("WT_ENGINE_BUDGET", "420"))   # seconds of engine time per run; the rest resumes next run
+ENGINE_CHUNK = 40                                                # skills per SkillSpector launch (each launch costs ~5s to start)
+ENGINE_MAX_FILES, ENGINE_MAX_BYTES = 400, 2_000_000
 
 
-def husk_scan(dirs, notes):
-    """Run husk (static, obfuscation-focused) per skill folder. Returns {skill_dir: [messages]}."""
-    exe = tool("husk")
-    if not exe:
-        notes.append("husk not installed: run install.sh --scanners for an obfuscation-focused engine.")
-        return {}
-    res = {}
-    tmp = state_path("husk.sarif")
-    for d in dirs[:150]:
-        code, out_s, _ = run([exe, "package", d, "--output", tmp], 60)
-        data = load_json(tmp, None) or {}
-        msgs = [r.get("message", {}).get("text", "") for run_ in data.get("runs", []) for r in run_.get("results", [])]
-        if msgs or "FLAGGED" in out_s:
-            res[os.path.normpath(d)] = msgs or [out_s.strip()[:200]]
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    return res
+def timed(stage, fn, *a, **k):
+    """Run one audit stage, remember what's running and how long it took, so a slow one is easy to spot with `wt.py status`."""
+    set_progress(stage, 0, 0)
+    t0 = time.monotonic()
+    try:
+        return fn(*a, **k)
+    finally:
+        times = load_json(state_path("stage_times.json"), {}) or {}
+        times[stage] = round(time.monotonic() - t0, 1)
+        save_json(state_path("stage_times.json"), times)
 
 
-def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=()):
-    """Second and third opinions. A skill is 'corroborated' only when two independent engines flag it."""
+def set_progress(stage, done, total, started=None):
+    save_json(state_path("progress.json"), {"stage": stage, "done": done, "total": total, "at": now(),
+                                            "seconds": round(time.monotonic() - started) if started else None})
+
+
+def skill_files(d):
     out = []
-    targets = sorted({os.path.normpath(d) for d in skill_dirs})
-    roots = [d for d in user_root_dirs if os.path.isdir(d)]
-    ss = skillspector_scan(roots, notes) if roots else {}
-    extra = [d for d in targets if not any(d.startswith(r) for r in roots)]
-    if extra:
-        ss.update(skillspector_scan(extra, notes))
-    hk = husk_scan(targets, notes)
+    for dirpath, dirnames, filenames in os.walk(d):
+        dirnames[:] = sorted(x for x in dirnames if x not in SKIP_DIRS)
+        for fn in sorted(filenames):
+            p = os.path.join(dirpath, fn)
+            try:
+                if os.path.isfile(p) and not os.path.islink(p) and os.path.getsize(p) <= ENGINE_MAX_BYTES:
+                    out.append(p)
+            except OSError:
+                pass
+            if len(out) >= ENGINE_MAX_FILES:
+                return out
+    return out
+
+
+def skill_dir_hash(d):
+    h = hashlib.sha256()
+    for p in skill_files(d):
+        h.update(os.path.relpath(p, d).encode())
+        h.update(sha256_file(p).encode())
+    return h.hexdigest()[:20]
+
+
+def stage_skills(dirs, root):
+    """Copy skills into one folder so each engine is launched once for the whole batch instead of once per skill.
+    (Symlinks aren't followed by SkillSpector; copies are small because only text-sized files are taken.)"""
+    mapping = {}
+    for i, d in enumerate(dirs):
+        name = f"{i:04d}-{re.sub(r'[^A-Za-z0-9_.-]+', '_', os.path.basename(d.rstrip('/')))[:40]}"
+        for p in skill_files(d):
+            dst = os.path.join(root, name, os.path.relpath(p, d))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(p, dst)
+        os.makedirs(os.path.join(root, name), exist_ok=True)
+        mapping[name] = d
+    return mapping
+
+
+def skillspector_batch(exe, stage, mapping):
+    """One SkillSpector run over a staged folder. Returns ({original_dir: summary}, error or None)."""
+    tmp = os.path.join(stage, "..", f"ss-{os.path.basename(stage)}.json")
+    code, _, err = run([exe, "scan", stage, "--recursive", "--no-llm", "--format", "json", "--output", tmp], 600)
+    data = load_json(tmp, None)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if not isinstance(data, dict):
+        return {}, f"no result (exit {code}: {(err.strip().splitlines() or ['timed out or crashed'])[-1][:100]})"
+    res = {}
+    for sk in data.get("skills") or ([dict(data, path=".")] if len(mapping) == 1 else []):
+        name = os.path.basename(os.path.normpath(sk.get("path") or "."))
+        orig = mapping.get(name) or (next(iter(mapping.values())) if len(mapping) == 1 else None)
+        if not orig:
+            continue
+        ra = sk.get("risk_assessment") or {}
+        issues = [i for i in sk.get("issues") or [] if isinstance(i, dict)]
+        res[orig] = {"score": ra.get("score", sk.get("risk_score")), "recommendation": ra.get("recommendation", ""), "issues": len(issues),
+                     "top": sorted({f"{i.get('category')}: {i.get('pattern')}" for i in issues if i.get("severity") in ("CRITICAL", "HIGH")})[:4]}
+    return res, None
+
+
+def husk_batch(exe, stage, mapping):
+    """Husk's own bulk mode flags names in one run; only flagged skills are re-run for their messages."""
+    cache = os.path.join(stage, "..", "husk-cache.json")
+    code, out_s, err = run([exe, "registry", "--cache", cache, "--json", stage], 600)
+    try:
+        flagged = (json.loads(out_s) or {}).get("flagged", {})
+    except ValueError:
+        return {}, f"no result (exit {code})"
+    res = {}
+    for name in list(flagged)[:25]:
+        orig = mapping.get(name)
+        if not orig:
+            continue
+        sarif = os.path.join(stage, "..", f"hk-{name}.sarif")
+        run([exe, "package", os.path.join(stage, name), "--output", sarif], 60)
+        data = load_json(sarif, None) or {}
+        res[orig] = [r.get("message", {}).get("text", "") for run_ in data.get("runs", []) for r in run_.get("results", [])] or ["flagged"]
+        try:
+            os.remove(sarif)
+        except OSError:
+            pass
+    for name in list(flagged)[25:]:
+        if mapping.get(name):
+            res[mapping[name]] = [f"flagged ({flagged[name]} issues)"]
+    return res, None
+
+
+def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=None):
+    """Second and third opinions on skills. Each engine starts once per batch of 40 skills; a skill is only re-scanned when
+    its files change; work stops at the time budget and resumes next run. A skill is 'corroborated' only when two engines flag it."""
+    out, started = [], time.monotonic()
+    budget = ENGINE_BUDGET if budget is None else budget
+    ss_exe, hk_exe = tool("skillspector"), tool("husk")
+    if not ss_exe:
+        notes.append("SkillSpector not installed: run install.sh --scanners for a second engine.")
+    if not hk_exe:
+        notes.append("husk not installed: run install.sh --scanners for an obfuscation-focused engine.")
+    targets = []
+    for d in skill_dirs:
+        d = os.path.normpath(d)
+        if d not in targets and os.path.isdir(d) and os.path.isfile(os.path.join(d, "SKILL.md")):
+            targets.append(d)
+    targets = targets[:300]
+    cache = load_json(state_path("engine_cache.json"), {}) or {}
+    hashes = {d: skill_dir_hash(d) for d in targets}
+    todo = [d for d in targets if cache.get(d, {}).get("hash") != hashes[d]]
+    scanned = 0
+    for i in range(0, len(todo), ENGINE_CHUNK):
+        if time.monotonic() - started > budget:
+            break
+        chunk = todo[i:i + ENGINE_CHUNK]
+        stage = tempfile.mkdtemp(prefix="stage-", dir=state_path())
+        try:
+            mapping = stage_skills(chunk, stage)
+            set_progress("SkillSpector and husk", scanned, len(todo), started)
+            ss, ss_err = skillspector_batch(ss_exe, stage, mapping) if ss_exe else ({}, None)
+            hk, hk_err = husk_batch(hk_exe, stage, mapping) if hk_exe else ({}, None)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        for err_, who in ((ss_err, "SkillSpector"), (hk_err, "husk")):
+            if err_:
+                notes.append(f"{who} failed on a batch of {len(chunk)} skills ({err_}); they'll be retried next run.")
+        if (ss_exe and ss_err) or (hk_exe and hk_err):
+            continue   # don't remember a batch that didn't finish
+        for d in chunk:
+            cache[d] = {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "at": now()}
+        scanned += len(chunk)
+        save_json(state_path("engine_cache.json"), cache)   # progress survives an interrupted run
+    left = len(todo) - scanned
+    if left > 0 and not any("failed on a batch" in n for n in notes):
+        notes.append(f"SkillSpector and husk checked {scanned} of {len(todo)} new or changed skills in the time budget; "
+                     f"the other {left} finish on the next run (results are remembered).")
+    set_progress("done", scanned, len(todo), started)
+
     wt_hits = {}
     for f in wt_findings:
         if f["severity"] in ("critical", "high") and f["rule"].startswith("WT-T"):
             wt_hits.setdefault(os.path.dirname(f["where"].split(":")[0]), []).append(f["rule"])
-    for d in sorted(set(ss) | set(hk)):
-        s_ = ss.get(d, {})
+    for d in targets:
+        e_ = cache.get(d) or {}
+        if e_.get("hash") != hashes[d]:
+            continue
+        s_, hk = e_.get("ss") or {}, e_.get("hk")
         ss_flag = s_.get("recommendation") == "DO_NOT_INSTALL"
-        hk_flag = d in hk
+        hk_flag = bool(hk)
         wt_flag = any(k == d or k.startswith(d + "/") for k in wt_hits)
         tier = skill_tier(d + "/")
         engines = [n for n, v in (("SkillSpector", ss_flag), ("husk", hk_flag), ("Watchtower", wt_flag)) if v]
@@ -809,9 +912,18 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=()):
                                "Run `skillspector scan <folder>` for the exact lines; one engine alone can be wrong.", source="skillspector"))
         elif hk_flag:
             out.append(finding("WT-X002", "husk flagged this skill", "medium" if tier == "user" else "low", ["AST01", "AST05"], d,
-                               hk[d][0][:150], "Run `husk package <folder>` for details; one engine alone can be wrong.", source="husk"))
-    save_json(state_path("engines.json"), {"at": now(), "skillspector": len(ss), "husk_flagged": len(hk), "targets": len(targets)})
+                               hk[0][:150], "Run `husk package <folder>` for details; one engine alone can be wrong.", source="husk"))
+    save_json(state_path("engines.json"), {"at": now(), "targets": len(targets), "scanned_this_run": scanned, "cached": len(targets) - len(todo),
+                                           "seconds": round(time.monotonic() - started, 1)})
     return out
+
+
+def cmd_status(args):
+    p = load_json(state_path("progress.json"), None)
+    e_ = load_json(state_path("engines.json"), None)
+    st = load_json(state_path("stage_times.json"), None)
+    print(json.dumps({"progress": p, "last_engine_run": e_, "seconds_per_stage": st}, indent=1))
+    return 0
 
 
 GITLEAKS_CONFIG = r"""[extend]
@@ -1049,6 +1161,9 @@ def ledger(event):
 
 
 def run_audit(args, quick):
+    global ENGINE_BUDGET
+    if getattr(args, "budget", None) is not None:
+        ENGINE_BUDGET = max(0, args.budget)
     roots = args.roots or [os.path.expanduser("~"), "/workspace"]
     exports = args.exports or os.path.join(home(), "exports")
     start = dt.datetime.now()
@@ -2928,6 +3043,8 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--roots", nargs="*")
         p.add_argument("--exports")
+        p.add_argument("--budget", type=int, help="seconds of scanner time for this run (default 420); unfinished skills resume next run")
+    sub.add_parser("status")
     sub.add_parser("report")
     sub.add_parser("breakdown")
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
@@ -2945,7 +3062,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
-            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept}[a.cmd](a)
+            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status}[a.cmd](a)
 
 
 if __name__ == "__main__":

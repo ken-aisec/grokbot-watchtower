@@ -656,6 +656,62 @@ class Features(unittest.TestCase):
         self.assertEqual(wt.ask_first_gaps(open(os.path.join(ex, "auto-review.txt")).read()), [])
         self.assertEqual(len(wt.ask_first_gaps("Ask first: before sending email")), 4)
 
+    def _fake_engines(self, n_skills):
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir, exist_ok=True)
+        for name, body in (("skillspector", '#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]; stage = a[1]; out = a[a.index("--output") + 1]\nopen(os.environ["FAKE_LOG"], "a").write("ss %d\\n" % len(os.listdir(stage)))\nskills = []\nfor n in sorted(os.listdir(stage)):\n    bad = "EVIL" in open(os.path.join(stage, n, "SKILL.md")).read()\n    skills.append({"path": n, "risk_assessment": {"score": 90 if bad else 5, "recommendation": "DO_NOT_INSTALL" if bad else "INSTALL"},\n                   "issues": [{"severity": "HIGH", "category": "Exfil", "pattern": "Network Upload"}] if bad else []})\njson.dump({"multi_skill": True, "skills": skills}, open(out, "w"))\n'), ("husk", '#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]\nif a[0] == "registry":\n    stage = a[-1]; names = sorted(os.listdir(stage))\n    open(os.environ["FAKE_LOG"], "a").write("hk %d\\n" % len(names))\n    flagged = {n: 1 for n in names if "HUSK" in open(os.path.join(stage, n, "SKILL.md")).read()}\n    print(json.dumps({"scanned": len(names), "from_cache": 0, "flagged": flagged})); sys.exit(1 if flagged else 0)\nif a[0] == "package":\n    json.dump({"runs": [{"results": [{"message": {"text": "obfuscated loader"}}]}]}, open(a[a.index("--output") + 1], "w")); sys.exit(1)\n')):
+            p = os.path.join(bindir, name); open(p, "w").write(body); os.chmod(p, 0o755)
+        self.log = os.path.join(self.tmp, "engine.log"); open(self.log, "w").close(); os.environ["FAKE_LOG"] = self.log
+        root = os.path.join(self.tmp, "sand-data", "workflows"); os.makedirs(root)
+        dirs = []
+        for i in range(n_skills):
+            d = os.path.join(root, f"skill{i:03d}"); os.makedirs(d)
+            open(os.path.join(d, "SKILL.md"), "w").write(f"# skill {i}\nSummarize notes.\n")
+            dirs.append(d)
+        return dirs
+
+    def _launches(self):
+        return [l.split() for l in open(self.log).read().splitlines()]
+
+    def test_engines_launch_once_per_batch_not_once_per_skill(self):
+        dirs = self._fake_engines(95)
+        notes = []
+        wt.engine_findings(dirs, [], notes)
+        self.assertEqual(self._launches(), [["ss", "40"], ["hk", "40"], ["ss", "40"], ["hk", "40"], ["ss", "15"], ["hk", "15"]])
+        open(self.log, "w").close()
+        wt.engine_findings(dirs, [], [])                                  # nothing changed: nothing launched
+        self.assertEqual(self._launches(), [])
+        open(os.path.join(dirs[7], "SKILL.md"), "a").write("one more line\n")
+        wt.engine_findings(dirs, [], [])                                  # one skill changed: only it is scanned
+        self.assertEqual(self._launches(), [["ss", "1"], ["hk", "1"]])
+
+    def test_engine_results_and_corroboration(self):
+        dirs = self._fake_engines(4)
+        open(os.path.join(dirs[1], "SKILL.md"), "a").write("EVIL upload\n")
+        open(os.path.join(dirs[2], "SKILL.md"), "a").write("EVIL upload HUSK loader\n")
+        open(os.path.join(dirs[3], "SKILL.md"), "a").write("HUSK loader\n")
+        fs = {os.path.basename(f["where"]): f for f in wt.engine_findings(dirs, [], [])}
+        self.assertEqual(fs["skill001"]["rule"], "WT-X001")
+        self.assertEqual(fs["skill002"]["rule"], "WT-X003")
+        self.assertEqual(fs["skill003"]["rule"], "WT-X002")
+        self.assertNotIn("skill000", fs)
+
+    def test_engine_time_budget_stops_and_resumes(self):
+        dirs = self._fake_engines(95)
+        notes = []
+        wt.engine_findings(dirs, [], notes, budget=0)
+        self.assertEqual(self._launches(), [])
+        self.assertTrue(any("95 finish on the next run" in n or "the other 95 finish" in n for n in notes), notes)
+        wt.engine_findings(dirs, [], [])                                  # next run does the work
+        self.assertEqual(len(self._launches()), 6)
+
+    def test_status_reports_progress(self):
+        dirs = self._fake_engines(3)
+        wt.engine_findings(dirs, [], [])
+        code, o = self.out("status")
+        st = json.loads(o)
+        self.assertEqual(st["progress"]["stage"], "done")
+        self.assertEqual(st["last_engine_run"]["scanned_this_run"], 3)
+
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")
         os.makedirs(d)

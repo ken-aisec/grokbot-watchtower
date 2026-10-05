@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.1 — 2026-10-05 (fast scanners)
+- SkillSpector and husk now start once per batch of 40 skills instead of once per skill (SkillSpector takes about 5 seconds just to start). 60 skills: 13 seconds, down from roughly 5 minutes.
+- Skills are remembered by content: unchanged skills are never re-scanned. A repeat run takes under a second; editing one skill rescans only that one.
+- Time budget (default 7 minutes, `--budget SECONDS`): if it runs out, finished work is saved and the rest resumes on the next run, with a note saying how many are left. Daily runs use 2 minutes.
+- New `wt.py status`: what a running audit is doing now and how long each stage took.
+- A batch that fails or times out is reported and retried, never remembered as clean.
+
 ## v0.5.0 — 2026-10-05 (one yes, then everything)
 - `/watchtower-fix` is now a one-question fix. It previews everything it can do, asks once, then does it: safe cleanup, software upgrades, Ask-first rules, and accepting findings that are fine on purpose.
 - Upgrades with automatic undo. Python packages are upgraded at user level (system files are never touched) and put back if `pip check` shows anything new broke. Project dependencies get `npm audit fix` on the lockfile only, never `--force`, with a backup copy and a check that the dependency tree still resolves. Verified against real pip, PyPI and npm: pip 2.7.0 → 2.15.1 and back; a lockfile with a critical and a high issue went to zero.
