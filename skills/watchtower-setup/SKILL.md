@@ -10,10 +10,10 @@ Tell the user up front: "Setup only writes inside /workspace/watchtower, plus th
 ## 1. Install the pinned release
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.0/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.1/scripts/install.sh
 head -40 install.sh
 ```
-Show the user those 40 lines, then run `bash install.sh v0.2.0`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
+Show the user those 40 lines, then run `bash install.sh v0.2.1`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
 
 ## 2. Scanning engines (recommended)
 Say: "Watchtower checks skills with its own rules. Adding NVIDIA SkillSpector and husk gives two independent engines, so a finding two of them agree on is far more trustworthy. gitleaks finds secrets and pip-audit checks installed packages. All pinned, about a minute, installed in /workspace/watchtower only. Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`.

@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -27,7 +27,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "
              "google-chrome", "chromium", "Chrome", "BraveSoftware", "mozilla", "Cache", "Code Cache", "GPUCache",
              "Service Worker", "IndexedDB", "WasmTtsEngine", "Crashpad", ".npm", ".pnpm-store", ".cargo", ".rustup"}
 SKIP_PREFIXES = ("scoped_dir", ".org.chromium", "tmp")
-SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
+SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.local/go/", "/.config/google-chrome", "/.config/chromium", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
 SECRET_RULE = "WT-T011"
 
@@ -424,6 +424,7 @@ KNOWN_CRED_FILES = {
     ".docker/config.json": "Docker registry login",
     ".npmrc": "npm token",
     ".config/gcloud/credentials.db": "Google Cloud CLI login",
+    ".codex/auth.json": "OpenAI Codex CLI login",
 }
 
 
@@ -790,7 +791,10 @@ useDefault = true
 [allowlist]
 description = "Watchtower: package caches and its own state"
 paths = [
-  '''(^|/)(go/pkg|pkg/mod|node_modules|\.cache|\.npm|\.venv|site-packages|dist-packages)/''',
+  '''(^|/)(go/pkg|pkg/mod|\.local/go|node_modules|\.cache|\.npm|\.venv|site-packages|dist-packages)/''',
+  '''(^|/)\.config/(google-chrome[^/]*|chromium[^/]*|BraveSoftware)/''',
+  '''(^|/)scoped_dir[^/]*/''',
+  '''(^|/)(\.codex/auth\.json|\.claude/\.credentials\.json|\.config/gh/hosts\.yml|\.aws/credentials|\.git-credentials|\.netrc|\.docker/config\.json|\.npmrc)$''',
   '''(^|/)watchtower/(state|reports|app|\.venv|bin)/''',
   '''chrome-cookie-seed\.json$''',
 ]
@@ -816,6 +820,18 @@ def gitleaks_findings(roots, notes):
         per_file = {}
         for leak in load_json(tmp, []) or []:
             per_file.setdefault(leak.get("File"), []).append(leak)
+        by_dir = {}
+        for fpath in per_file:
+            by_dir.setdefault(os.path.dirname(fpath or ""), []).append(fpath)
+        for d, files in by_dir.items():
+            if len(files) >= 4:  # transcripts, logs, tool output: one finding per folder
+                leaks = [l for fp in files for l in per_file.pop(fp)]
+                kinds = sorted({l.get("RuleID", "secret") for l in leaks})
+                generic = all(k.startswith("generic") for k in kinds)
+                out.append(finding("WT-S002", f"gitleaks: secrets in {len(files)} files in one folder", "medium" if generic else "critical",
+                                   ["ASI03", "LLM02"], d, f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
+                                   "Check which of these tokens are still live and revoke them, then clear the folder or move it off "
+                                   "the shared computer. Transcripts and tool output often capture tokens by accident.", source="gitleaks"))
         for fpath, leaks in per_file.items():
             kinds = sorted({l.get("RuleID", "secret") for l in leaks})
             generic = all(k.startswith("generic") for k in kinds)
@@ -1542,19 +1558,6 @@ CODE_FIX = {
 
 
 # ---------------------------------------------------------------- weekly threat brief
-FEEDS_PATH = os.path.join(HERE, "..", "rules", "feeds.json")
-WHY = [
-    (r"(?i)\bmcp\b|model context protocol", "You run MCP connectors; a poisoned tool description reaches every Bot that loads it."),
-    (r"(?i)\bskills?\b", "Grok Bot templates install skills; the same trick could ship inside a marketplace template."),
-    (r"(?i)prompt[- ]injection|indirect injection", "Your Bots read web pages, email and X posts, which is exactly where injected instructions hide."),
-    (r"(?i)npm|pypi|package|typosquat|dependency", "Your cloud computer installs packages on request; a poisoned package runs with every Bot's logins."),
-    (r"(?i)exfiltrat|data leak|steal", "Shared browser sessions and files mean one compromised Bot can reach all your accounts."),
-    (r"(?i)memory|persisten", "Auto Review does not check memory writes; a poisoned memory steers every future run."),
-    (r"(?i)browser|extension|chrome", "Every Bot shares one browser profile and its logged-in sessions."),
-    (r"(?i)cursor|grok|xai|x\.ai", "This touches the platform your Bots run on."),
-]
-
-
 def http_get(url, timeout=15, accept="*/*"):
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": f"Watchtower/{VERSION} (+threat brief)", "Accept": accept})
@@ -1627,6 +1630,125 @@ def vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
 
 
+# ---------------------------------------------------------------- weekly threat brief (watch report)
+FEEDS_PATH = os.path.join(HERE, "..", "rules", "feeds.json")
+
+# Categories: how a story touches a Grok Bot account. Order = tie-break priority.
+CATEGORIES = [
+    ("mcp", "MCP and connectors", r"(?i)\bmcp\b|model context protocol|connector|oauth|tool (description|poisoning)"),
+    ("hijack", "Agent hijacking", r"(?i)prompt[- ]injection|indirect injection|jailbreak|agent[^.]{0,40}(bypass|hijack|escap|exfiltrat|takeover)|(bypass|escap)[^.]{0,30}(sandbox|control|guardrail)"),
+    ("supply", "Supply chain", r"(?i)malicious (package|npm|pypi|extension|skill|plugin|template)|typosquat|npm|pypi|crate|extension|marketplace|dependency|supply[- ]chain"),
+    ("creds", "Credentials and data exposure", r"(?i)credential|token|api key|secret|exposed|leak|exfiltrat|billing|session"),
+    ("browser", "Browser and sessions", r"(?i)browser|chrom|cookie|extension|session hijack"),
+    ("platform", "Platform and models", r"(?i)\bgrok\b|\bxai\b|x\.ai|cursor|openai|anthropic|claude|gemini|copilot|codex|model"),
+]
+BOOST = [
+    (r"(?i)\bcve-\d{4}-\d+", 3), (r"(?i)actively exploited|in the wild|zero[- ]day|0-day", 4), (r"(?i)critical|cvss\s*(9|10)|9\.\d", 2),
+    (r"(?i)\bmcp\b|model context protocol", 4), (r"(?i)prompt[- ]injection", 4), (r"(?i)malicious (package|npm|pypi|extension|skill)", 3),
+    (r"(?i)agent", 2), (r"(?i)steal|exfiltrat|bypass|escape|takeover|remote code|command execution|\brce\b", 2),
+    (r"(?i)oauth|credential|token|api key", 2), (r"(?i)browser|chrome|extension", 1), (r"(?i)\bgrok\b|\bxai\b|cursor", 3),
+    (r"(?i)agents?\b[^.]{0,60}(bypass|escap|exfiltrat|expos|leak|steal|delet|wip|rogue|went around)", 4),
+    (r"(?i)(bypass|escap)\w*[^.]{0,40}(control|sandbox|guardrail|restriction|approval)", 2),
+]
+DAMPEN = [r"(?i)how we (found|built|used)|we found \d+|using (our|an) (open[- ]source )?ai|podcast|webinar|sponsored|partner content|how .{0,40} (can|should) modernize|framework for|\bguide to\b|ebook|survey finds|report details|predictions|roundup|best practices"]
+SOURCE_WEIGHT = {"research": 2, "standards": 2, "supply-chain": 1, "news": 0}
+
+
+def clip(t, n):
+    """End on a full sentence when possible, never mid-word."""
+    t = (t or "").strip()
+    complete = t.endswith((".", "!", "?", '"', "”", "…", ")"))
+    if len(t) <= n and complete:
+        return t
+    cut = t[:n]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    if end > (20 if not complete and len(t) <= n else len(cut) * 0.45):
+        return cut[:end + 1]
+    return cut[:cut.rfind(" ")].rstrip(",;:") + "…"
+
+
+def classify(text):
+    for cid, label, rx in CATEGORIES:
+        if re.search(rx, text):
+            return cid, label
+    return "platform", "Platform and models"
+
+
+def story_score(text, kind):
+    sc = SOURCE_WEIGHT.get(kind, 0) + sum(w for rx, w in BOOST if re.search(rx, text))
+    if any(re.search(rx, text) for rx in DAMPEN):
+        sc -= 5
+    return sc
+
+
+def account_context():
+    """Real numbers from this computer, used to say what a story means here."""
+    snap = load_json(state_path("last_findings.json"), {}) or {}
+    inv = snap.get("inventory", {})
+    fs = snap.get("findings", [])
+    sess = next((f for f in fs if f["rule"] == "WT-S004"), None)
+    m = re.match(r"(\d+) domains", sess["evidence"]) if sess else None
+    pkg = load_json(state_path("package_vulns.json"), {}) or {}
+    rc = load_json(state_path("rollcall_findings.json"), {}) or {}
+    return {"mcp": inv.get("mcp_configs", 0), "skills": inv.get("skills", 0), "plugins": inv.get("plugin_files", 0),
+            "sites": int(m.group(1)) if m else None, "packages": pkg.get("packages"), "bots": len(rc.get("bots", [])) or None,
+            "cli": sum(1 for f in fs if f["rule"] == "WT-S003"), "secrets": sum(1 for f in fs if f["rule"] in ("WT-S001", "WT-S002") and f["severity"] == "critical")}
+
+
+def means_here(cat, ctx):
+    n = lambda v, one, many: f"{v} {one if v == 1 else many}" if v else None
+    if cat == "mcp":
+        bits = [n(ctx["mcp"], "MCP config", "MCP configs"), n(ctx["plugins"], "plugin file", "plugin files")]
+        have = " and ".join(b for b in bits if b) or "MCP connectors"
+        return f"This computer has {have}. Every Bot that loads a poisoned tool description follows it, with the logins all your Bots share."
+    if cat == "hijack":
+        return ("Your Bots read web pages, email and posts that strangers write. Injected text there can steer a Bot, and on a shared "
+                "computer that Bot can reach every login" + (f" (the browser is signed in to {ctx['sites']} sites)." if ctx["sites"] else "."))
+    if cat == "supply":
+        return (f"Templates add skills ({ctx['skills']} are on this computer now), and Bots install packages on request. "
+                "Anything installed runs with every Bot's access.")
+    if cat == "creds":
+        extra = f" Watchtower found {ctx['secrets']} files with live-looking secrets on this computer." if ctx["secrets"] else ""
+        return "Any Bot can read any file on the shared computer, including tokens other tools leave behind." + extra
+    if cat == "browser":
+        return (f"All your Bots share one browser profile" + (f", signed in to {ctx['sites']} sites" if ctx["sites"] else "") +
+                ". A browser-level attack reaches every account at once.")
+    return ("Your Bots work through AI tools and gateways like this one. A flaw here shows what an attacker can do once an agent "
+            "holds access, which on a shared computer means every login.")
+
+
+DO_THIS = {
+    "mcp": "Remove connectors no Bot uses, and put Ask first on anything that sends or shares.",
+    "hijack": "Make sure every Bot that reads outside content has an approval line before it sends, posts or buys.",
+    "supply": "Run /vet-template before adding any template, and let the daily watch flag new skills.",
+    "creds": "Run /watchtower-audit and clear the secret findings; rotate anything that looks live.",
+    "browser": "Sign the shared browser out of sites no Bot needs; keep AI consoles and admin sites signed out.",
+    "platform": "Skim the change; re-run /watchtower-audit if it touches approvals, routines or connectors.",
+}
+
+
+WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five"}
+
+
+def split_stories(b):
+    """Top five: stories with a concrete way to reach a Grok Bot account; generic platform news only if it scores high."""
+    top = [r for r in b["research"] if r["category"] != "platform" or r["score"] >= 8][:5]
+    ids = {r["id"] for r in top}
+    return top, [r for r in b["research"] if r["id"] not in ids]
+
+
+def threat_level(b, snap, stories):
+    fs = (snap or {}).get("findings", [])
+    pts = 2 * sum(1 for k in b["kev"] if k["relevant"]) + 2 * sum(1 for s in stories if s["tier"] == "act")
+    pts += 2 if any(f["severity"] == "critical" for f in fs) else 0
+    pts += 4 if any(f["rule"].startswith("WT-K") for f in fs) else 0
+    pts += 1 if (snap or {}).get("score", 100) < 50 else 0
+    for i, (lvl, cut) in enumerate((("Low", 1), ("Guarded", 3), ("Elevated", 5), ("High", 8))):
+        if pts <= cut:
+            return i, lvl, pts
+    return 4, "Severe", pts
+
+
 def gather_brief(cfg, offline=None):
     """Collect everything the brief needs. offline: dict of url->text for tests."""
     get = (lambda u, **k: offline[u]) if offline is not None else http_get
@@ -1638,24 +1760,33 @@ def gather_brief(cfg, offline=None):
         try:
             items = parse_feed(get(fd["url"], accept="application/rss+xml, application/atom+xml, application/xml"))
             sources.append({"name": fd["name"], "url": fd["url"], "status": "ok", "items": len(items)})
-        except Exception as e:  # network, parse, KeyError in offline mode
+        except Exception as e:
             sources.append({"name": fd["name"], "url": fd["url"], "status": f"unavailable ({type(e).__name__})", "items": 0})
             continue
         for it in items:
             if it.get("date") and it["date"] < since:
                 continue
             text = f"{it['title']} {it.get('summary', '')}"
-            if fd.get("all_relevant") or rel.search(text):
-                why = next((w for rx, w in WHY if re.search(rx, text)), "Relevant to AI agents and the software around them.")
-                research.append({"source": fd["name"], "kind": fd["kind"], "title": it["title"], "link": it.get("link", ""),
-                                 "date": it["date"].date().isoformat() if it.get("date") else "", "summary": it.get("summary", "")[:280], "why": why})
+            if not (fd.get("all_relevant") or rel.search(text)):
+                continue
+            if re.search(r"(?i)\b(podcast|webinar|sponsored|ebook|whitepaper|on-demand|register now|live demo)\b", it["title"]):
+                continue  # formats, not events
+            sc = story_score(text, fd["kind"])
+            if sc < 3:
+                continue
+            cat, label = classify(text)
+            research.append({"id": hashlib.sha1(it["title"].encode()).hexdigest()[:8], "source": fd["name"], "kind": fd["kind"],
+                             "title": it["title"], "link": it.get("link", ""), "date": it["date"].date().isoformat() if it.get("date") else "",
+                             "summary": clip(it.get("summary", ""), 380), "score": sc, "category": cat, "category_label": label})
     seen, dedup = set(), []
-    for r in sorted(research, key=lambda x: x["date"], reverse=True):
+    for r in sorted(sorted(research, key=lambda x: x["date"], reverse=True), key=lambda x: -x["score"]):
         k = re.sub(r"\W+", "", r["title"].lower())[:60]
         if k not in seen:
             seen.add(k)
             dedup.append(r)
-    research = dedup[:14]
+    for i, r in enumerate(dedup):
+        r["tier"] = "act" if r["score"] >= 8 and i < 3 else "watch" if r["score"] >= 6 else "know"
+    research = dedup[:16]
 
     kev, kev_status = [], "ok"
     try:
@@ -1669,7 +1800,7 @@ def gather_brief(cfg, offline=None):
                             "name": v.get("vulnerabilityName"), "added": v.get("dateAdded"), "due": v.get("dueDate"),
                             "ransomware": v.get("knownRansomwareCampaignUse") == "Known", "relevant": bool(watch.search(text)),
                             "action": (v.get("requiredAction") or "")[:200]})
-        kev.sort(key=lambda x: (not x["relevant"], x["added"]), reverse=False)
+        kev.sort(key=lambda x: (not x["relevant"], x["added"]))
     except Exception as e:
         kev_status = f"unavailable ({type(e).__name__})"
     sources.append({"name": "CISA Known Exploited Vulnerabilities", "url": cfg["kev_url"], "status": kev_status, "items": len(kev)})
@@ -1703,114 +1834,186 @@ def gather_brief(cfg, offline=None):
     return {"research": research, "kev": kev, "updates": updates, "pages": pages, "sources": sources, "window_days": days}
 
 
-def brief_actions(b, snap, pkg):
-    acts = []
-    for f in (snap or {}).get("findings", [])[:3]:
-        if f["severity"] in ("critical", "high"):
-            acts.append(("Your setup", f"{f['title']}: {f['fix']}"))
-    for u in b["updates"]:
-        acts.append(("Tooling", f"Update {u['name']} {u['have']} → {u['latest']} (`bash /workspace/watchtower/app/scripts/install.sh --scanners` or re-run setup)."))
-    for k in [k for k in b["kev"] if k["relevant"]][:3]:
-        acts.append(("Exploited now", f"{k['vendor']} {k['product']} ({k['cve']}): {k['action'] or 'apply the vendor fix'}"))
-    for f in (pkg or {}).get("findings", [])[:3]:
-        acts.append(("Packages", f"{f['title']}: {f['fix']}"))
-    for pg in b["pages"]:
-        acts.append(("Platform", f"Re-read “{pg['name']}”: it changed this week."))
-    if not acts:
-        acts.append(("Your setup", "Nothing urgent. Keep the daily watch on and re-vet any template before you add it."))
-    return acts[:8]
+EXPOSURE_AREAS = [
+    ("Secrets on the shared computer", ("WT-S001", "WT-S002", "WT-S003", "WT-T011")),
+    ("Logged-in browser sessions", ("WT-S004",)),
+    ("Skills and templates", ("WT-X001", "WT-X002", "WT-X003", "WT-T001", "WT-T002", "WT-T003", "WT-T004", "WT-T005", "WT-T006", "WT-T007", "WT-T008", "WT-I001")),
+    ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003")),
+    ("Bots, memories and routines", ("WT-M010", "WT-L001", "WT-R002", "WT-T013")),
+    ("Packages", ("WT-D001",)),
+    ("Tripwires and history", ("WT-K001", "WT-K002", "WT-K003", "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H009")),
+]
 
 
-def render_brief(b, snap, pkg, hist, tag, analyst_note=None):
+def exposure(snap):
+    fs = [f for f in (snap or {}).get("findings", []) if f["severity"] in ("critical", "high", "medium")]
+    rows = []
+    for label, rules in EXPOSURE_AREAS:
+        hits = [f for f in fs if f["rule"] in rules]
+        if not hits:
+            rows.append({"area": label, "state": "clear", "count": 0, "top": None})
+            continue
+        top = sorted(hits, key=lambda f: SEV_ORDER.index(f["severity"]))[0]
+        rows.append({"area": label, "state": top["severity"], "count": len(hits), "top": top})
+    return rows
+
+
+def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
     e = html.escape
     safe = lambda u: html.escape(u) if re.match(r"(?i)^https?://", u or "") else "#"
-    rel_kev = [k for k in b["kev"] if k["relevant"]]
-    score = (snap or {}).get("score", "–")
+    notes = notes or {}
+    ctx = account_context()
+    stories, more = split_stories(b)
+    lvl_i, lvl, _ = threat_level(b, snap, stories)
+    score = (snap or {}).get("score")
     grade = (snap or {}).get("grade", "")
-    hot = [f for f in (snap or {}).get("findings", []) if f["severity"] in ("critical", "high")]
-    pkg_f = (pkg or {}).get("findings", [])
-    acts = brief_actions(b, snap, pkg)
-    ok_sources = sum(1 for s in b["sources"] if s["status"] == "ok")
-    summary = analyst_note or (
-        f"In the last {b['window_days']} days, {len(b['research'])} research and news items touched AI agents, skills, MCP or the software "
-        f"supply chain. CISA added {len(b['kev'])} vulnerabilities to its exploited-in-the-wild catalog, {len(rel_kev)} in software "
-        f"software that runs on this kind of computer. Your Grok Bot posture is {score}/100{(' (' + grade + ')') if grade else ''} with "
-        f"{len(hot)} critical or high finding{'s' if len(hot) != 1 else ''} open"
-        f"{', and ' + str(len(pkg_f)) + ' known-vulnerable Python package' + ('s' if len(pkg_f) != 1 else '') if pkg_f else ''}. "
-        f"The first recommended action below is the one to do today.")
-    pill = lambda t, c: f"<span class='pill {c}'>{e(t)}</span>"
-    research_html = "".join(
-        f"<article class='item'><div class='meta'>{pill(r['kind'], 'k-' + re.sub(r'[^a-z]', '', r['kind']))}<span>{e(r['source'])}</span><span>{e(r['date'])}</span></div>"
-        f"<h3><a href='{safe(r['link'])}' target='_blank' rel='noopener'>{e(r['title'])}</a></h3>"
-        f"{('<p>' + e(r['summary']) + '</p>') if r['summary'] else ''}<p class='why'><b>Why it matters here:</b> {e(r['why'])}</p></article>"
-        for r in b["research"]) or "<p class='empty'>No relevant research this week from the sources that responded.</p>"
+    fs = (snap or {}).get("findings", [])
+    crit = sum(1 for f in fs if f["severity"] == "critical")
+    high = sum(1 for f in fs if f["severity"] == "high")
+    rel_kev = [k for k in b["kev"] if k["relevant"]]
+    act = [s for s in stories if s["tier"] == "act"]
+    trend_txt = ""
+    if len(hist) >= 2:
+        d = hist[-1][1] - hist[0][1] if len(hist) < 8 else hist[-1][1] - hist[-8][1]
+        trend_txt = f", {'up' if d > 0 else 'down' if d < 0 else 'flat'} {abs(d)} since the earliest run on record" if d else ", unchanged"
+    exp = exposure(snap)
+    worst_area = next((r for r in exp if r["state"] == "critical"), next((r for r in exp if r["state"] == "high"), None))
+    bluf = analyst_note or " ".join(x for x in [
+        f"Threat level is {lvl.lower()} this week.",
+        (f"{WORDS.get(len(act), str(len(act)))} {'story touches' if len(act) == 1 else 'stories touch'} something you run, led by “{act[0]['title']}”."
+         if act else (f"The story most relevant to you is “{stories[0]['title']}”." if stories else "No relevant research came through this week.")),
+        (f"CISA added {len(rel_kev)} exploited {'vulnerability' if len(rel_kev) == 1 else 'vulnerabilities'} in software this kind of computer runs." if rel_kev else ""),
+        (f"Your posture is {score}/100" + (f" ({grade})" if grade else "") + trend_txt + "." if score is not None else ""),
+        (f"Fix first: {worst_area['area'].lower()}, where {worst_area['count']} {'finding is' if worst_area['count'] == 1 else 'findings are'} open." if worst_area else ""),
+    ] if x)
+
+    # actions: a real priority sequence, so numbering is honest
+    actions = []
+    short = lambda w: (w.split(":")[0] if not w.startswith("python package") else w).replace("/home/box/", "~/")[-60:]
+    if worst_area and worst_area["top"]:
+        actions.append(("Your setup", worst_area["top"]["fix"], short(worst_area["top"]["where"])))
+    for s in act[:2]:
+        n = notes.get(s["id"], {})
+        actions.append(("This week's news", n.get("do") or DO_THIS[s["category"]], s["title"]))
+    for k in rel_kev[:2]:
+        actions.append(("Exploited now", f"Update {k['vendor']} {k['product']}: {k['action'] or 'apply the vendor fix'}", k["cve"]))
+    for u in b["updates"][:2]:
+        actions.append(("Tooling", f"Update {u['name']} from {u['have']} to {u['latest']} by re-running setup.", u["name"]))
+    for r in exp:
+        if len(actions) >= 5:
+            break
+        if r["top"] and r is not worst_area and r["state"] in ("critical", "high"):
+            actions.append(("Your setup", r["top"]["fix"], short(r["top"]["where"])))
+    if not actions:
+        actions.append(("Your setup", "Nothing urgent. Keep the daily watch on and vet templates before you add them.", ""))
+
+    seg = "".join(f"<span class='seg s{i}{' on' if i == lvl_i else ''}{' past' if i < lvl_i else ''}'><b>{n}</b></span>"
+                  for i, n in enumerate(("Low", "Guarded", "Elevated", "High", "Severe")))
+    acts_html = "".join(f"<li><span class='src'>{e(a)}</span><p>{e(t)}</p>{('<span class=ctx>' + e(c) + '</span>') if c else ''}</li>" for a, t, c in actions[:5])
+    tier_word = {"act": "Act on this", "watch": "Watch", "know": "Good to know"}
+
+    def story(s, i):
+        n = notes.get(s["id"], {})
+        return (f"<article class='story t-{s['tier']}' id='s-{e(s['id'])}'>"
+                f"<aside><span class='tier'>{tier_word[s['tier']]}</span><span class='cat c-{s['category']}'>{e(s['category_label'])}</span>"
+                f"<span class='by'>{e(s['source'])}<br>{e(s['date'])}</span></aside>"
+                f"<div><h3><a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a></h3>"
+                f"<dl><dt>What happened</dt><dd>{e(n.get('happened') or s['summary'] or 'See the source.')}</dd>"
+                f"<dt>What it means here</dt><dd>{e(n.get('means') or means_here(s['category'], ctx))}</dd>"
+                f"<dt>What to do</dt><dd>{e(n.get('do') or DO_THIS[s['category']])}</dd></dl></div></article>")
+
+    stories_html = "".join(story(s, i) for i, s in enumerate(stories)) or "<p class='empty'>No research cleared the relevance bar this week. That's a quiet week, not a broken feed; source status is at the end.</p>"
+    more_html = "".join(f"<li><a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a><span>{e(s['source'])}, {e(s['category_label'].lower())}</span></li>" for s in more)
+    cats = {}
+    for s in b["research"]:
+        cats[s["category_label"]] = cats.get(s["category_label"], 0) + 1
+    mx = max(cats.values()) if cats else 1
+    land = "".join(f"<div class='bar'><span>{e(k)}</span><i style='--w:{round(v / mx * 100)}%'></i><b>{v}</b></div>" for k, v in sorted(cats.items(), key=lambda x: -x[1]))
+    kev_note = (f"{len(b['kev'])} added this week; {len(rel_kev)} in software that runs on a computer like this one."
+                if b["kev"] else "No new entries this week, or the catalog was unreachable (see sources).")
     kev_rows = "".join(
         f"<tr class='{'rel' if k['relevant'] else ''}'><td><a href='https://nvd.nist.gov/vuln/detail/{e(k['cve'] or '')}' target='_blank' rel='noopener'>{e(k['cve'] or '')}</a></td>"
-        f"<td>{e(k['vendor'] or '')} {e(k['product'] or '')}</td><td>{e(k['name'] or '')}</td><td>{e(k['added'] or '')}</td>"
-        f"<td>{pill('ransomware', 'crit') if k['ransomware'] else ''}{pill('relevant', 'high') if k['relevant'] else ''}</td></tr>"
-        for k in b["kev"][:25])
-    posture_rows = "".join(
-        f"<tr><td>{pill(f['severity'], 'crit' if f['severity'] == 'critical' else 'high')}</td><td>{e(f['title'])}</td><td><code>{e(f['where'][-70:])}</code></td><td>{e(f['fix'])}</td></tr>"
-        for f in hot[:10]) or "<tr><td colspan=4 class='empty'>No critical or high findings open.</td></tr>"
-    upd = "".join(f"<li><b>{e(u['name'])}</b> {e(u['have'])} → <a href='{safe(u['url'])}' target='_blank' rel='noopener'>{e(u['latest'])}</a></li>" for u in b["updates"])
-    pages = "".join(f"<li><a href='{safe(p['url'])}' target='_blank' rel='noopener'>{e(p['name'])}</a> changed ({e(str(p['was']))} → {e(str(p['now']))})</li>" for p in b["pages"])
-    acts_html = "".join(f"<li><span class='tag'>{e(a)}</span>{e(t)}</li>" for a, t in acts)
-    src_rows = "".join(f"<tr><td>{e(s['name'])}</td><td class='{'ok' if s['status'] == 'ok' else 'bad'}'>{e(s['status'])}</td><td>{s['items']}</td></tr>" for s in b["sources"])
-    pts = hist[-12:] if hist else []
+        f"<td>{e((k['vendor'] or '') + ' ' + (k['product'] or ''))}</td><td>{e(k['name'] or '')}</td><td>{e(k['due'] or '')}</td>"
+        f"<td>{'Ransomware use known' if k['ransomware'] else ''}</td></tr>" for k in b["kev"][:30])
+    exp_parts = []
+    for r in exp:
+        state = "Clear" if r["state"] == "clear" else f"{r['state'].capitalize()}, {r['count']} open"
+        worst = e(r["top"]["title"]) if r["top"] else ""
+        exp_parts.append(f"<tr class='x-{r['state']}'><td><span class='dot'></span>{e(r['area'])}</td><td>{state}</td><td>{worst}</td></tr>")
+    exp_rows = "".join(exp_parts)
     spark = ""
+    pts = hist[-12:] if hist else []
     if len(pts) >= 2:
-        w, h = 160, 36
+        w, h = 120, 28
         step = w / (len(pts) - 1)
-        poly = " ".join(f"{round(i * step, 1)},{round(h - p[1] / 100 * h, 1)}" for i, p in enumerate(pts))
-        spark = f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' aria-label='score trend'><polyline fill='none' stroke='currentColor' stroke-width='2' points='{poly}'/></svg>"
-    generated = dt.datetime.now(dt.timezone.utc).strftime("%d %b %Y %H:%M UTC")
+        spark = f"<svg class='spark' width='{w}' height='{h}' viewBox='0 0 {w} {h}' role='img' aria-label='Posture score over the last {len(pts)} runs'><polyline points='{' '.join(f'{round(i * step, 1)},{round(h - 2 - p[1] / 100 * (h - 4), 1)}' for i, p in enumerate(pts))}'/></svg>"
+    upd = "".join(f"<li>{e(u['name'])} {e(u['have'])} has a newer release, <a href='{safe(u['url'])}' target='_blank' rel='noopener'>{e(u['latest'])}</a>.</li>" for u in b["updates"])
+    pages = "".join(f"<li><a href='{safe(p['url'])}' target='_blank' rel='noopener'>{e(p['name'])}</a> changed since the last brief.</li>" for p in b["pages"])
+    src_rows = "".join(f"<tr><td>{e(s['name'])}</td><td class='{'ok' if s['status'] == 'ok' else 'down'}'>{'Responded' if s['status'] == 'ok' else 'Unavailable'}</td><td>{s['items']}</td></tr>" for s in b["sources"])
+    ok_n = sum(1 for s in b["sources"] if s["status"] == "ok")
+    generated = dt.datetime.now(dt.timezone.utc).strftime("%-d %B %Y, %H:%M UTC")
+    week_no = tag.split("-W")[-1]
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Watchtower Threat Brief · {e(tag)}</title><style>
-:root{{--bg:#f6f7f9;--paper:#fff;--ink:#14181f;--mut:#5c6673;--line:#e2e6eb;--accent:#0f3d68;--accent2:#c8102e;--amber:#b45309;--ok:#1e7b46}}
-@media(prefers-color-scheme:dark){{:root{{--bg:#0d1117;--paper:#151b23;--ink:#e6e9ee;--mut:#9aa4b2;--line:#283140;--accent:#7cb3e8;--accent2:#ff6b7d;--amber:#f0a83a;--ok:#4cc38a}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}}
-.wrap{{max-width:1040px;margin:0 auto;padding:28px 20px 60px}}
-.mast{{background:var(--accent);color:#fff;border-radius:14px 14px 0 0;padding:22px 28px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}}
-@media(prefers-color-scheme:dark){{.mast{{background:#0f2a45}}}}
-.mast h1{{margin:0;font-size:24px;letter-spacing:.06em;text-transform:uppercase}}.mast .sub{{opacity:.85;font-size:13px;margin-top:4px}}
-.tlp{{background:#000;color:#ffc000;font:700 12px/1 ui-monospace,Menlo,monospace;padding:7px 10px;border-radius:4px;letter-spacing:.05em}}
-.paper{{background:var(--paper);border:1px solid var(--line);border-top:0;border-radius:0 0 14px 14px;padding:26px 28px}}
-h2{{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:34px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line)}}
-h2:first-child{{margin-top:0}}.lead{{font-size:17px;line-height:1.6;margin:0}}
-.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:20px}}
-.kpi{{border:1px solid var(--line);border-radius:10px;padding:12px 14px}}.kpi b{{display:block;font-size:28px;line-height:1.1}}.kpi span{{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
-.kpi.s b{{color:var(--accent)}}.kpi.r b{{color:var(--accent2)}}.kpi svg{{color:var(--accent);margin-top:4px}}
-ol.acts{{padding-left:20px;margin:0}}ol.acts li{{margin:8px 0}}.tag{{display:inline-block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);border:1px solid var(--line);border-radius:4px;padding:1px 6px;margin-right:8px}}
-.item{{border-left:3px solid var(--accent);padding:4px 0 4px 14px;margin:16px 0}}.item h3{{margin:4px 0;font-size:16px}}.item a{{color:var(--ink);text-decoration:none}}.item a:hover{{text-decoration:underline}}
-.item p{{margin:4px 0;color:var(--mut)}}.item p.why{{color:var(--ink)}}.meta{{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--mut)}}
-.pill{{display:inline-block;font-size:11px;font-weight:600;border-radius:999px;padding:1px 8px;margin-right:4px;background:var(--line);color:var(--ink);text-transform:lowercase}}
-.pill.crit{{background:var(--accent2);color:#fff}}.pill.high{{background:var(--amber);color:#fff}}
-.scroll{{overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em}}tr.rel td{{background:color-mix(in srgb,var(--amber) 10%,transparent)}}
-td a{{color:var(--accent)}}code{{font:12px ui-monospace,Menlo,monospace}}.ok{{color:var(--ok)}}.bad{{color:var(--accent2)}}.empty{{color:var(--mut);font-style:italic}}
-.foot{{color:var(--mut);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:14px}}
-@media print{{body{{background:#fff}}.wrap{{padding:0}}.mast{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}a{{color:inherit}}}}
-</style></head><body><div class='wrap'>
-<header class='mast'><div><h1>Watchtower Threat Brief</h1><div class='sub'>Week {e(tag)} · {b['window_days']}-day window · generated {e(generated)}</div></div><div class='tlp'>TLP:AMBER</div></header>
-<main class='paper'>
-<h2>Executive summary</h2><p class='lead'>{e(summary)}</p>
-<div class='kpis'><div class='kpi s'><b>{e(str(score))}</b><span>posture score</span>{spark}</div>
-<div class='kpi r'><b>{len(hot)}</b><span>critical / high open</span></div>
-<div class='kpi'><b>{len(b['research'])}</b><span>relevant research</span></div>
-<div class='kpi r'><b>{len(rel_kev)}</b><span>exploited, relevant</span></div>
-<div class='kpi'><b>{len(pkg_f)}</b><span>vulnerable packages</span></div></div>
-<h2>Recommended actions</h2><ol class='acts'>{acts_html}</ol>
-<h2>Agent and AI security developments</h2>{research_html}
-<h2>Exploited in the wild this week (CISA KEV)</h2>
-<div class='scroll'><table><tr><th>CVE</th><th>Product</th><th>Vulnerability</th><th>Added</th><th></th></tr>{kev_rows or "<tr><td colspan=5 class='empty'>No new entries, or the catalog was unreachable (see sources).</td></tr>"}</table></div>
-<h2>Your exposure</h2>
-<div class='scroll'><table><tr><th>Severity</th><th>Finding</th><th>Where</th><th>Fix</th></tr>{posture_rows}</table></div>
-{('<h3>Tool updates available</h3><ul>' + upd + '</ul>') if upd else ''}
-{('<h3>Platform documentation changes</h3><ul>' + pages + '</ul>') if pages else ''}
-<h2>Sources and method</h2>
-<div class='scroll'><table><tr><th>Source</th><th>Status</th><th>Items</th></tr>{src_rows}</table></div>
-<p class='foot'>{ok_sources} of {len(b['sources'])} sources responded. Items are filtered for relevance to AI agents, skills, MCP and the software supply chain; “why it matters” is matched to how Grok Bot works, not written by a model. Posture data comes from Watchtower {e(VERSION)}'s latest audit of this computer. TLP:AMBER: share with people who help you secure this account. Unavailable sources are listed rather than filled in from old data.</p>
-</main></div></body></html>"""
+<title>Watch report, week {e(week_no)}: threat level {e(lvl.lower())}</title><style>
+:root{{--paper:#eef1f0;--sheet:#fbfcfb;--ink:#1c2430;--soft:#56606c;--rule:#cfd6d4;--navy:#1f3a5f;--red:#b3261e;--amber:#c98a00;--green:#2e7d5b;--sea:#3f6f8f;
+--serif:Charter,"Bitstream Charter","Iowan Old Style","Source Serif Pro",Georgia,serif;--cond:"Avenir Next Condensed","Roboto Condensed","Arial Narrow","Helvetica Neue",sans-serif-condensed,sans-serif}}
+@media(prefers-color-scheme:dark){{:root{{--paper:#0e1621;--sheet:#131d2a;--ink:#e3e9ef;--soft:#9aa7b4;--rule:#2a3747;--navy:#8fb3dc;--red:#ff7a6e;--amber:#f2b632;--green:#5cc493;--sea:#7fb0cf}}}}
+*{{box-sizing:border-box}}html{{background:var(--paper)}}body{{margin:0;color:var(--ink);font:17px/1.62 var(--serif);font-variant-numeric:oldstyle-nums proportional-nums}}
+a{{color:var(--navy);text-decoration-thickness:1px;text-underline-offset:3px}}a:focus-visible{{outline:2px solid var(--navy);outline-offset:2px}}
+.sheet{{max-width:980px;margin:32px auto;background:var(--sheet);border:1px solid var(--rule);padding:0 0 48px}}
+header.mast{{display:grid;grid-template-columns:1fr auto;gap:8px 24px;align-items:end;padding:28px 48px 18px;border-bottom:3px solid var(--ink)}}
+.mast h1{{margin:0;font:600 40px/1 var(--cond);letter-spacing:-.01em}}.mast .sub{{grid-column:1;color:var(--soft);font:15px/1.4 var(--cond)}}
+.tlp{{grid-row:1/3;grid-column:2;font:700 13px/1 var(--cond);background:#000;color:#ffc000;padding:8px 12px;letter-spacing:.04em}}
+section{{padding:0 48px}}h2{{font:600 24px/1.2 var(--cond);margin:44px 0 14px;padding-top:12px;border-top:1px solid var(--rule)}}
+.condition{{display:grid;grid-template-columns:minmax(260px,330px) 1fr;gap:32px;padding:30px 48px 6px;align-items:start}}
+.gauge .seg{{display:flex;align-items:center;height:38px;padding:0 14px;border:1px solid var(--rule);color:var(--soft);font:600 15px/1 var(--cond)}}
+.gauge .seg{{border-left-width:6px}}.gauge .s0{{border-left-color:var(--green)}}.gauge .s1{{border-left-color:var(--sea)}}.gauge .s2{{border-left-color:var(--amber)}}.gauge .s3{{border-left-color:var(--red)}}.gauge .s4{{border-left-color:#6d0f0a}}
+.gauge .seg.on{{color:#fff;height:58px;font-size:24px;border-left-color:transparent}}
+.gauge .s0.on{{background:var(--green)}}.gauge .s1.on{{background:var(--sea)}}.gauge .s2.on{{background:var(--amber);color:#1c2430}}.gauge .s3.on{{background:var(--red)}}.gauge .s4.on{{background:#6d0f0a}}
+.gauge{{display:flex;flex-direction:column-reverse}}.gauge .seg+.seg{{margin-bottom:4px}}
+.bluf .label{{font:600 15px/1 var(--cond);color:var(--soft);margin:2px 0 10px}}.bluf p{{font-size:23px;line-height:1.45;margin:0;max-width:34em}}
+.ledger{{display:flex;flex-wrap:wrap;gap:4px 28px;margin:18px 0 0;padding:12px 0 0;border-top:1px solid var(--rule);font:16px/1.4 var(--cond);color:var(--soft)}}
+.ledger b{{color:var(--ink);font-weight:600;font-variant-numeric:lining-nums tabular-nums}}.spark{{vertical-align:middle;margin-left:6px}}.spark polyline{{fill:none;stroke:var(--navy);stroke-width:2}}
+ol.actions{{list-style:none;counter-reset:a;padding:0;margin:0}}ol.actions li{{counter-increment:a;display:grid;grid-template-columns:44px 150px 1fr;gap:4px 16px;padding:14px 0;border-bottom:1px solid var(--rule)}}
+ol.actions li::before{{content:counter(a);font:600 30px/1 var(--cond);color:var(--navy);font-variant-numeric:lining-nums}}
+ol.actions .src{{font:600 15px/1.5 var(--cond);color:var(--soft)}}ol.actions p{{margin:0}}ol.actions .ctx{{grid-column:3;color:var(--soft);font-size:14px}}
+.story{{display:grid;grid-template-columns:170px 1fr;gap:28px;padding:22px 0;border-bottom:1px solid var(--rule)}}
+.story aside{{font:15px/1.35 var(--cond);display:flex;flex-direction:column;gap:8px;border-left:4px solid var(--rule);padding-left:12px}}
+.story.t-act aside{{border-color:var(--red)}}.story.t-watch aside{{border-color:var(--amber)}}
+.tier{{font-weight:600}}.t-act .tier{{color:var(--red)}}.t-watch .tier{{color:var(--amber)}}.cat{{color:var(--ink)}}.by{{color:var(--soft);font-size:14px}}
+.story h3{{font:600 25px/1.2 var(--cond);margin:0 0 12px}}.story h3 a{{color:var(--ink);text-decoration:none}}.story h3 a:hover{{text-decoration:underline}}
+dl{{margin:0;display:grid;grid-template-columns:150px 1fr;gap:8px 18px}}dt{{font:600 15px/1.6 var(--cond);color:var(--soft)}}dd{{margin:0;max-width:36em}}
+ul.more{{list-style:none;padding:0;margin:0;columns:2;column-gap:40px}}ul.more li{{break-inside:avoid;padding:8px 0;border-bottom:1px solid var(--rule);font-size:16px}}ul.more span{{display:block;color:var(--soft);font:14px/1.3 var(--cond)}}
+.land{{display:grid;gap:6px;max-width:620px}}.bar{{display:grid;grid-template-columns:220px 1fr 28px;align-items:center;gap:12px;font:15px/1 var(--cond)}}.bar i{{height:10px;background:linear-gradient(90deg,var(--navy) var(--w),transparent var(--w));border:1px solid var(--rule)}}.bar b{{text-align:right;font-variant-numeric:lining-nums}}
+.scroll{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;font:15px/1.4 var(--cond)}}th,td{{text-align:left;padding:9px 10px 9px 0;border-bottom:1px solid var(--rule);vertical-align:top}}th{{color:var(--soft);font-weight:600}}
+tr.rel td{{background:color-mix(in srgb,var(--amber) 14%,transparent)}}td .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:10px;background:var(--green)}}
+.x-critical .dot{{background:var(--red)}}.x-high .dot{{background:var(--amber)}}.x-medium .dot{{background:var(--sea)}}.ok{{color:var(--green)}}.down{{color:var(--red)}}
+.lede{{margin:0 0 12px;color:var(--soft)}}.empty{{color:var(--soft);font-style:italic}}details summary{{cursor:pointer;font:600 15px/1.6 var(--cond);color:var(--navy);margin:8px 0}}
+footer{{margin:40px 48px 0;padding-top:14px;border-top:3px solid var(--ink);color:var(--soft);font:14px/1.5 var(--cond);display:grid;grid-template-columns:1fr 1fr;gap:20px}}
+@media(prefers-color-scheme:dark){{.gauge .seg.on{{color:#0e1621}}}}
+@media(max-width:760px){{header.mast,section,.condition{{padding-left:20px;padding-right:20px}}.condition{{grid-template-columns:1fr;gap:18px}}.bluf{{order:-1}}
+.gauge{{flex-direction:row;gap:4px}}.gauge .seg{{flex:1;height:34px;padding:0 6px;justify-content:center;font-size:12px}}.gauge .seg+.seg{{margin-bottom:0}}.gauge .seg.on{{flex:2.4;height:40px;font-size:17px}}.bluf p{{font-size:20px}}.story{{grid-template-columns:1fr;gap:10px}}
+.story aside{{flex-direction:row;flex-wrap:wrap;gap:12px}}dl{{grid-template-columns:1fr}}ol.actions li{{grid-template-columns:36px 1fr}}ol.actions .src,ol.actions .ctx{{grid-column:2}}ul.more{{columns:1}}footer{{grid-template-columns:1fr;margin:30px 20px 0}}.bar{{grid-template-columns:130px 1fr 24px}}.mast h1{{font-size:30px}}}}
+@media print{{html{{background:#fff}}.sheet{{border:0;margin:0}}.story,ol.actions li,tr{{break-inside:avoid}}a{{color:inherit;text-decoration:none}}.gauge .seg.on,.tlp{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
+@media(prefers-reduced-motion:no-preference){{.gauge .seg.on{{animation:raise .5s ease-out .15s both}}@keyframes raise{{from{{filter:saturate(0);transform:scaleX(.96)}}}}}}
+</style></head><body><div class='sheet'>
+<header class='mast'><h1>Watchtower watch report</h1><span class='tlp'>TLP:AMBER</span><div class='sub'>Week {e(week_no)} of {e(tag[:4])}, covering the last {b['window_days']} days. Prepared for this Grok Bot account on {e(generated)}.</div></header>
+<div class='condition'><div class='gauge' role='img' aria-label='Threat level {e(lvl)}'>{seg}</div>
+<div class='bluf'><div class='label'>Bottom line</div><p>{e(bluf)}</p>
+<div class='ledger'><span>Posture <b>{e(str(score)) if score is not None else 'not yet audited'}</b>{('/100 ' + e(grade)) if score is not None else ''}{spark}</span><span>Critical <b>{crit}</b></span><span>High <b>{high}</b></span><span>Stories that touch you <b>{len(act)}</b></span><span>Exploited, relevant <b>{len(rel_kev)}</b></span></div></div></div>
+<section><h2>Do these in order</h2><ol class='actions'>{acts_html}</ol></section>
+<section><h2>This week's stories</h2><p class='lede'>Ranked by how directly each one touches a Grok Bot account like yours.</p>{stories_html}
+{('<h2>Also this week</h2><ul class=more>' + more_html + '</ul>') if more_html else ''}</section>
+{('<section><h2>Where the activity was</h2><div class=land>' + land + '</div></section>') if land else ''}
+<section><h2>Exploited in the wild</h2><p class='lede'>{e(kev_note)} Source: CISA Known Exploited Vulnerabilities.</p>
+{('<details' + (' open' if rel_kev else '') + '><summary>' + ('Show the relevant entries' if rel_kev else 'Show all entries') + '</summary><div class=scroll><table><tr><th>CVE</th><th>Product</th><th>Vulnerability</th><th>Fix by</th><th></th></tr>' + kev_rows + '</table></div></details>') if kev_rows else ''}</section>
+<section><h2>Your exposure</h2><p class='lede'>From Watchtower's latest audit of this computer. Details are in the weekly report and dashboard.</p>
+<div class='scroll'><table><tr><th>Area</th><th>State</th><th>Most serious finding</th></tr>{exp_rows}</table></div>
+{('<h3>Tool updates</h3><ul>' + upd + '</ul>') if upd else ''}{('<h3>Platform documentation changes</h3><ul>' + pages + '</ul>') if pages else ''}</section>
+<section><h2>Sources</h2><p class='lede'>{ok_n} of {len(b['sources'])} sources responded this week.</p><details><summary>Show every source and its status</summary><div class='scroll'><table><tr><th>Source</th><th>Status</th><th>Items read</th></tr>{src_rows}</table></div></details></section>
+<footer><p>{ok_n} of {len(b['sources'])} sources responded. Stories are ranked by how directly they touch AI agents, connectors, skills and the software on this computer; “what it means here” uses this account's own numbers. Sources that didn't respond are listed, never filled in from old data.</p>
+<p>Watchtower {e(VERSION)}, read-only. TLP:AMBER means share it only with people who help you secure this account. Scanners and feeds are evidence, not proof.</p></footer>
+</div></body></html>"""
 
 
 def cmd_brief(args):
@@ -1819,7 +2022,12 @@ def cmd_brief(args):
         print("ERROR feeds.json missing", file=sys.stderr)
         return 2
     offline = load_json(args.offline, None) if args.offline else None
-    b = gather_brief(cfg, offline)
+    reuse = getattr(args, "notes", None) or getattr(args, "summary", None)
+    last = load_json(state_path("last_brief.json"), None)
+    week = dt.date.today().isocalendar()
+    tag = f"{week[0]}-W{week[1]:02d}"
+    # adding analysis re-renders this week's brief from saved data instead of fetching again
+    b = last if (reuse and last and last.get("tag") == tag and offline is None) else gather_brief(cfg, offline)
     snap = load_json(state_path("last_findings.json"), None)
     pkg = load_json(state_path("package_vulns.json"), None)
     hist = []
@@ -1828,20 +2036,22 @@ def cmd_brief(args):
             hist = [(a, int(s), int(n)) for a, s, n in (l.strip().split(",") for l in f if l.strip())]
     except (OSError, ValueError):
         pass
-    note = open(args.summary).read().strip() if args.summary else None
-    week = dt.date.today().isocalendar()
-    tag = f"{week[0]}-W{week[1]:02d}"
+    note = open(args.summary).read().strip() if getattr(args, "summary", None) else None
+    notes = load_json(args.notes, {}) if getattr(args, "notes", None) else {}
     rdir = os.path.join(home(), "reports")
     os.makedirs(rdir, exist_ok=True)
     path = os.path.join(rdir, f"threat-brief-{tag}.html")
     with open(path, "w") as f:
-        f.write(render_brief(b, snap, pkg, hist, tag, note))
+        f.write(render_brief(b, snap, pkg, hist, tag, note, notes))
     save_json(state_path("last_brief.json"), dict(b, tag=tag, path=path))
     ledger({"event": "brief", "week": tag, "research": len(b["research"]), "kev": len(b["kev"])})
-    print(fit({"brief": path, "research": [{"title": r["title"], "source": r["source"]} for r in b["research"][:8]],
-               "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:8],
+    top, _ = split_stories(b)
+    print(fit({"brief": path, "threat_level": threat_level(b, snap, top)[1],
+               "top_stories": [{"id": r["id"], "tier": r["tier"], "category": r["category_label"], "title": r["title"],
+                                "summary": r["summary"][:260], "source": r["source"]} for r in top],
+               "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:6],
                "updates": b["updates"], "doc_changes": [p["name"] for p in b["pages"]],
-               "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"]}))
+               "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"]}, limit=6000))
     return 0
 
 
@@ -1863,7 +2073,7 @@ def main(argv=None):
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
     ic = sub.add_parser("incident"); ic.add_argument("--note")
     cs = sub.add_parser("codescan"); cs.add_argument("path")
-    br = sub.add_parser("brief"); br.add_argument("--summary"); br.add_argument("--offline")
+    br = sub.add_parser("brief"); br.add_argument("--summary"); br.add_argument("--notes"); br.add_argument("--offline")
     a = ap.parse_args(argv)
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,

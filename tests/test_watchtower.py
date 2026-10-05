@@ -373,6 +373,32 @@ class Features(unittest.TestCase):
         self.assertTrue({"WT-M010", "WT-T001", "WT-L001", "WT-R002", "WT-R010"} <= rules, rules)
         self.assertTrue(all("ASI06" in f["owasp"] for f in fs if ":memory" in f["where"]))
 
+    def test_brief_ranking_notes_and_clip(self):
+        self.assertTrue(wt.clip("First sentence here. Second sentence that runs on and on.", 40).endswith("here."))
+        self.assertTrue(wt.clip("word " * 50, 33).endswith("…"))
+        self.assertEqual(wt.clip("Advisory says it is bad. Affected versions sent the secret, the code,", 380), "Advisory says it is bad.")
+        cfg = json.load(open(wt.FEEDS_PATH))
+        today = dt.datetime.now(dt.timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
+        items = [("Insecure Agents Podcast: agents bypassing security controls", "prompt injection agent bypass"),
+                 ("Official MCP SDK flaw lets malicious servers steal OAuth credentials", "MCP OAuth credential theft"),
+                 ("How financial services companies can modernize their software supply chain", "supply chain modernize"),
+                 ("Agent bypasses internet controls to reach an external chatbot", "agent escaped its sandbox controls")]
+        rss = "<rss><channel>" + "".join(f"<item><title>{t}</title><link>https://example.org/{i}</link><pubDate>{today}</pubDate><description>{d}</description></item>" for i, (t, d) in enumerate(items)) + "</channel></rss>"
+        off = {cfg["feeds"][0]["url"]: rss, cfg["kev_url"]: json.dumps({"vulnerabilities": []})}
+        path = os.path.join(self.tmp, "off.json")
+        json.dump(off, open(path, "w"))
+        code, o = self.out("brief", "--offline", path)
+        top = json.loads(o)["top_stories"]
+        titles = [s["title"] for s in top]
+        self.assertFalse(any("Podcast" in t for t in titles))
+        self.assertFalse(any("financial services" in t for t in titles))
+        self.assertEqual({s["tier"] for s in top[:2]}, {"act"})
+        sid = top[0]["id"]
+        json.dump({sid: {"means": "Your Inbox Bot uses this exact connector.", "do": "Disconnect it today."}}, open(os.path.join(self.tmp, "n.json"), "w"))
+        code, o = self.out("brief", "--offline", path, "--notes", os.path.join(self.tmp, "n.json"))
+        page = open(json.loads(o)["brief"]).read()
+        self.assertIn("Your Inbox Bot uses this exact connector.", page)
+
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")
         os.makedirs(d)
@@ -424,14 +450,15 @@ class Features(unittest.TestCase):
         code, o = self.out("brief", "--offline", path)
         r = json.loads(o)
         page = open(r["brief"]).read()
-        self.assertIn("Watchtower Threat Brief", page)
+        self.assertIn("Watchtower watch report", page)
         self.assertIn("CVE-2026-0001", page)
         self.assertNotIn("CVE-2020-0002", page)
         self.assertNotIn("<script>", page)
         self.assertNotIn("javascript:alert", page)
         self.assertNotIn("Gardening", page)
-        self.assertIn("unavailable", page)                 # feeds missing in offline mode are listed, not invented
-        self.assertEqual(len(r["research"]), 1)
+        self.assertIn("Unavailable", page)                 # feeds missing in offline mode are listed, not invented
+        self.assertEqual(len(r["top_stories"]), 1)
+        self.assertEqual(r["top_stories"][0]["category"], "MCP and connectors")
 
 
 if __name__ == "__main__":

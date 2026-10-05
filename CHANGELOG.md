@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1 — 2026-10-05 (watch report redesign; first full-engine audit on a real box)
+- Threat brief redesigned as a watch report: threat level, bottom line, ordered actions, ranked stories with what happened, what it means for this account (using its own numbers) and what to do, exposure by area, exploited vulnerabilities, folded source list. Light, dark, mobile and print layouts; no external fonts or requests.
+- Stories are scored and categorized (MCP and connectors, agent hijacking, supply chain, credentials, browser, platform). Podcasts, webinars and how-we-built posts drop out; agent misbehavior ranks up. Summaries end on full sentences.
+- The Bot can add its own analysis per story (`wt.py brief --notes notes.json`), re-rendering the same week without fetching again.
+- gitleaks skips browser profiles, the Go toolchain and known CLI credential files (reported once as WT-S003, now including the Codex CLI); folders with many secret files become one finding.
+
 ## v0.2.0 — 2026-10-05 (full feature set)
 - Three engines: SkillSpector and husk run on your own skills plus anything new or changed; two engines agreeing is a corroborated critical. Scanners are found in Watchtower's own folder (fixes "SkillSpector not installed" when it was).
 - Weekly threat brief: professional HTML with relevant research, CISA exploited vulnerabilities, tool updates, Grok Bot doc changes, your exposure and recommended actions. Hostile feed content is escaped and non-http links are dropped.
