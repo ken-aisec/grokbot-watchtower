@@ -4,7 +4,7 @@
 #        bash install.sh --scanners    add SkillSpector, husk and gitleaks (optional)
 set -euo pipefail
 WT_HOME="${WATCHTOWER_HOME:-/workspace/watchtower}"
-REPO="https://github.com/GITHUB_OWNER/grokbot-watchtower"
+REPO="https://github.com/ken-aisec/grokbot-watchtower"
 GITLEAKS_VERSION="8.21.2"
 
 if [[ "${1:-}" == "--scanners" ]]; then
