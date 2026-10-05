@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.0 — 2026-10-05 (one yes, then everything)
+- `/watchtower-fix` is now a one-question fix. It previews everything it can do, asks once, then does it: safe cleanup, software upgrades, Ask-first rules, and accepting findings that are fine on purpose.
+- Upgrades with automatic undo. Python packages are upgraded at user level (system files are never touched) and put back if `pip check` shows anything new broke. Project dependencies get `npm audit fix` on the lockfile only, never `--force`, with a backup copy and a check that the dependency tree still resolves. Verified against real pip, PyPI and npm: pip 2.7.0 → 2.15.1 and back; a lockfile with a critical and a high issue went to zero.
+- `wt.py accept --all-current RULES` and `wt.py fix --accept RULES`: accept what's open now; new findings still show. Never accepts two scanners agreeing a skill is dangerous, a touched decoy, a working key, or a memory acting as an order.
+- Ask-first rules saved to `exports/auto-review.txt` count, so rules that only exist in the app no longer show as missing forever.
+- Each item in the report says who handles it: Fix handles it, One yes, or Only you.
+- Fixed: accepting one finding could hide another that happened to share its key.
+- Fixed: `pip uninstall` is blocked on protected Pythons the same way `pip install` is; the undo now handles it.
+
 ## v0.4.1 — 2026-10-05 (a score you can trust: stability pass)
 - The score history only shows full audits measured with the current formula. Older scores (earlier formulas) and daily runs no longer appear, so the trend line isn't comparing different measuring sticks. A ring on the chart and "Watchtower updated" next to the change mark audits where a new version or scanner was added, since a jump there isn't new problems.
 - Smoother score: one kind of finding appearing or vanishing moves it by at most 12 points (was 20), and many of the same kind add at most 50% more.

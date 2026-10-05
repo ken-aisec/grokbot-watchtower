@@ -16,7 +16,7 @@ Watchtower is a read-only security officer for that setup. It vets templates bef
 | `/watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
 | `/watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
 | `/watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
-| `/watchtower-fix` | The easy fix button: removes keys from chat logs, empties tool caches, resets decoys and prunes old reports, then lists in plain words what only you can do, with direct links |
+| `/watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages and npm lockfiles (each upgrade is backed up and undone automatically if it breaks something), adds your Ask-first rules, and accepts findings that are fine on purpose, after asking you a single question |
 | `/watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
 
 | Routine | When | Cost |
@@ -49,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.4.1/scripts/install.sh
-head -40 install.sh && bash install.sh v0.4.1
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.0/scripts/install.sh
+head -40 install.sh && bash install.sh v0.5.0
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -65,7 +65,9 @@ wt.py brief [--summary F]     weekly threat brief (HTML)
 wt.py rollcall                analyze saved roll-call replies
 wt.py prepublish PATH         check a Bot before sharing it as a template
 wt.py fix [--apply]            safe cleanup (preview by default)
-wt.py accept RULE WHERE --reason "..."   accept a risk on purpose (90 days)
+wt.py fix --apply --upgrade --accept RULES   everything in one pass (after your yes)
+wt.py accept RULE WHERE --reason "..."   accept one risk on purpose (90 days)
+wt.py accept --all-current RULES         accept everything currently open for those rules
 wt.py events list|clear        one-time detections
 wt.py canary plant|status|remove
 wt.py incident --note "..."   evidence pack + containment checklist

@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, math, os, re, shutil, subprocess, sys
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -397,9 +397,9 @@ def skill_dir_files(skill_md):
     return sorted(files)[:200]
 
 
-def run(cmd, timeout=120):
+def run(cmd, timeout=120, cwd=None):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         return r.returncode, r.stdout, r.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, "", str(e)
@@ -564,6 +564,7 @@ def audit(roots, exports, quick=False):
                               f"{p}:{line_of(t, m.start())}", f"{mask(m.group(0))} ({len(hits)} in file)",
                               "Every Bot can read this file. Revoke the key, delete the file, and use the secure secret request instead."))
 
+    export_rules, native_rules = "", ""
     # 5. exports the user pastes in (routines, descriptions, Auto Review rules, settings)
     if exports and os.path.isdir(exports):
         for fn in sorted(os.listdir(exports)):
@@ -577,7 +578,8 @@ def audit(roots, exports, quick=False):
             elif low.startswith(("bot", "description", "skill", "template")):
                 fs += scan_text(t, f"export:{fn}", rules, kind="description")
             elif low.startswith("auto-review") or low.startswith("autoreview"):
-                fs += lint_auto_review(t, f"export:{fn}")
+                export_rules += "\n" + t
+                fs += lint_auto_review(t, f"export:{fn}", check_missing=False)
             elif low.startswith("settings") and low.endswith(".json"):
                 fs += lint_settings(load_json(p, {}), f"export:{fn}")
     else:
@@ -586,14 +588,20 @@ def audit(roots, exports, quick=False):
     nat = native_settings()
     if nat:
         rules_text, settings, p = nat
+        native_rules = rules_text
         if rules_text:
-            fs += lint_auto_review(rules_text, p)
-        else:
-            fs.append(finding("WT-A005", "No Auto Review rules", "medium", ["ASI09"], p, "autoReviewInstructions empty",
-                              "Add Ask-first rules for sending, publishing, purchasing, deleting, and changing settings or routines."))
+            fs += lint_auto_review(rules_text, p, check_missing=False)
         fs += lint_settings(settings, p)
     else:
         notes.append("Grok Bot settings.json not found: Auto Review rules and local execution checked from exports only.")
+
+    combined = native_rules + "\n" + export_rules
+    gaps = ask_first_gaps(combined)
+    if gaps:
+        fs.append(finding("WT-A003", "Ask-first rules not found", "medium", ["ASI09"], "Auto-review rules",
+                          ", ".join(gaps),
+                          "Rules saved only in the app can't be seen from the computer. Tell the Bot to add them and save a copy to "
+                          "/workspace/watchtower/exports/auto-review.txt."))
 
     # 5b. tripwires and shell history (zero tokens)
     fs += remember_events(canary_findings() + history_findings(rules))
@@ -663,7 +671,17 @@ def native_settings():
     return None
 
 
-def lint_auto_review(text, where):
+ASK_AREAS = (("sending email or messages", r"send|email|message"), ("publishing or posting", r"publish|post"),
+             ("purchases or payments", r"purchas|pay|buy"), ("deleting data", r"delet|remov"),
+             ("changing permissions or settings", r"permission|setting|routine|connector"))
+
+
+def ask_first_gaps(text):
+    ask = " ".join(l for l in text.splitlines() if re.search(r"(?i)ask\s+first", l)).lower()
+    return [w for w, rx in ASK_AREAS if not re.search(rx, ask)]
+
+
+def lint_auto_review(text, where, check_missing=True):
     out = []
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     for i, l in enumerate(lines, 1):
@@ -676,10 +694,7 @@ def lint_auto_review(text, where):
         if re.search(r"(?i)allow\s+automatically", l) and re.search(r"(?i)(automation|routine|schedul|cron|trigger|create\s+(a\s+)?skill|install|plugin|connector)", l):
             out.append(finding("WT-A004", "Auto-allow on creating automations or installs", "high", ["ASI10", "ASI03"], f"{where}:{i}", l[:140],
                                "Change it to Ask first. Anything that creates a routine or installs code can give injected text a way to run again later, unattended."))
-    ask = " ".join(l for l in lines if re.search(r"(?i)ask\s+first", l)).lower()
-    missing = [w for w, rx in (("sending email or messages", r"send|email|message"), ("publishing or posting", r"publish|post"),
-                               ("purchases or payments", r"purchas|pay|buy"), ("deleting data", r"delet|remov"),
-                               ("changing permissions or settings", r"permission|setting")) if not re.search(rx, ask)]
+    missing = ask_first_gaps(text) if check_missing else []
     if missing:
         out.append(finding("WT-A003", "Missing Ask-first rules", "medium", ["ASI09"], where, ", ".join(missing),
                            "Add Ask-first rules in Settings → General → Auto-review for: " + ", ".join(missing) + "."))
@@ -990,9 +1005,8 @@ def is_accepted(f, sup, today):
 def active(findings):
     sup = load_json(state_path("suppressions.json"), [])
     today = dt.date.today().isoformat()
-    acc = [f for f in findings if is_accepted(f, sup, today)]
-    keys = {f["key"] for f in acc}
-    return [f for f in findings if f["key"] not in keys], acc
+    flags = [is_accepted(f, sup, today) for f in findings]   # per finding, never by shared key
+    return [f for f, a in zip(findings, flags) if not a], [f for f, a in zip(findings, flags) if a]
 
 
 def cmd_accept(args):
@@ -1005,6 +1019,10 @@ def cmd_accept(args):
             print(f"{state:8} {s_.get('rule', '-'):9} {s_.get('match') or s_.get('key', '')[:12]:40} until {s_.get('expires')}  {s_.get('reason', '')}")
         if not sup:
             print("No accepted risks.")
+        return 0
+    if args.all_current:
+        n, skipped, exp = accept_current([r.strip() for r in args.rule.split(",")], args.reason or "reviewed by owner", args.days)
+        print(f"Accepted {n} finding(s) until {exp}." + (f" {skipped} can't be accepted and stay open." if skipped else ""))
         return 0
     if args.remove:
         keep = [s_ for s_ in sup if not (s_.get("rule") == args.rule and s_.get("match") == args.where)]
@@ -2156,7 +2174,8 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
 
     def todo_item(i, t):
         links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Turn off {e(n)} keys</a>" for n, u in t.get("links", []))
-        return (f"<li class='sev-{t['severity']}'><div class='tt'><b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}</div>"
+        return (f"<li class='sev-{t['severity']}'><div class='tt'><b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}"
+                f"<span class='hd h-{t.get('handled', 'Only you').split()[0].lower()}'>{e(t.get('handled', ''))}</span></div>"
                 f"<p>{e(t['why'])} <span class='how'>{e(t['how'])}</span></p>{('<div class=links>' + links + '</div>') if links else ''}{rows_table(t)}</li>")
 
     todo_html = "".join(todo_item(i, t) for i, t in enumerate(todo[:4])) or "<li class='sev-ok'><div class='tt'><b>Nothing needs you.</b></div></li>"
@@ -2222,6 +2241,7 @@ ol.todo li{{background:var(--card);border:1px solid var(--line);border-left:5px 
 ul.threats li{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}}ul.threats a{{font-weight:600;color:var(--ink);text-decoration:none;font-size:17px}}ul.threats a:hover{{text-decoration:underline}}ul.threats p{{margin:6px 0 0;color:var(--soft)}}ul.threats p b{{color:var(--ink);font-weight:600}}
 .tag{{display:inline-block;font-size:12px;font-weight:600;color:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 7px;margin-right:8px;vertical-align:2px}}
 details{{margin-top:10px}}summary{{cursor:pointer;color:var(--navy);font-weight:600;font-size:14px}}ul.small{{margin:8px 0 0;padding-left:18px;color:var(--soft);font-size:14px}}ul.small li{{margin:4px 0}}ul.small b{{color:var(--ink)}}.q{{color:var(--soft)}}
+.hd{{float:right;font-size:12px;font-weight:600;border-radius:6px;padding:2px 8px;background:var(--line);color:var(--soft)}}.hd.h-fix{{background:color-mix(in srgb,var(--green) 18%,transparent);color:var(--green)}}.hd.h-only{{background:color-mix(in srgb,var(--red) 16%,transparent);color:var(--red)}}
 .quiet{{color:var(--soft);font-size:14px}}.hint{{margin:6px 0 0!important;font-size:13px}}
 .cmd code{{user-select:all;-webkit-user-select:all;cursor:text}}.engines{{margin:14px 2px 0;color:var(--soft);font-size:13px}}
 details.dd{{margin-top:8px}}details.dd summary{{font-size:13px}}.scroll{{overflow-x:auto}}details.dd table{{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}}
@@ -2235,7 +2255,7 @@ ol.small-todo{{margin-top:8px}}ol.small-todo li{{padding:10px 12px}}ol.small-tod
 <header class='hero {tone}'><h1>{e(status)}</h1><p class='sub'>{e(sub)}</p><div class='metrics'>{metrics}</div></header>
 <div class='charts'><div class='panel'><h3>Security score over time</h3>{svg_trend(hist)}</div><div class='panel'><h3>Where the open issues are</h3>{svg_areas(exp)}</div></div>
 {engines_html}
-<div class='fix'><div class='fx'><h3>Fix it now</h3><p>Paste this into your Watchtower Bot. It clears old keys from chat logs, empties tool caches and resets the decoys, then tells you what's left. It asks before changing anything.</p>
+<div class='fix'><div class='fx'><h3>Fix it all</h3><p>Paste this into your Watchtower Bot. It cleans up, upgrades outdated software (and undoes any upgrade that breaks something), then asks you one yes or no for everything that's fine on purpose.</p>
 <div class='cmd'><code id='c1' tabindex='0'>{e(fix_prompt)}</code><button type='button' data-copy='c1' hidden>Copy</button></div><p class='hint'>Click the text to select it, then copy.</p></div>
 <div class='fx alt'><h3>Keep it clean automatically</h3><p>Paste this into Watchtower as a new routine. It runs the same safe cleanup every Sunday.</p>
 <div class='cmd'><code id='c2' tabindex='0'>{e(routine)}</code><button type='button' data-copy='c2' hidden>Copy</button></div><p class='hint'>Click the text to select it, then copy.</p></div></div>
@@ -2326,7 +2346,7 @@ REVOKE = [  # gitleaks rule prefix → where the owner turns that key off
 PLAIN = {
     "WT-S001": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider, then delete the file.", "you"),
     "WT-S002": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider; Watchtower clears the copies.", "you"),
-    "WT-S003": ("A command-line login is stored on the Bot computer", "Any Bot can act as you with it.", "Keep it if a Bot needs it; otherwise sign out of that tool.", "you"),
+    "WT-S003": ("A command-line login is stored on the Bot computer", "Any Bot can act as you with it.", "Run /watchtower-fix: one yes keeps it, or sign out of that tool.", "you"),
     "WT-S004": ("The shared browser is logged in to sensitive sites", "Every Bot uses the same logins.", "In the Bot browser, sign out of sites no Bot needs.", "you"),
     "WT-A001": ("An auto-approve rule is too broad", "Bots can act without asking.", "Settings → General → Auto-review: change it to Ask first.", "you"),
     "WT-A002": ("Sending or buying is auto-approved", "A tricked Bot could act on it.", "Settings → General → Auto-review: change it to Ask first.", "you"),
@@ -2335,17 +2355,17 @@ PLAIN = {
     "WT-A005": ("No approval rules at all", "Nothing stops a Bot from acting.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
     "WT-C001": ("Bots can run code on your own computer", "Not just the cloud computer.", "Settings → General → Bot → Local Computer: Never allow.", "you"),
     "WT-C003": ("Auto-review is off", "Nothing checks Bot actions.", "Settings → General → Auto-review: turn it on.", "you"),
-    "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Open the skill and check it, or disable it.", "you"),
-    "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Open the skill and check it, or disable it.", "you"),
+    "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
+    "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it.", "you"),
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Re-check it with /vet-template.", "you"),
-    "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Update them in each project, or ask the Bot that built it.", "you"),
-    "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Ask a Bot to upgrade it, or ignore if it's part of the base system.", "you"),
+    "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it updates each project's lockfile and keeps a backup.", "fix"),
+    "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it upgrades them and puts any upgrade back that breaks something.", "fix"),
     "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Run /watchtower-incident.", "you"),
     "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Run /watchtower-incident.", "you"),
     "WT-L001": ("A Bot has the risky combination", "It reads strangers' content, sees private data, and can send.", "Add Ask first on its sends, or split its jobs.", "you"),
     "WT-M010": ("A Bot memory acts like a standing order", "It steers every future run.", "Remove it in that Bot's memory settings.", "you"),
-    "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Add “ask me first before sending” to those skills.", "you"),
+    "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Run /watchtower-fix and say yes if they're meant to send on their own.", "you"),
     "WT-H003": ("A command opened a remote shell", "That's how attackers take over machines.", "Run /watchtower-incident.", "you"),
 }
 
@@ -2486,8 +2506,10 @@ def needs_you(findings, limit=None):
     pkgs = sorted({re.sub(r"^Vulnerable package ", "", f["title"]).split(" ")[0] for f in findings if f["rule"] == "WT-D001"})
     for g in items:
         if "WT-D001" in g["rules"] and pkgs:
-            g["how"] = "Tell any Bot: “upgrade " + ", ".join(pkgs) + " on this computer.”"
+            g["how"] = "Run /watchtower-fix: it upgrades " + ", ".join(pkgs) + " and puts any upgrade back that breaks something."
     for g in items:
+        cls = {fix_class(f) for f in g["findings"]}
+        g["handled"] = "Only you" if "only_you" in cls else ("One yes" if "decision" in cls else "Fix handles it")
         g["rules"] = sorted(g["rules"])
         g["rows"] = [item_row(f, key_files) for f in sorted(g.pop("findings"), key=lambda f: SEV_ORDER.index(f["severity"]))]
         if g["title"] == "Keys that still work are sitting in files" and live:
@@ -2499,23 +2521,6 @@ def needs_you(findings, limit=None):
     return items[:limit] if limit else items
 
 
-def cmd_fix(args):
-    roots = args.roots or [os.path.expanduser("~"), "/workspace"]
-    plan = fix_plan(roots)
-    snap = load_json(state_path("last_findings.json"), {"findings": []})
-    todo = [{"what": g["title"], "how": g["how"], "links": [u for _, u in g.get("links", [])]} for g in needs_you(snap.get("findings", []), 6)]
-    if not args.apply:
-        print(fit({"mode": "preview (nothing changed)", "safe_fixes": [{k: v for k, v in s.items() if k != "list"} for s in plan],
-                   "needs_you": todo, "next": "Run `wt.py fix --apply` to do the safe fixes."}))
-        return 0
-    done = apply_fix(plan)
-    ledger({"event": "fix", "steps": len(done)})
-    print(fit({"done": done or ["Nothing to clean."], "needs_you": todo,
-               "next": "Run `wt.py audit` to confirm, then handle the needs_you items."}))
-    return 0
-
-
-# ---------------------------------------------------------------- v0.4: live-key check, OSV, drill-downs
 def trufflehog_status(paths, notes):
     """Ask each key's own provider whether it still works (TruffleHog verification). Scoped to files Watchtower
     already flagged. Raw key values are dropped the moment they're read; only detector, file and status are kept."""
@@ -2630,6 +2635,8 @@ def osv_findings(roots, notes):
                 d["ids"].update(ids)
                 d["sev"] = max(d["sev"], worst)
                 d["dirs"].add(os.path.dirname(src))
+    save_json(state_path("osv_projects.json"), {"at": now(), "projects": sorted({x for d in pkgs.values() for x in d["dirs"]}),
+                                                "packages": {f"{n} {v}": sorted(d["dirs"]) for (e_, n, v), d in pkgs.items()}})
     out = []
     for (eco, name, ver), d in sorted(pkgs.items(), key=lambda kv: str(kv[0])):
         dirs = sorted(d["dirs"])
@@ -2703,6 +2710,214 @@ def live_key_links(key_files):
     return out
 
 
+# ---------------------------------------------------------------- v0.5: one yes, then everything
+ACCEPTABLE_RULES = ("WT-X001", "WT-X002", "WT-T012", "WT-T013", "WT-T014", "WT-T006k", "WT-S003", "WT-D001", "WT-D002")
+
+
+def acceptable(f):
+    """Findings a person can reasonably accept as fine on purpose. Never: two engines agreeing a skill is dangerous,
+    a decoy being touched, a working key, a memory acting as an order, a remote shell."""
+    return f["rule"] in ACCEPTABLE_RULES or (f["rule"] in ("WT-S001", "WT-S002") and f["title"] in (KEY_MAYBE, KEY_UNSURE))
+
+
+def fix_class(f):
+    if f["rule"] in ("WT-D001", "WT-D002"):
+        return "upgrade"
+    if f["rule"] in ("WT-A003", "WT-A005"):
+        return "ask_first"
+    if f["title"] == KEY_DEAD:
+        return "auto"
+    return "decision" if acceptable(f) else "only_you"
+
+
+def accept_match(f):
+    if f["rule"] in ("WT-D001", "WT-D002"):
+        return f["title"]                      # one package and version, so a new one still shows up
+    return f["where"].split(":")[0]            # one skill, file or login, not the whole folder
+
+
+def accept_current(rules, reason, days=90):
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    sup = load_json(state_path("suppressions.json"), [])
+    exp = (dt.date.today() + dt.timedelta(days=max(1, min(days, 365)))).isoformat()
+    added = skipped = 0
+    for f in snap.get("findings", []):
+        if f["rule"] not in rules:
+            continue
+        if not acceptable(f):
+            skipped += 1
+            continue
+        m = accept_match(f)
+        if any(s_.get("rule") == f["rule"] and s_.get("match") == m for s_ in sup):
+            continue
+        sup.append({"rule": f["rule"], "match": m, "reason": reason[:200], "expires": exp, "added": now()})
+        added += 1
+    save_json(state_path("suppressions.json"), sup)
+    if added:
+        ledger({"event": "accept", "rules": sorted(rules), "count": added, "expires": exp})
+    return added, skipped, exp
+
+
+def fix_decisions(findings):
+    groups = {}
+    for f in findings:
+        if f["severity"] not in ("critical", "high", "medium") or fix_class(f) != "decision":
+            continue
+        pl = plain(f)
+        g = groups.setdefault((f["rule"], pl["title"]), {"rule": f["rule"], "what": pl["title"], "count": 0, "names": []})
+        g["count"] += 1
+        nm = item_row(f)["name"]
+        if nm not in g["names"] and len(g["names"]) < 6:
+            g["names"].append(nm)
+    return sorted(groups.values(), key=lambda g: -g["count"])
+
+
+# ---- upgrades, each with an automatic undo
+def py_exe():
+    return "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else (shutil.which("python3") or "python3")
+
+
+def pip_problems(py):
+    _, out_s, _ = run([py, "-m", "pip", "check", "--disable-pip-version-check"], 120)
+    return {l.strip() for l in out_s.splitlines() if l.strip() and "No broken requirements" not in l}
+
+
+def pip_version(py, name):
+    _, out_s, _ = run([py, "-m", "pip", "show", name, "--disable-pip-version-check"], 60)
+    m = re.search(r"(?m)^Version:\s*(\S+)", out_s)
+    return m.group(1) if m else None
+
+
+def python_upgrades():
+    data = load_json(state_path("package_vulns.json"), {}) or {}
+    ups = []
+    for f in data.get("findings", []):
+        m = re.match(r"Vulnerable package (\S+) (\S+)", f["title"])
+        t = re.search(r"Upgrade to (\S+) or later", f.get("fix", ""))
+        if m and t:
+            ups.append({"name": m.group(1), "have": m.group(2), "want": t.group(1)})
+    return ups
+
+
+def pip_install(py, args, timeout=300):
+    base = [py, "-m", "pip", "install", "--user", "--disable-pip-version-check"]
+    code, out_s, err = run(base + args, timeout)
+    if code != 0 and "externally-managed" in (err + out_s).lower():   # Debian/Ubuntu: --user keeps /usr untouched
+        code, out_s, err = run(base + ["--break-system-packages"] + args, timeout)
+    return code, err
+
+
+def pip_rollback(py, name, old):
+    """Remove our user-level copy (the system copy comes back); if that's not enough, install the old version."""
+    base = [py, "-m", "pip", "uninstall", "-y", name]
+    code, out_s, err = run(base, 120)
+    if code != 0 and "externally-managed" in (err + out_s).lower():
+        run(base[:4] + ["--break-system-packages"] + base[4:], 120)
+    if old and pip_version(py, name) != old:
+        pip_install(py, [f"{name}=={old}"])
+    return pip_version(py, name) == old
+
+
+def upgrade_python(ups, py=None):
+    py, done = py or py_exe(), []
+    for u in ups:
+        name = u["name"]
+        old, before = pip_version(py, name), pip_problems(py)
+        code, err = pip_install(py, ["--upgrade", f"{name}>={u['want']}"])
+        if code != 0:
+            done.append(f"Couldn't upgrade {name}: {(err.strip().splitlines() or ['pip failed'])[-1][:120]}")
+            continue
+        new = pip_version(py, name)
+        if pip_problems(py) - before:               # the upgrade broke something that worked
+            pip_rollback(py, name, old)
+            done.append(f"Upgraded {name} to {new} but it broke other packages, so I put {old} back")
+        else:
+            done.append(f"Upgraded {name} {old} → {new}")
+    return done
+
+
+def npm_projects():
+    data = load_json(state_path("osv_projects.json"), {}) or {}
+    return [d for d in data.get("projects", []) if os.path.isfile(os.path.join(d, "package-lock.json"))]
+
+
+def npm_issue_count(npm, d):
+    _, out_s, _ = run([npm, "audit", "--json", "--package-lock-only"], 120, cwd=d)
+    try:
+        return int(json.loads(out_s).get("metadata", {}).get("vulnerabilities", {}).get("total", 0))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def upgrade_npm(projects):
+    npm = shutil.which("npm")
+    if not npm:
+        return ["npm isn't installed on this computer, so project dependencies were left alone"]
+    done, stamp = [], dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for d in projects:
+        name = os.path.basename(d.rstrip("/")) or d
+        bdir = os.path.join(home(), "backups", stamp, re.sub(r"\W+", "_", d)[-80:])
+        os.makedirs(bdir, exist_ok=True)
+        files = [f for f in ("package.json", "package-lock.json") if os.path.isfile(os.path.join(d, f))]
+        for f in files:
+            shutil.copy2(os.path.join(d, f), os.path.join(bdir, f))
+        restore = lambda: [shutil.copy2(os.path.join(bdir, f), os.path.join(d, f)) for f in files]
+        ok_before = run([npm, "ls", "--depth=0", "--package-lock-only"], 120, cwd=d)[0] == 0
+        n_before = npm_issue_count(npm, d)
+        code, out_s, err = run([npm, "audit", "fix", "--package-lock-only", "--no-fund", "--loglevel=error"], 600, cwd=d)
+        if code != 0:
+            restore()
+            if "--force" in out_s:
+                done.append(f"{name}: the fixes need versions to change that package.json pins exactly (a bigger change), so I left it alone. "
+                            f"Tell a Bot to review and update it by hand if it matters")
+            else:
+                done.append(f"{name}: npm couldn't fix it automatically ({(err.strip().splitlines() or ['error'])[-1][:100]}); left as it was")
+            continue
+        try:
+            json.load(open(os.path.join(d, "package-lock.json")))
+            valid = True
+        except (OSError, ValueError):
+            valid = False
+        ok_after = run([npm, "ls", "--depth=0", "--package-lock-only"], 120, cwd=d)[0] == 0
+        if not valid or (ok_before and not ok_after):
+            restore()
+            done.append(f"{name}: the fix would have broken the dependency tree, so I put it back (copy in {bdir})")
+            continue
+        n_after = npm_issue_count(npm, d)
+        done.append(f"{name}: known issues {n_before} → {n_after}. Lockfile updated; your next install or deploy picks it up (undo copy: {bdir})")
+    return done
+
+
+def cmd_fix(args):
+    roots = args.roots or [os.path.expanduser("~"), "/workspace"]
+    plan = fix_plan(roots)
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    fs = snap.get("findings", [])
+    ups, projs = python_upgrades(), npm_projects()
+    only_you = [{"what": g["title"], "how": g["how"], "links": [u for _, u in g.get("links", [])]}
+                for g in needs_you([f for f in fs if fix_class(f) == "only_you"], 5)]
+    rules_needed = [r for r in ("WT-A003", "WT-A005") if any(f["rule"] == r for f in fs)]
+    if not (args.apply or args.upgrade or args.accept):
+        print(fit({"mode": "preview (nothing changed)",
+                   "safe_fixes": [{k: v for k, v in x.items() if k not in ("list", "why")} for x in plan],
+                   "upgrades": {"python": [f"{u['name']} {u['have']} → {u['want']}+" for u in ups], "projects": [os.path.basename(d) or d for d in projs]},
+                   "decisions": fix_decisions(fs), "ask_first_rules_missing": bool(rules_needed), "only_you": only_you,
+                   "next": "Ask the user one question. On yes run: wt.py fix --apply --upgrade --accept <rules they agreed to> --reason \"reviewed by owner\""}, limit=5200))
+        return 0
+    done = apply_fix(plan) if args.apply else []
+    if args.upgrade:
+        done += upgrade_python(ups) if ups else []
+        done += upgrade_npm(projs) if projs else []
+    if args.accept:
+        rules = [r.strip() for r in args.accept.split(",") if r.strip()]
+        n, skipped, exp = accept_current(rules, args.reason or "reviewed by owner")
+        done.append(f"Accepted {n} finding(s) as fine on purpose until {exp}" + (f"; {skipped} were not acceptable and stay open" if skipped else ""))
+    ledger({"event": "fix", "steps": len(done)})
+    print(fit({"done": done or ["Nothing to do."], "only_you": only_you,
+               "next": "Run `wt.py audit` to confirm, then tell the user the new score and anything in only_you."}))
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
@@ -2718,8 +2933,9 @@ def main(argv=None):
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
     fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
+    fx.add_argument("--upgrade", action="store_true"); fx.add_argument("--accept"); fx.add_argument("--reason")
     ac = sub.add_parser("accept"); ac.add_argument("rule", nargs="?"); ac.add_argument("where", nargs="?")
-    ac.add_argument("--reason"); ac.add_argument("--days", type=int, default=90); ac.add_argument("--list", action="store_true"); ac.add_argument("--remove", action="store_true")
+    ac.add_argument("--reason"); ac.add_argument("--days", type=int, default=90); ac.add_argument("--list", action="store_true"); ac.add_argument("--remove", action="store_true"); ac.add_argument("--all-current", action="store_true")
     ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule")
     r = sub.add_parser("rollcall"); r.add_argument("--dir")
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")

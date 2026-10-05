@@ -588,6 +588,74 @@ class Features(unittest.TestCase):
         code, o = self.out("accept", "--list")
         self.assertIn("expired", o)
 
+    def _fake_py(self, versions, targets, system, breaks=False):
+        py = os.path.join(self.tmp, "fakepy"); open(py, "w").write('#!/usr/bin/env python3\nimport json, os, sys\nst = os.environ["FAKE_STATE"]; d = json.load(open(st)); a = sys.argv[1:]; cmd = a[2]\ndef save(): json.dump(d, open(st, "w"))\nif cmd == "show":\n    v = d["versions"].get(a[3])\n    if not v: sys.exit(1)\n    print("Name: %s\\nVersion: %s" % (a[3], v)); sys.exit(0)\nif cmd == "check":\n    if d.get("broken"): print("app 1.0 requires bar<2, which is not installed."); sys.exit(1)\n    print("No broken requirements found."); sys.exit(0)\nif cmd == "install":\n    spec = a[-1]\n    if "==" in spec:\n        n, v = spec.split("=="); d["versions"][n] = v; d["broken"] = False\n    else:\n        n = spec.split(">=")[0]; d["versions"][n] = d["targets"][n]; d["broken"] = bool(d.get("breaks"))\n    save(); sys.exit(0)\nif cmd == "uninstall":\n    n = a[-1]; d["versions"][n] = d["system"][n]; d["broken"] = False; save(); sys.exit(0)\n'); os.chmod(py, 0o755)
+        st = os.path.join(self.tmp, "fake.json")
+        json.dump({"versions": versions, "targets": targets, "system": system, "breaks": breaks}, open(st, "w"))
+        os.environ["FAKE_STATE"] = st
+        return py, st
+
+    def test_python_upgrade_succeeds(self):
+        py, st = self._fake_py({"pip": "25.1.1", "wheel": "0.46.1"}, {"pip": "26.1", "wheel": "0.47.0"}, {"pip": "25.1.1", "wheel": "0.46.1"})
+        done = wt.upgrade_python([{"name": "pip", "have": "25.1.1", "want": "26.1"}, {"name": "wheel", "have": "0.46.1", "want": "0.47.0"}], py=py)
+        self.assertEqual(done, ["Upgraded pip 25.1.1 → 26.1", "Upgraded wheel 0.46.1 → 0.47.0"])
+
+    def test_python_upgrade_that_breaks_things_is_undone(self):
+        py, st = self._fake_py({"cryptography": "43.0.0"}, {"cryptography": "50.0.0"}, {"cryptography": "43.0.0"}, breaks=True)
+        done = wt.upgrade_python([{"name": "cryptography", "have": "43.0.0", "want": "50.0.0"}], py=py)
+        self.assertIn("put 43.0.0 back", done[0])
+        self.assertEqual(json.load(open(st))["versions"]["cryptography"], "43.0.0")
+
+    def test_accept_current_only_takes_acceptable_findings_and_keeps_new_ones_visible(self):
+        F = wt.finding
+        fs = [F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/w/assessment-deck-2", "risk 100", "f"),
+              F("WT-X003", "Corroborated by multiple engines", "critical", ["AST01"], "/w/evil", "two engines", "f"),
+              F("WT-S002", wt.KEY_LIVE, "critical", ["ASI03"], "/w/notes.txt", "AWS (1 live)", "f"),
+              F("WT-S002", wt.KEY_MAYBE, "medium", ["ASI03"], "/w/docs/a.md:3", "pattern", "f"),
+              F("WT-D002", "Vulnerable package next 16.3.4", "high", ["ASI04"], "/ws/app", "npm: 1 known", "f")]
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": fs})
+        n, skipped, exp = wt.accept_current(["WT-X001", "WT-X003", "WT-S002", "WT-D002"], "owner reviewed")
+        self.assertEqual((n, skipped), (3, 2))                                  # X003 and the live key are refused
+        live, acc = wt.active(fs + [F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/w/brand-new-skill", "risk 90", "f"),
+                                    F("WT-D002", "Vulnerable package next 17.0.0", "high", ["ASI04"], "/ws/app", "npm: 1 known", "f")])
+        self.assertEqual(sorted(f["where"] for f in live if f["rule"] in ("WT-X001", "WT-D002")), ["/w/brand-new-skill", "/ws/app"])
+        self.assertIn("/w/evil", [f["where"] for f in live])
+        self.assertIn("/w/notes.txt", [f["where"] for f in live])
+
+    def test_fix_preview_groups_everything_into_one_question(self):
+        F = wt.finding
+        fs = [F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], f"/home/box/sand-data/workflows/deck{i}", "risk 100", "f") for i in range(3)] + \
+             [F("WT-T013", "External action with no approval line", "medium", ["ASI02"], "/w/seo/SKILL.md:9", "send", "f"),
+              F("WT-S002", wt.KEY_LIVE, "critical", ["ASI03"], "/w/notes.txt", "AWS (1 live)", "f"),
+              F("WT-A003", "Ask-first rules not found", "medium", ["ASI09"], "Auto-review rules", "x", "f")]
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": fs})
+        wt.save_json(wt.state_path("package_vulns.json"), {"findings": [wt.finding("WT-D001", "Vulnerable package pip 25.1.1", "high", ["ASI04"], "python packages", "e", "Upgrade to 26.1 or later.")]})
+        code, o = self.out("fix", "--roots", self.tmp)
+        r = json.loads(o)
+        self.assertEqual([d["rule"] for d in r["decisions"]], ["WT-X001", "WT-T013"])
+        self.assertEqual(r["decisions"][0]["count"], 3)
+        self.assertEqual(r["upgrades"]["python"], ["pip 25.1.1 → 26.1+"])
+        self.assertTrue(r["ask_first_rules_missing"])
+        self.assertEqual([x["what"] for x in r["only_you"]], ["Keys that still work are sitting in files"])
+
+    def test_fix_accept_flag_refuses_what_must_stay_open(self):
+        F = wt.finding
+        fs = [F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/w/deck", "risk 100", "f"),
+              F("WT-X003", "Corroborated by multiple engines", "critical", ["AST01"], "/w/evil", "x", "f")]
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": fs})
+        code, o = self.out("fix", "--accept", "WT-X001,WT-X003", "--reason", "owner reviewed")
+        done = json.loads(o)["done"]
+        self.assertIn("Accepted 1 finding(s)", done[0])
+        self.assertIn("1 were not acceptable and stay open", done[0])
+
+    def test_ask_first_rules_saved_to_exports_count(self):
+        ex = os.path.join(os.environ["WATCHTOWER_HOME"], "exports"); os.makedirs(ex)
+        open(os.path.join(ex, "auto-review.txt"), "w").write(
+            "Ask first: before sending any external email or message\nAsk first: before publishing, posting, buying or paying for anything\n"
+            "Ask first: before deleting anything\nAsk first: before changing settings, routines or connectors\n")
+        self.assertEqual(wt.ask_first_gaps(open(os.path.join(ex, "auto-review.txt")).read()), [])
+        self.assertEqual(len(wt.ask_first_gaps("Ask first: before sending email")), 4)
+
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")
         os.makedirs(d)
