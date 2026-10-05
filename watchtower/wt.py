@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -23,7 +23,10 @@ SEV_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
 SEV_ORDER = ["critical", "high", "medium", "low", "info"]
 CATEGORY_CAP = 30
 LOW_CAP = 5
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "site-packages", "proc", "sys"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "site-packages", "proc", "sys",
+             "google-chrome", "chromium", "Chrome", "BraveSoftware", "mozilla", "Cache", "Code Cache", "GPUCache",
+             "Service Worker", "IndexedDB", "WasmTtsEngine", "Crashpad", ".npm", ".pnpm-store", ".cargo", ".rustup"}
+SKIP_PREFIXES = ("scoped_dir", ".org.chromium", "tmp")
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
 SECRET_RULE = "WT-T011"
 
@@ -119,6 +122,8 @@ def scan_text(text, where, rules, kind="skill"):
     out = []
     guarded = set(rules.get("guarded_rules", []))
     for rule in rules["rules"]:
+        if kind == "vendor" and rule["severity"] not in ("critical", "high"):
+            continue
         for m in rule["rx"].finditer(text):
             if rule["id"] in guarded and in_warning(text, m, rules):
                 continue
@@ -135,7 +140,7 @@ def scan_text(text, where, rules, kind="skill"):
                 break  # one per file is enough for invisible chars
     writes = rules["write_verbs"].search(text)
     approved = has_approval(text, rules)
-    if writes and not approved and kind != "reference":
+    if writes and not approved and kind not in ("reference", "vendor"):
         out.append(finding("WT-T013", "External action with no approval line", "medium" if kind == "skill" else "high", ["ASI02", "AST03", "LLM06"],
                            f"{where}:{line_of(text, writes.start())}", writes.group(0),
                            "Add to the description or routine: never send, post, buy, publish or delete without my approval."))
@@ -189,14 +194,24 @@ def dedupe(findings):
 def score(findings):
     """100 minus weighted findings. Per OWASP category cap so one noisy category can't zero the score;
     low findings together cost at most LOW_CAP so hygiene notes never outweigh a real risk."""
-    by_cat, low = {}, 0
+    by_cat, low, seen = {}, 0, {}
     for f in findings:
+        # each rule counts once at its worst severity, plus 1 point per extra occurrence (max +5),
+        # so 200 skills with the same style issue don't outweigh one live secret
+        k = f["rule"]
         w = SEV_WEIGHT.get(f["severity"], 0)
+        prev = seen.get(k)
+        if prev is None:
+            seen[k] = [w, 0, f]
+        else:
+            prev[0] = max(prev[0], w)
+            prev[1] += 1
+    for k, (w, extra, f) in seen.items():
         if f["severity"] == "low":
             low += w
             continue
         cat = (f["owasp"] or ["other"])[0]
-        by_cat[cat] = by_cat.get(cat, 0) + w
+        by_cat[cat] = by_cat.get(cat, 0) + w + (min(extra, 5) if w else 0)
     penalty = sum(min(v, CATEGORY_CAP) for v in by_cat.values()) + min(low, LOW_CAP)
     s = max(0, 100 - penalty)
     grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 70 else "D" if s >= 60 else "F"
@@ -252,7 +267,7 @@ def walk(roots, max_depth=8):
             continue
         base = root.rstrip("/").count("/")
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".venv")]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith((".venv",) + SKIP_PREFIXES)]
             if dirpath.count("/") - base >= max_depth:
                 dirnames[:] = []
             ap = os.path.abspath(dirpath)
@@ -316,6 +331,34 @@ def persistence_snapshot():
     return snap
 
 
+KNOWN_CRED_FILES = {
+    ".claude/.credentials.json": "Claude Code login",
+    ".config/gh/hosts.yml": "GitHub CLI login",
+    ".aws/credentials": "AWS CLI keys",
+    ".netrc": "netrc logins",
+    ".git-credentials": "git stored credentials",
+    ".docker/config.json": "Docker registry login",
+    ".npmrc": "npm token",
+    ".config/gcloud/credentials.db": "Google Cloud CLI login",
+}
+
+
+def cli_credentials():
+    out = []
+    for rel, what in KNOWN_CRED_FILES.items():
+        p = os.path.join(os.path.expanduser("~"), rel)
+        if os.path.isfile(p):
+            out.append(finding("WT-S003", f"CLI credential on the shared computer: {what}", "high", ["ASI03", "AST06"], p, what,
+                               "Expected if a Bot uses this CLI, but every Bot (and anything injected into one) can use it. "
+                               "Keep only the CLIs your Bots need, scope tokens to least privilege, and rotate them; sign out of unused ones."))
+    return out
+
+
+def is_vendor(path):
+    """Skills shipped by managed or marketplace plugins, as opposed to the user's own workflows."""
+    return any(x in path for x in ("/managed-skills/", "/plugins/", "/plugin-cache/", "/.grok-plugin/", "/.cursor-plugin/"))
+
+
 # ---------------------------------------------------------------- audit
 def audit(roots, exports, quick=False):
     rules = load_rules()
@@ -329,7 +372,8 @@ def audit(roots, exports, quick=False):
             if os.path.splitext(p)[1].lower() in TEXT_EXT:
                 t = read_text(p)
                 if t is not None:
-                    fs += scan_text(t, p, rules, kind="skill" if os.path.basename(p) == "SKILL.md" else "reference")
+                    kind = "vendor" if is_vendor(p) else ("skill" if os.path.basename(p) == "SKILL.md" else "reference")
+                    fs += scan_text(t, p, rules, kind=kind)
             manifest[p] = sha256_file(p)
     for p in inv["plugin_files"] + inv["mcp_configs"]:
         t = read_text(p)
@@ -369,8 +413,12 @@ def audit(roots, exports, quick=False):
                                   str(v)[:120], "Check who added this cron entry, unit, or shell rc change; remove it if no Bot of yours needs it."))
     save_json(state_path("persistence.json"), snap)
 
-    # 4. secrets in files
+    # 4. secrets in files (known CLI credential files reported separately)
+    fs += cli_credentials()
+    known = {os.path.join(os.path.expanduser("~"), k) for k in KNOWN_CRED_FILES}
     for p in walk(roots, max_depth=6):
+        if p in known:
+            continue
         if os.path.splitext(p)[1].lower() not in TEXT_EXT:
             continue
         t = read_text(p, limit=300_000)
@@ -650,6 +698,24 @@ def cmd_baseline(args):
     return 0
 
 
+def cmd_breakdown(args):
+    snap = load_json(state_path("last_findings.json"), None)
+    if not snap:
+        print("ERROR no audit yet", file=sys.stderr)
+        return 2
+    rows = {}
+    for f in snap["findings"]:
+        r = rows.setdefault((f["severity"], f["rule"], f["title"]), {"n": 0, "dirs": {}})
+        r["n"] += 1
+        d = os.path.dirname(f["where"].split(":")[0])
+        top = "/".join(d.split("/")[:5])
+        r["dirs"][top] = r["dirs"].get(top, 0) + 1
+    for (sev, rule, title), r in sorted(rows.items(), key=lambda x: (SEV_ORDER.index(x[0][0]), -x[1]["n"])):
+        dirs = ", ".join(f"{k} ×{v}" for k, v in sorted(r["dirs"].items(), key=lambda x: -x[1])[:3])
+        print(f"{sev:8} {rule:8} ×{r['n']:<5} {title[:48]:48} {dirs}")
+    return 0
+
+
 def by_sev(fs):
     c = {s: 0 for s in SEV_ORDER}
     for f in fs:
@@ -711,9 +777,15 @@ def render_md(snap, hist, tag):
     if not fs:
         lines.append("Nothing to fix this week.")
     lines += ["", "## All open findings", "", "| Severity | Rule | Finding | Where | Evidence | OWASP |", "| --- | --- | --- | --- | --- | --- |"]
-    for f in fs:
+    lows = [f for f in fs if f["severity"] in ("low", "info")]
+    for f in [f for f in fs if f["severity"] not in ("low", "info")]:
         ev = f["evidence"].replace("|", "\\|")
         lines.append(f"| {f['severity']} | {f['rule']} | {f['title']} | `{f['where']}` | {ev} | {', '.join(f['owasp'])} |")
+    if lows:
+        by_rule = {}
+        for f in lows:
+            by_rule[(f["rule"], f["title"])] = by_rule.get((f["rule"], f["title"]), 0) + 1
+        lines += ["", "Hygiene notes (low): " + "; ".join(f"{t} ×{n}" for (r, t), n in sorted(by_rule.items(), key=lambda x: -x[1]))]
     inv = snap.get("inventory", {})
     lines += ["", "## Inventory", "", f"Skills on disk: {inv.get('skills', 0)} · plugin files: {inv.get('plugin_files', 0)} · MCP configs: {inv.get('mcp_configs', 0)}"]
     if snap.get("suppressed"):
@@ -735,7 +807,7 @@ def render_html(snap, hist, tag):
     rows = "".join(
         f"<tr><td><span class='sev' style='background:{colors[f['severity']]}'>{f['severity']}</span></td>"
         f"<td>{html.escape(f['title'])}</td><td><code>{html.escape(f['where'])}</code></td>"
-        f"<td>{html.escape(', '.join(f['owasp']))}</td><td>{html.escape(f['fix'])}</td></tr>" for f in fs[:60])
+        f"<td>{html.escape(', '.join(f['owasp']))}</td><td>{html.escape(f['fix'])}</td></tr>" for f in [x for x in fs if x["severity"] not in ("low", "info")][:60])
     tiles = "".join(f"<div class='tile'><b style='color:{colors[s]}'>{c[s]}</b><span>{s}</span></div>" for s in SEV_ORDER[:4])
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Watchtower {tag}</title><style>
@@ -764,8 +836,9 @@ def main(argv=None):
         p.add_argument("--roots", nargs="*")
         p.add_argument("--exports")
     sub.add_parser("report")
+    sub.add_parser("breakdown")
     a = ap.parse_args(argv)
-    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report}[a.cmd](a)
+    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown}[a.cmd](a)
 
 
 if __name__ == "__main__":

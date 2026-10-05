@@ -12,9 +12,9 @@ Run in the shell, exactly:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/GITHUB_OWNER/grokbot-watchtower/v0.1.1/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/GITHUB_OWNER/grokbot-watchtower/v0.1.2/scripts/install.sh
 head -40 install.sh   # show the user before running it
-bash install.sh v0.1.1
+bash install.sh v0.1.2
 ```
 
 Show the user the head of install.sh before you run it. Watchtower never pipes a script into a shell, and neither should anything it vets. If the manifest check fails, stop and report it.

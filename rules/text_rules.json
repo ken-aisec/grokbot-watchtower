@@ -117,7 +117,7 @@
     "AST04",
     "LLM02"
    ],
-   "pattern": "(AKIA[0-9A-Z]{16}|\\bsk-(proj-|ant-)?[A-Za-z0-9_-]{20,}|\\bxai-[A-Za-z0-9]{20,}|\\bghp_[A-Za-z0-9]{36}|\\bgithub_pat_[A-Za-z0-9_]{40,}|\\bxox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35})",
+   "pattern": "(AKIA[0-9A-Z]{16}|\\bsk-(proj|ant|svcacct|admin)-[A-Za-z0-9_-]{20,}|\\bsk-[A-Za-z0-9]{40,}\\b|\\bxai-[A-Za-z0-9]{20,}|\\bghp_[A-Za-z0-9]{36}|\\bgithub_pat_[A-Za-z0-9_]{40,}|\\bxox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35})",
    "fix": "Revoke the key now, then remove it. Anything in a Bot's description, skill or routine ships with its template link."
   },
   {
