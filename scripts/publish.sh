@@ -5,15 +5,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
-TAG="v0.5.1"
+TAG="v0.5.2"
 echo "Publishing $REPO ($TAG)"
 if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
   grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
   git add -A && git commit -qm "Set repository owner to $OWNER"
 fi
 python3 -W ignore::ResourceWarning -m unittest discover -s tests -q
+git add -A   # new files must be tracked before the manifest lists them
 bash scripts/make-manifest.sh
-git add MANIFEST.sha256 && { git diff --cached --quiet || git commit -qm "Manifest for $TAG"; }
+# Commit the whole release, not just the manifest, so the tag always points at the code that was tested.
+git add -A && { git diff --cached --quiet || git commit -qm "Watchtower $TAG"; }
 if gh repo view "$REPO" >/dev/null 2>&1; then
   echo "Repo exists; pushing to it."
   git remote get-url origin >/dev/null 2>&1 || git remote add origin "https://github.com/$REPO.git"

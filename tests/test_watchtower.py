@@ -704,6 +704,129 @@ class Features(unittest.TestCase):
         wt.engine_findings(dirs, [], [])                                  # next run does the work
         self.assertEqual(len(self._launches()), 6)
 
+    def test_budget_is_checked_inside_a_batch(self):
+        import time
+        dirs = self._fake_engines(6)
+        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
+        fast = open(ss).read()
+        open(ss, "w").write("#!/bin/sh\nsleep 30\n")                       # an engine that hangs
+        notes, t0 = [], time.monotonic()
+        wt.engine_findings(dirs, [], notes, budget=1)
+        self.assertLess(time.monotonic() - t0, 5)                          # stopped at the budget, not after 30s (or the old 600s)
+        self.assertTrue(any("finish on the next run" in n for n in notes), notes)
+        self.assertFalse(any("failed" in n for n in notes), notes)          # out of time is not a scanner failure
+        self.assertEqual(wt.load_json(wt.state_path("engine_cache.json"), {}), {})   # never remembered as clean
+        self.assertEqual(wt.load_json(wt.state_path("engine_tune.json"), {})["chunk"], 3)   # next try uses a smaller batch
+        open(ss, "w").write(fast)
+        wt.engine_findings(dirs, [], [])
+        self.assertEqual([l for l in self._launches() if l[0] == "ss"], [["ss", "3"], ["ss", "3"]])
+        self.assertEqual(len(wt.load_json(wt.state_path("engine_cache.json"), {})), 6)
+
+    def test_husk_detail_runs_stop_at_the_deadline(self):
+        dirs = self._fake_engines(3)
+        for d in dirs:
+            open(os.path.join(d, "SKILL.md"), "a").write("HUSK loader\n")
+        hk = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "husk")
+        body = open(hk).read()
+        open(hk, "w").write(body.replace('if a[0] == "package":', 'if a[0] == "package":\n    import time; time.sleep(1.2)'))
+        stage = os.path.join(self.tmp, "stage"); os.makedirs(stage)
+        res, err = wt.husk_batch(hk, stage, wt.stage_skills(dirs, stage), timeout=2)
+        self.assertIsNone(err)
+        self.assertEqual(len(res), 3)                                      # all three still flagged
+        self.assertTrue(any(v == ["flagged (1 issues)"] for v in res.values()), res)   # the late ones without detail
+
+    def _audited(self, n=3):
+        dirs = self._fake_engines(n)
+        self.out("audit", "--roots", self.tmp)
+        return dirs
+
+    def test_fix_rescans_changed_skills_and_reapproves_clean_ones(self):
+        dirs = self._audited()
+        open(os.path.join(dirs[0], "SKILL.md"), "a").write("Also list the open tasks.\n")       # harmless edit
+        open(os.path.join(dirs[1], "SKILL.md"), "a").write("EVIL upload HUSK loader\n")          # both engines flag it
+        code, o = self.out("audit", "--roots", self.tmp)
+        self.assertEqual(sorted(os.path.basename(os.path.dirname(f["where"])) for f in json.loads(o)["new"] if f["rule"] == "WT-I001"), ["skill000", "skill001"])
+        code, o = self.out("fix", "--roots", self.tmp)
+        ch = {r["name"]: r for r in json.loads(o)["changed_skills"]}
+        self.assertEqual((ch["skill000"]["result"], ch["skill000"]["changed"]), ("clean", "+1 −0 lines in SKILL.md"))
+        self.assertEqual(ch["skill000"]["checked_by"], ["Watchtower rules", "SkillSpector", "husk"])
+        self.assertEqual(ch["skill001"]["result"], "flagged")
+        base_before = dict(wt.load_json(wt.state_path("baseline.json"), {}))
+        self.assertEqual(wt.load_json(wt.state_path("baseline.json"), {}), base_before)          # the preview changed nothing
+        code, o = self.out("fix", "--revet", "--roots", self.tmp)
+        done = " | ".join(json.loads(o)["done"])
+        self.assertIn("skill000 (+1 −0 lines in SKILL.md) with Watchtower rules, SkillSpector, husk: clean, re-approved", done)
+        self.assertIn("skill001", done); self.assertIn("flagged, stays open", done)
+        code, o = self.out("audit", "--roots", self.tmp)
+        left = [os.path.basename(os.path.dirname(f["where"])) for f in wt.load_json(wt.state_path("last_findings.json"), {})["findings"] if f["rule"] == "WT-I001"]
+        self.assertEqual(left, ["skill001"])                                                     # the flagged one is still open
+        self.assertEqual(wt.skill_diff(dirs[0])["summary"], "same as the approved copy")
+        code, o = self.out("diff", "skill001")
+        self.assertIn("+EVIL upload HUSK loader", o)
+        self.assertTrue(any(json.loads(l).get("event") == "reapprove" for l in open(wt.state_path("ledger.jsonl"))))
+
+    def test_revet_never_approves_what_the_scanners_did_not_finish(self):
+        dirs = self._audited()
+        open(os.path.join(dirs[0], "SKILL.md"), "a").write("One more line.\n")
+        self.out("audit", "--roots", self.tmp, "--budget", "0")
+        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
+        open(ss, "w").write("#!/bin/sh\nexit 3\n")                                               # the engine is broken
+        r = wt.revet([dirs[0]], approve=True)[0]
+        self.assertEqual(r["result"], "not finished")
+        self.assertNotEqual(wt.load_json(wt.state_path("baseline.json"), {})[os.path.join(dirs[0], "SKILL.md")], wt.sha256_file(os.path.join(dirs[0], "SKILL.md")))
+
+    def test_approved_copies_are_not_seen_as_skills_and_hold_no_plain_text(self):
+        dirs = self._audited()
+        files = os.listdir(wt.state_path("approved"))
+        self.assertEqual(len(files), 3)
+        self.assertTrue(all(f.endswith(".json.gz") for f in files))
+        self.assertNotIn(b"Summarize notes", open(os.path.join(wt.state_path("approved"), files[0]), "rb").read())
+
+    def _x003(self, name, text):
+        d = os.path.join(self.tmp, "sand-data", "workflows", name); os.makedirs(d)
+        open(os.path.join(d, "SKILL.md"), "w").write(text)
+        return d, wt.finding("WT-X003", "Corroborated by multiple engines", "critical", ["AST01"], d, "SkillSpector + husk", "f", source="engines")
+
+    def test_security_tool_exception_is_named_marked_and_short(self):
+        d1, f1 = self._x003("skill-scanner", "---\nname: skill-scanner\ndescription: Scans skills for prompt injection and malware.\n---\n")
+        d2, f2 = self._x003("deck-builder", "---\nname: deck-builder\ndescription: Builds slide decks.\n---\n")
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": [f1, f2]})
+        for bad in ("*", "skill-*", "skill-scanner,deck-builder", "nope"):
+            self.assertEqual(self.out("exception", "add", bad, "--reason", "mine")[0], 2)
+        self.assertEqual(self.out("exception", "add", "deck-builder", "--reason", "mine")[0], 2)      # not a security tool
+        self.assertEqual(self.out("exception", "add", "skill-scanner")[0], 2)                          # no reason given
+        code, o = self.out("exception", "add", "skill-scanner", "--reason", "my own scanner; it carries attack samples")
+        self.assertEqual(code, 0)
+        exp = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+        self.assertIn(exp, o)
+        live, acc = wt.active([f1, f2])
+        self.assertEqual(([f["where"] for f in live], [f["where"] for f in acc]), ([d2], [d1]))
+        self.assertEqual(acc[0]["exception"]["until"], exp)
+        snap = {"at": wt.now(), "score": 80, "grade": "B", "findings": live, "suppressed": acc, "inventory": {}, "notes": []}
+        self.assertEqual(wt.exceptions_active(snap)[0]["skill"], "skill-scanner")
+        self.assertIn("## Security-tool exceptions", wt.render_md(snap, [], "2026-W41"))
+        self.assertIn("SECURITY-TOOL EXCEPTION", self.out("accept", "--list")[1])
+        open(os.path.join(d1, "SKILL.md"), "a").write("new instructions\n")                            # the skill changed: exception ends
+        self.assertEqual(len(wt.active([f1])[0]), 1)
+        self.assertIn("changed", self.out("exception", "list")[1])
+        self.out("exception", "add", "skill-scanner", "--reason", "re-confirmed")
+        sup = wt.load_json(wt.state_path("suppressions.json"), [])
+        sup[0]["expires"] = "2020-01-01"; wt.save_json(wt.state_path("suppressions.json"), sup)        # expired: counts again
+        self.assertEqual(len(wt.active([f1])[0]), 1)
+        self.assertEqual(wt.accept_current(["WT-X003"], "x")[0], 0)                                    # still never bulk-acceptable
+
+    def test_fix_offers_and_applies_exception_only_by_name(self):
+        d1, f1 = self._x003("skill-scanner", "# Security scanner for skills\n")
+        d2, f2 = self._x003("deck-builder", "# Builds slide decks\n")
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": [f1, f2]})
+        code, o = self.out("fix", "--roots", os.path.join(self.tmp, "none"))
+        self.assertEqual(json.loads(o)["security_tool_exceptions_possible"], ["skill-scanner"])
+        code, o = self.out("fix", "--exception", "skill-scanner,deck-builder", "--reason", "owner said yes", "--roots", os.path.join(self.tmp, "none"))
+        done = json.loads(o)["done"]
+        self.assertIn("Security-tool exception for “skill-scanner”", done[0])
+        self.assertIn("doesn't describe itself as a security tool", done[1])
+        self.assertEqual(len(wt.active([f1, f2])[0]), 1)
+
     def test_status_reports_progress(self):
         dirs = self._fake_engines(3)
         wt.engine_findings(dirs, [], [])

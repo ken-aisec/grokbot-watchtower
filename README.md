@@ -49,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.1/scripts/install.sh
-head -40 install.sh && bash install.sh v0.5.1
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.2/scripts/install.sh
+head -40 install.sh && bash install.sh v0.5.2
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -65,7 +65,9 @@ wt.py brief [--summary F]     weekly threat brief (HTML)
 wt.py rollcall                analyze saved roll-call replies
 wt.py prepublish PATH         check a Bot before sharing it as a template
 wt.py fix [--apply]            safe cleanup (preview by default)
-wt.py fix --apply --upgrade --accept RULES   everything in one pass (after your yes)
+wt.py fix --apply --upgrade --revet --accept RULES   everything in one pass (after your yes)
+wt.py diff SKILL               what changed in a skill since you approved it
+wt.py exception add SKILL --reason "..."   keep one named security-tool skill that two scanners flag (30 days)
 wt.py accept RULE WHERE --reason "..."   accept one risk on purpose (90 days)
 wt.py accept --all-current RULES         accept everything currently open for those rules
 wt.py events list|clear        one-time detections

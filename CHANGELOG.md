@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.2 — 2026-10-05 (changed skills, handled)
+- `/watchtower-fix` now deals with skills that changed after you approved them. It re-scans each one with every engine (Watchtower rules, SkillSpector, husk) and, as part of the one yes, re-approves the ones that come back clean. A flagged skill, or one the scanners didn't finish, stays open.
+- Watchtower keeps a compressed copy of every approved skill in its own state folder, so a change shows as a diff: "+1 −0 lines in SKILL.md" in the fix preview, and the exact lines with `wt.py diff SKILL`. Skills approved before this version get a copy on the next full audit, as long as they still match what was approved.
+- Security-tool exception: a skill that two scanners flag because it carries attack samples (a scanner, a vetting tool) can be kept by its owner. One named skill at a time, never a pattern or a rule; it must describe itself as a security tool; it lasts 30 days; it ends early if the skill's files change; and it is marked in the audit output and every report. `wt.py exception add|list|remove`, or `--exception NAME` in the fix.
+- The time budget is now checked inside a batch, not only between batches. An engine gets only the time that is left, so a 2-minute daily run can no longer sit in one launch for 10 minutes. A batch that runs out of time is retried at half the size next run.
+- Fixed: `publish.sh` committed only the manifest unless the owner placeholder was present, so a release built from the public repo would have tagged the old code. It now commits the whole release.
+- Fixed: `--budget` on one audit no longer carries over to later runs in the same process.
+- Verified against real SkillSpector 2.12.0 and husk 1.3.5: clean edit re-approved, malicious edit kept open, exception applied and dropped on change, 3-second budget stopped at 3.0 seconds.
+
 ## v0.5.1 — 2026-10-05 (fast scanners)
 - SkillSpector and husk now start once per batch of 40 skills instead of once per skill (SkillSpector takes about 5 seconds just to start). 60 skills: 13 seconds, down from roughly 5 minutes.
 - Skills are remembered by content: unchanged skills are never re-scanned. A repeat run takes under a second; editing one skill rescans only that one.
