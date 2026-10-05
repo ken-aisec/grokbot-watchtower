@@ -29,8 +29,8 @@ python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
 Summarize the JSON in five lines or fewer: score, counts by severity, the top three fixes with their click path or command.
 
-## 4. Exports (the parts no script can see)
-Grok Bot keeps routines, Auto Review rules and some settings in the app, so ask the user for them once. Save each answer verbatim under /workspace/watchtower/exports/:
+## 4. Exports (only what the disk doesn't show)
+Watchtower reads Auto Review rules and the local-execution setting from `~/agent-data/settings.json` and every shared skill from `~/agent-data/workflows` automatically. Ask the user only for what is missing, and save each answer verbatim under /workspace/watchtower/exports/:
 
 - `auto-review.txt`: "Open Settings → General → Auto-review and paste every rule, one per line."
 - `settings.json`: ask three questions and write `{"local_execution": "<never|ask|always>", "auto_review": <true|false>, "unused_connectors": [<names>]}`.

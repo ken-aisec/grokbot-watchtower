@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -377,9 +377,11 @@ def audit(roots, exports, quick=False):
         if not t:
             continue
         rule = next(r for r in rules["rules"] if r["id"] == SECRET_RULE)
-        for m in rule["rx"].finditer(t):
+        hits = list(rule["rx"].finditer(t))
+        if hits:
+            m = hits[0]
             fs.append(finding("WT-S001", "Secret stored in a file on the shared computer", "critical", ["ASI03", "LLM02"],
-                              f"{p}:{line_of(t, m.start())}", mask(m.group(0)),
+                              f"{p}:{line_of(t, m.start())}", f"{mask(m.group(0))} ({len(hits)} in file)",
                               "Every Bot can read this file. Revoke the key, delete the file, and use the secure secret request instead."))
 
     # 5. exports the user pastes in (routines, descriptions, Auto Review rules, settings)
@@ -401,6 +403,18 @@ def audit(roots, exports, quick=False):
     else:
         notes.append("No exports folder: routines, descriptions and Auto Review rules not checked. Run /watchtower-setup step 4.")
 
+    nat = native_settings()
+    if nat:
+        rules_text, settings, p = nat
+        if rules_text:
+            fs += lint_auto_review(rules_text, p)
+        else:
+            fs.append(finding("WT-A005", "No Auto Review rules", "medium", ["ASI09"], p, "autoReviewInstructions empty",
+                              "Add Ask-first rules for sending, publishing, purchasing, deleting, and changing settings or routines."))
+        fs += lint_settings(settings, p)
+    else:
+        notes.append("Grok Bot settings.json not found: Auto Review rules and local execution checked from exports only.")
+
     # 6. optional external scanners
     if not quick:
         fs += external_scanners(inv["skills"], roots, notes)
@@ -408,6 +422,38 @@ def audit(roots, exports, quick=False):
     fs = sort_findings(dedupe(fs))
     meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap}
     return fs, meta
+
+
+NATIVE_SETTINGS = ["~/agent-data/settings.json", "/home/box/agent-data/settings.json"]
+
+
+def native_settings():
+    """Read Grok Bot's own settings file (spike, Oct 5 2026): autoReviewInstructions + localToolPermission.
+    Returns (auto_review_text, settings_dict, path) or None. Schema is undocumented, so parse loosely."""
+    cands = [os.environ["WATCHTOWER_SETTINGS"]] if os.environ.get("WATCHTOWER_SETTINGS") else NATIVE_SETTINGS
+    for cand in cands:
+        p = os.path.expanduser(cand)
+        data = load_json(p, None)
+        if not isinstance(data, dict):
+            continue
+        lines = []
+        ari = data.get("autoReviewInstructions") or {}
+        if isinstance(ari, dict):
+            for k, v in ari.items():
+                label = "Allow automatically" if "allow" in k.lower() else "Ask first" if "ask" in k.lower() else k
+                items = v if isinstance(v, list) else [v]
+                for it in items:
+                    if isinstance(it, dict):
+                        it = it.get("instruction") or it.get("text") or it.get("action") or json.dumps(it)
+                    if isinstance(it, str) and it.strip():
+                        lines.append(f"{label}: {it.strip()}")
+        perm = str(data.get("localToolPermission", "")).lower()
+        mapped = {"always": "always", "allow": "always", "ask": "ask", "never": "never", "deny": "never"}.get(perm, perm)
+        settings = {"local_execution": mapped}
+        if "autoReview" in data:
+            settings["auto_review"] = bool(data.get("autoReview"))
+        return "\n".join(lines), settings, p
+    return None
 
 
 def lint_auto_review(text, where):
@@ -420,6 +466,9 @@ def lint_auto_review(text, where):
         if re.search(r"(?i)allow\s+automatically", l) and re.search(r"(?i)\b(send|email|post|publish|purchase|pay|delete|transfer|permission)", l):
             out.append(finding("WT-A002", "Auto-allow on a consequential action", "critical", ["ASI02", "ASI09"], f"{where}:{i}", l,
                                "Change it to Ask first. Sending, paying, publishing and deleting always need your yes."))
+        if re.search(r"(?i)allow\s+automatically", l) and re.search(r"(?i)(automation|routine|schedul|cron|trigger|create\s+(a\s+)?skill|install|plugin|connector)", l):
+            out.append(finding("WT-A004", "Auto-allow on creating automations or installs", "high", ["ASI10", "ASI03"], f"{where}:{i}", l[:140],
+                               "Change it to Ask first. Anything that creates a routine or installs code can give injected text a way to run again later, unattended."))
     ask = " ".join(l for l in lines if re.search(r"(?i)ask\s+first", l)).lower()
     missing = [w for w, rx in (("sending email or messages", r"send|email|message"), ("publishing or posting", r"publish|post"),
                                ("purchases or payments", r"purchas|pay|buy"), ("deleting data", r"delet|remov"),
@@ -455,11 +504,16 @@ def external_scanners(skills, roots, notes):
             d = os.path.dirname(s)
             tmp = state_path("skillspector.json")
             code, _, err = run(["skillspector", "scan", d, "--no-llm", "--format", "json", "--output", tmp], 180)
-            data = load_json(tmp, None)
-            risk = find_key(data, ("risk_score", "riskScore", "score")) if data else None
-            if isinstance(risk, (int, float)) and risk >= 50:
-                sev = "critical" if risk >= 75 else "high"
-                out.append(finding("WT-X001", f"SkillSpector risk {risk}", sev, ["AST01", "AST08"], d, f"risk_score={risk}",
+            data = load_json(tmp, None) or {}
+            issues = data.get("issues", []) if isinstance(data, dict) else []
+            risk = find_key(data.get("risk_assessment", {}), ("risk_score", "score", "overall_score")) if isinstance(data, dict) else None
+            sevs = [str(i.get("severity", "")).lower() for i in issues if isinstance(i, dict)]
+            worst = next((x for x in ("critical", "high") if x in sevs), None)
+            if worst or (isinstance(risk, (int, float)) and risk >= 50):
+                sev = worst or ("critical" if risk >= 75 else "high")
+                first = next((i for i in issues if isinstance(i, dict)), {})
+                out.append(finding("WT-X001", f"SkillSpector: {len(issues)} issue(s)", sev, ["AST01", "AST08"], d,
+                                   f"risk={risk}; {first.get('title') or first.get('rule_id') or ''}"[:140],
                                    "Open the SkillSpector report for the exact patterns.", source="skillspector"))
     else:
         notes.append("SkillSpector not installed: skill scan used Watchtower rules only.")
@@ -468,11 +522,19 @@ def external_scanners(skills, roots, notes):
         for r in roots:
             r = os.path.expanduser(r)
             if os.path.isdir(r):
-                run(["gitleaks", "detect", "--source", r, "--no-git", "--report-format", "json", "--report-path", tmp, "--exit-code", "0"], 300)
+                run(["gitleaks", "detect", "--source", r, "--no-git", "--redact", "--report-format", "json", "--report-path", tmp, "--exit-code", "0"], 300)
+                per_file = {}
                 for leak in load_json(tmp, []) or []:
-                    out.append(finding("WT-S002", f"gitleaks: {leak.get('RuleID', 'secret')}", "critical", ["ASI03", "LLM02"],
-                                       f"{leak.get('File')}:{leak.get('StartLine')}", mask(leak.get("Secret", "") or ""),
-                                       "Revoke the credential, then remove the file.", source="gitleaks"))
+                    per_file.setdefault(leak.get("File"), []).append(leak)
+                for fpath, leaks in per_file.items():
+                    kinds = sorted({l.get("RuleID", "secret") for l in leaks})
+                    out.append(finding("WT-S002", "gitleaks: secrets in file", "critical" if len(leaks) else "high", ["ASI03", "LLM02"],
+                                       f"{fpath}:{leaks[0].get('StartLine')}", f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
+                                       "Check whether these are live credentials. Revoke live ones, then delete or scrub the file.", source="gitleaks"))
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     if shutil.which("pip-audit"):
         code, out_s, _ = run(["pip-audit", "-f", "json"], 300)
         data = None

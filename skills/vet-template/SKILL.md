@@ -10,7 +10,7 @@ One of: an `https://x.ai/bot/...` template link, a GitHub skill URL, a path on t
 
 ## Steps
 1. Get the text, untouched.
-   - x.ai link: open it in the browser and copy every visible section (description, skills, routines, plugins, setup notes) into `/workspace/watchtower/vet/<slug>.txt`. Do not click Add.
+   - x.ai link: the public preview shows only the title and description, not skills or routines. Click **Download** (never Add to Grok Bot), save the file to `/workspace/watchtower/vet/<slug>/`, unpack it if it is an archive, and vet every file inside. Never run anything from it. If no download is offered, vet the description and say plainly: "Description only: skills and routines not visible, so this cannot be rated Install."
    - GitHub URL: `git clone --depth 1 <url> /workspace/watchtower/vet/<slug>`; never run anything inside it.
    - Pasted text: save it verbatim.
 2. Run `python3 /workspace/watchtower/app/watchtower/wt.py vet <file> --json` for each text file (for a folder, run it on SKILL.md and every script). If SkillSpector is installed, also run `skillspector scan <folder> --no-llm --format json --output /workspace/watchtower/vet/<slug>-ss.json`.

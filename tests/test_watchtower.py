@@ -84,6 +84,29 @@ class Lints(unittest.TestCase):
         self.assertEqual(r, {"WT-C001", "WT-C003"})
 
 
+class NativeSettings(unittest.TestCase):
+    """Shape seen on a real Grok Bot computer (spike, Oct 5 2026)."""
+    def test_real_rules(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "settings.json")
+        json.dump({"localToolPermission": "ask", "autoReviewInstructions": {"allowInstructions": [
+            "Create Notion databases under the AI Operator tree",
+            "Create Notion pages under the AI Operator tree",
+            "Use sand_automation_write to create automations"]}}, open(p, "w"))
+        os.environ["WATCHTOWER_SETTINGS"] = p
+        try:
+            text, settings, path = wt.native_settings()
+        finally:
+            del os.environ["WATCHTOWER_SETTINGS"]
+            shutil.rmtree(d)
+        fs = wt.lint_auto_review(text, path) + wt.lint_settings(settings, path)
+        rules = [f["rule"] for f in fs]
+        self.assertEqual(rules.count("WT-A004"), 1, rules)   # the automation rule only
+        self.assertNotIn("WT-A001", rules)                    # Notion rules are scoped, not broad
+        self.assertIn("WT-A003", rules)                       # no Ask-first rules at all
+        self.assertIn("WT-C002", rules)                       # local execution = ask
+
+
 class Flow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
