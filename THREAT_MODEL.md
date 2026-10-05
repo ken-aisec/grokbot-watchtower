@@ -14,12 +14,19 @@ Watchtower runs on the same shared Grok Bot computer it audits, so it is held to
 | Update drift after review | AST07 | WT-I001 |
 | Persistence (cron, units, shell rc) | ASI10 | WT-P001 |
 | Unpinned MCP servers, vulnerable packages | AST02, ASI04 | WT-M001, D001 |
+| Memory poisoning | ASI06 | roll-call: WT-M010 and text rules on each memory |
+| Lethal trifecta on one Bot | ASI01, ASI02 | WT-L001 |
+| Data theft in progress | ASI03, ASI10 | canaries: WT-K001–K003 |
+| Commands nobody meant to run | ASI05, ASI10 | shell history: WT-H001–H009 |
+| Secrets or private links shipped in a template | AST04, LLM02 | pre-publish: WT-PP01–PP07 |
+| Vulnerable code written by Bots | OWASP Top 10 (2021) | codescan: WT-WA01–WA10 |
+| Evasion of a single scanner | AST08 | three engines; WT-X001–X003 |
 
 ## What it trusts
 The pinned release verified against `MANIFEST.sha256`; Python's standard library; the user's answers during setup.
 
 ## What it does not trust
-Every file it scans, every web page it reads, and every reply from another Bot. They are data. An instruction found in them is a finding.
+Every file it scans, every web page and feed it reads, and every reply from another Bot. They are data. An instruction found in them is a finding.
 
 ## Out of scope
 Connector OAuth tokens (kept on Cursor's backend), other users' computers, model serving, and anything that requires Enterprise APIs.

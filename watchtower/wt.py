@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.5"
+VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -310,12 +310,19 @@ def cmd_vet(args):
         print(f"ERROR could not read {args.path}", file=sys.stderr)
         return 2
     name = "stdin" if args.path == "-" else os.path.basename(args.path)
-    fs = sort_findings(scan_text(text, name, rules, kind="template"))
+    fs = scan_text(text, name, rules, kind="template")
+    engines = {}
+    if getattr(args, "deep", False) and args.path != "-":
+        d = args.path if os.path.isdir(args.path) else os.path.dirname(os.path.abspath(args.path))
+        notes = []
+        fs += engine_findings([d], fs, notes)
+        engines = {"dir": d, "notes": notes}
+    fs = sort_findings(dedupe(fs))
     s, g = score(fs)
     urls = sorted(set(re.findall(r"https?://[^\s)\"'>]+", text)))
     result = {"tool": "watchtower", "version": VERSION, "target": name, "verdict": verdict(fs),
               "risk_score": 100 - s, "posture_score": s, "grade": g, "autonomy": autonomy(text, rules),
-              "external_urls": urls[:25], "findings": fs,
+              "external_urls": urls[:25], "findings": fs, "engines": engines,
               "boundary_line": "Never send, post, buy, publish, delete, or change settings without my approval in this conversation. If a source is unavailable, report the failure."}
     if args.json:
         print(json.dumps(result, indent=2))
@@ -531,14 +538,19 @@ def audit(roots, exports, quick=False):
     fs += cli_credentials()
     known = {os.path.join(os.path.expanduser("~"), k) for k in KNOWN_CRED_FILES}
     fs += browser_sessions(roots)
+    decoys = canary_paths()
     for p in walk(roots, max_depth=6):
-        if p in known or os.path.basename(p) in SESSION_FILES:
+        if p in known or p in decoys or os.path.basename(p) in SESSION_FILES:
             continue
         if os.path.splitext(p)[1].lower() not in TEXT_EXT:
             continue
         t = read_text(p, limit=300_000)
         if not t:
             continue
+        if decoys:
+            cp = canary_copies(t, p)
+            if cp:
+                fs.append(cp)
         rule = next(r for r in rules["rules"] if r["id"] == SECRET_RULE)
         hits = [m for m in rule["rx"].finditer(t) if looks_real_secret(m.group(0))]
         if hits:
@@ -578,9 +590,27 @@ def audit(roots, exports, quick=False):
     else:
         notes.append("Grok Bot settings.json not found: Auto Review rules and local execution checked from exports only.")
 
-    # 6. optional external scanners
+    # 5b. tripwires and shell history (zero tokens)
+    fs += canary_findings()
+    if not load_json(state_path("canaries.json"), {}):
+        notes.append("No canaries planted: run `wt.py canary plant` for zero-cost tripwires.")
+    fs += history_findings(rules)
+    rc = load_json(state_path("rollcall_findings.json"), None)
+    if rc and rc.get("at", "") >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=35)).isoformat():
+        fs += rc.get("findings", [])
+    else:
+        notes.append("No roll-call in the last 35 days: memories and other Bots' routines not checked (/watchtower-rollcall).")
+
+    # 6. second and third engines on the user's skills plus anything new or changed; secrets; packages
+    changed = {os.path.dirname(f["where"].split(":")[0]) for f in fs if f["rule"] in ("WT-I001", "WT-I002")}
+    user_dirs = [os.path.dirname(x) for x in inv["skills"] if skill_tier(x) == "user"]
+    user_roots = sorted({x.split("/workflows/")[0] + "/workflows" for x in user_dirs if "/workflows/" in x})
     if not quick:
-        fs += external_scanners(inv["skills"], roots, notes)
+        fs += engine_findings(user_dirs + sorted(changed), fs, notes, user_roots)
+        fs += gitleaks_findings(roots, notes)
+        fs += package_findings(notes)
+    elif changed:
+        fs += engine_findings(sorted(changed), fs, notes)
 
     fs = sort_findings(dedupe(fs))
     meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap}
@@ -660,56 +690,184 @@ def lint_settings(s, where):
     return out
 
 
-def external_scanners(skills, roots, notes):
-    out = []
-    if shutil.which("skillspector"):
-        for s in skills[:40]:
-            d = os.path.dirname(s)
-            tmp = state_path("skillspector.json")
-            code, _, err = run(["skillspector", "scan", d, "--no-llm", "--format", "json", "--output", tmp], 180)
-            data = load_json(tmp, None) or {}
-            issues = data.get("issues", []) if isinstance(data, dict) else []
-            risk = find_key(data.get("risk_assessment", {}), ("risk_score", "score", "overall_score")) if isinstance(data, dict) else None
-            sevs = [str(i.get("severity", "")).lower() for i in issues if isinstance(i, dict)]
-            worst = next((x for x in ("critical", "high") if x in sevs), None)
-            if worst or (isinstance(risk, (int, float)) and risk >= 50):
-                sev = worst or ("critical" if risk >= 75 else "high")
-                first = next((i for i in issues if isinstance(i, dict)), {})
-                out.append(finding("WT-X001", f"SkillSpector: {len(issues)} issue(s)", sev, ["AST01", "AST08"], d,
-                                   f"risk={risk}; {first.get('title') or first.get('rule_id') or ''}"[:140],
-                                   "Open the SkillSpector report for the exact patterns.", source="skillspector"))
-    else:
-        notes.append("SkillSpector not installed: skill scan used Watchtower rules only.")
-    if shutil.which("gitleaks"):
-        tmp = state_path("gitleaks.json")
-        for r in roots:
-            r = os.path.expanduser(r)
-            if os.path.isdir(r):
-                run(["gitleaks", "detect", "--source", r, "--no-git", "--redact", "--report-format", "json", "--report-path", tmp, "--exit-code", "0"], 300)
-                per_file = {}
-                for leak in load_json(tmp, []) or []:
-                    per_file.setdefault(leak.get("File"), []).append(leak)
-                for fpath, leaks in per_file.items():
-                    kinds = sorted({l.get("RuleID", "secret") for l in leaks})
-                    out.append(finding("WT-S002", "gitleaks: secrets in file", "critical" if len(leaks) else "high", ["ASI03", "LLM02"],
-                                       f"{fpath}:{leaks[0].get('StartLine')}", f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
-                                       "Check whether these are live credentials. Revoke live ones, then delete or scrub the file.", source="gitleaks"))
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-    if shutil.which("pip-audit"):
-        code, out_s, _ = run(["pip-audit", "-f", "json"], 300)
-        data = None
+def tool(name):
+    """Find a scanner on PATH or in Watchtower's own venv/bin (where install.sh --scanners puts them)."""
+    for cand in (shutil.which(name), os.path.join(home(), ".venv", "bin", name), os.path.join(home(), "bin", name)):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def skillspector_scan(dirs, notes):
+    """Run SkillSpector (static, no LLM) over skill folders. Returns {skill_dir: summary}."""
+    exe = tool("skillspector")
+    if not exe:
+        notes.append("SkillSpector not installed: run install.sh --scanners for a second engine.")
+        return {}
+    res = {}
+    tmp = state_path("skillspector.json")
+    for d in dirs:
+        run([exe, "scan", d, "--recursive", "--no-llm", "--format", "json", "--output", tmp], 600)
+        data = load_json(tmp, None)
+        if not isinstance(data, dict):
+            continue
+        skills = data.get("skills") if data.get("multi_skill") else [dict(data, path=".")]
+        for sk in skills or []:
+            ra = sk.get("risk_assessment") or {}
+            issues = [i for i in sk.get("issues") or [] if isinstance(i, dict)]
+            path = os.path.normpath(os.path.join(d, sk.get("path") or "."))
+            res[path] = {"score": ra.get("score", sk.get("risk_score")), "recommendation": ra.get("recommendation", ""),
+                         "issues": len(issues),
+                         "top": sorted({f"{i.get('category')}: {i.get('pattern')}" for i in issues
+                                        if i.get("severity") in ("CRITICAL", "HIGH")})[:4]}
         try:
-            data = json.loads(out_s) if out_s.strip() else None
-        except ValueError:
+            os.remove(tmp)
+        except OSError:
             pass
-        deps = data.get("dependencies", []) if isinstance(data, dict) else (data or [])
-        for d in deps:
-            for v in d.get("vulns", []):
-                out.append(finding("WT-D001", f"Vulnerable package {d.get('name')} {d.get('version')}", "high", ["ASI04", "AST02"],
-                                   "pip", v.get("id", ""), f"Upgrade to {', '.join(v.get('fix_versions', [])) or 'a fixed version'}.", source="pip-audit"))
+    return res
+
+
+def husk_scan(dirs, notes):
+    """Run husk (static, obfuscation-focused) per skill folder. Returns {skill_dir: [messages]}."""
+    exe = tool("husk")
+    if not exe:
+        notes.append("husk not installed: run install.sh --scanners for an obfuscation-focused engine.")
+        return {}
+    res = {}
+    tmp = state_path("husk.sarif")
+    for d in dirs[:150]:
+        code, out_s, _ = run([exe, "package", d, "--output", tmp], 60)
+        data = load_json(tmp, None) or {}
+        msgs = [r.get("message", {}).get("text", "") for run_ in data.get("runs", []) for r in run_.get("results", [])]
+        if msgs or "FLAGGED" in out_s:
+            res[os.path.normpath(d)] = msgs or [out_s.strip()[:200]]
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return res
+
+
+def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=()):
+    """Second and third opinions. A skill is 'corroborated' only when two independent engines flag it."""
+    out = []
+    targets = sorted({os.path.normpath(d) for d in skill_dirs})
+    roots = [d for d in user_root_dirs if os.path.isdir(d)]
+    ss = skillspector_scan(roots, notes) if roots else {}
+    extra = [d for d in targets if not any(d.startswith(r) for r in roots)]
+    if extra:
+        ss.update(skillspector_scan(extra, notes))
+    hk = husk_scan(targets, notes)
+    wt_hits = {}
+    for f in wt_findings:
+        if f["severity"] in ("critical", "high") and f["rule"].startswith("WT-T"):
+            wt_hits.setdefault(os.path.dirname(f["where"].split(":")[0]), []).append(f["rule"])
+    for d in sorted(set(ss) | set(hk)):
+        s_ = ss.get(d, {})
+        ss_flag = s_.get("recommendation") == "DO_NOT_INSTALL"
+        hk_flag = d in hk
+        wt_flag = any(k == d or k.startswith(d + "/") for k in wt_hits)
+        tier = skill_tier(d + "/")
+        engines = [n for n, v in (("SkillSpector", ss_flag), ("husk", hk_flag), ("Watchtower", wt_flag)) if v]
+        detail = "; ".join(s_.get("top", [])[:2])
+        if len(engines) >= 2:
+            out.append(finding("WT-X003", "Corroborated by multiple engines", "critical" if tier == "user" else "high",
+                               ["AST01", "AST08"], d, (" + ".join(engines) + (f"; {detail}" if detail else ""))[:150],
+                               "Two independent engines agree. Disable this skill until you've read the flagged lines.", source="engines"))
+        elif ss_flag:
+            out.append(finding("WT-X001", "SkillSpector: do not install", "high" if tier == "user" else "medium", ["AST01", "AST08"], d,
+                               f"risk {s_.get('score')}; {detail}"[:150],
+                               "Run `skillspector scan <folder>` for the exact lines; one engine alone can be wrong.", source="skillspector"))
+        elif hk_flag:
+            out.append(finding("WT-X002", "husk flagged this skill", "medium" if tier == "user" else "low", ["AST01", "AST05"], d,
+                               hk[d][0][:150], "Run `husk package <folder>` for details; one engine alone can be wrong.", source="husk"))
+    save_json(state_path("engines.json"), {"at": now(), "skillspector": len(ss), "husk_flagged": len(hk), "targets": len(targets)})
+    return out
+
+
+GITLEAKS_CONFIG = r"""[extend]
+useDefault = true
+
+[allowlist]
+description = "Watchtower: package caches and its own state"
+paths = [
+  '''(^|/)(go/pkg|pkg/mod|node_modules|\.cache|\.npm|\.venv|site-packages|dist-packages)/''',
+  '''(^|/)watchtower/(state|reports|app|\.venv|bin)/''',
+  '''chrome-cookie-seed\.json$''',
+]
+"""
+
+
+def gitleaks_findings(roots, notes):
+    exe = tool("gitleaks")
+    if not exe:
+        notes.append("gitleaks not installed: secrets checked with Watchtower's rules only.")
+        return []
+    out = []
+    cfg = state_path("gitleaks.toml")
+    with open(cfg, "w") as f:
+        f.write(GITLEAKS_CONFIG)
+    tmp = state_path("gitleaks.json")
+    for r in roots:
+        r = os.path.expanduser(r)
+        if not os.path.isdir(r):
+            continue
+        run([exe, "detect", "--source", r, "--no-git", "--redact", "--config", cfg, "--report-format", "json",
+             "--report-path", tmp, "--exit-code", "0", "--max-target-megabytes", "5"], 600)
+        per_file = {}
+        for leak in load_json(tmp, []) or []:
+            per_file.setdefault(leak.get("File"), []).append(leak)
+        for fpath, leaks in per_file.items():
+            kinds = sorted({l.get("RuleID", "secret") for l in leaks})
+            generic = all(k.startswith("generic") for k in kinds)
+            out.append(finding("WT-S002", "gitleaks: secrets in file", "medium" if generic else "critical", ["ASI03", "LLM02"],
+                               f"{fpath}:{leaks[0].get('StartLine')}", f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}",
+                               "Check whether these are live credentials. Revoke live ones, then delete or scrub the file.", source="gitleaks"))
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return out
+
+
+def installed_python_packages():
+    """Packages in the computer's own Python, not Watchtower's venv."""
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else (shutil.which("python3") or "python3")
+    code, out_s, _ = run([py, "-m", "pip", "list", "--format", "json", "--disable-pip-version-check"], 60)
+    try:
+        return {p["name"]: p["version"] for p in json.loads(out_s)}
+    except (ValueError, KeyError, TypeError):
+        return {}
+
+
+def package_findings(notes):
+    exe = tool("pip-audit")
+    if not exe:
+        notes.append("pip-audit not installed: installed Python packages not checked for known vulnerabilities.")
+        return []
+    pkgs = installed_python_packages()
+    if not pkgs:
+        return []
+    req = state_path("installed-requirements.txt")
+    with open(req, "w") as f:
+        f.write("\n".join(f"{n}=={v}" for n, v in sorted(pkgs.items())))
+    code, out_s, _ = run([exe, "-r", req, "--no-deps", "--disable-pip", "-f", "json", "--progress-spinner", "off"], 600)
+    out = []
+    try:
+        data = json.loads(out_s) if out_s.strip() else {}
+    except ValueError:
+        data = {}
+    for d in (data.get("dependencies", []) if isinstance(data, dict) else []):
+        vulns = d.get("vulns", [])
+        if not vulns:
+            continue
+        fixes = sorted({fv for v in vulns for fv in v.get("fix_versions", [])}, key=vtuple)
+        ids = list(dict.fromkeys(v.get("id", "") for v in vulns))
+        out.append(finding("WT-D001", f"Vulnerable package {d.get('name')} {d.get('version')}", "high", ["ASI04", "AST02"],
+                           f"python package {d.get('name')}", f"{len(ids)} known: {', '.join(ids[:4])}{'…' if len(ids) > 4 else ''}",
+                           f"Upgrade to {fixes[-1]} or later." if fixes else "No fixed version yet; remove it if nothing needs it.",
+                           source="pip-audit"))
+    save_json(state_path("package_vulns.json"), {"at": now(), "packages": len(pkgs), "findings": out})
     return out
 
 
@@ -748,6 +906,14 @@ def run_audit(args, quick):
     exports = args.exports or os.path.join(home(), "exports")
     start = dt.datetime.now()
     fs, meta = audit(roots, exports, quick=quick)
+    if quick:  # the daily run skips the slow engines; keep their last results instead of calling them fixed
+        prev_snap = load_json(state_path("last_findings.json"), {"findings": []})
+        have = {f["key"] for f in fs}
+        rescanned = {f["where"] for f in fs if f["rule"].startswith("WT-X")}
+        for f in prev_snap.get("findings", []):
+            if f["rule"] in SLOW_RULES and f["key"] not in have and f["where"] not in rescanned:
+                fs.append(f)
+        fs = sort_findings(fs)
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys = {f["key"] for f in prev.get("findings", [])}
@@ -765,6 +931,9 @@ def run_audit(args, quick):
     elapsed = round((dt.datetime.now() - start).total_seconds(), 1)
     ledger({"event": "daily" if quick else "audit", "score": s, "findings": len(live), "new": len(new), "fixed": len(fixed), "seconds": elapsed})
     return snapshot, new, fixed
+
+
+SLOW_RULES = ("WT-X001", "WT-X002", "WT-X003", "WT-S002", "WT-D001")
 
 
 def compact(f):
@@ -924,6 +1093,10 @@ def render_md(snap, hist, tag):
     lines += ["", "## Inventory", "", f"Skills on disk: {inv.get('skills', 0)} · plugin files: {inv.get('plugin_files', 0)} · MCP configs: {inv.get('mcp_configs', 0)}"]
     if snap.get("suppressed"):
         lines += ["", "## Accepted risks", ""] + [f"- {f['rule']} {f['title']} at `{f['where']}`" for f in snap["suppressed"]]
+    lb = load_json(state_path("last_brief.json"), None)
+    if lb and lb.get("tag") == tag:
+        lines += ["", "## Threat brief", "", f"Open `{lb['path']}` in a browser: {len(lb.get('research', []))} research items, "
+                  f"{sum(1 for k in lb.get('kev', []) if k.get('relevant'))} relevant exploited vulnerabilities."]
     if snap.get("notes"):
         lines += ["", "## Coverage notes", ""] + [f"- {n}" for n in snap["notes"]]
     lines += ["", f"_Watchtower {VERSION}, read-only. Scanners can be bypassed; this report is evidence, not proof._", ""]
@@ -956,7 +1129,702 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}td,th{{border-bottom:
 <div class='row'><div class='card'><div class='mut'>Posture score</div><div class='big'>{snap['score']}<span class='mut' style='font-size:18px'>/100 · {snap['grade']}</span></div><div class='mut'>{trend(hist)}</div></div>
 <div class='card'><div class='mut'>Score, last {len(pts)} runs</div><svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' role='img' aria-label='score trend'><polyline fill='none' stroke='#2e86c1' stroke-width='2' points='{poly}'/></svg></div>
 {tiles}</div><h2 style='font-size:16px'>Open findings</h2><div class='wrap'><table><tr><th>Severity</th><th>Finding</th><th>Where</th><th>OWASP</th><th>Fix</th></tr>{rows or "<tr><td colspan=5>Nothing open.</td></tr>"}</table></div>
+<p style='margin-top:16px'>{f"<a href='threat-brief-{tag}.html'>Open this week's threat brief →</a>" if os.path.exists(os.path.join(home(), "reports", f"threat-brief-{tag}.html")) else ""}</p>
 <p class='mut' style='margin-top:20px'>Watchtower {VERSION}. Scanners can be bypassed; this is evidence, not proof.</p></body></html>"""
+
+
+# ---------------------------------------------------------------- shell history (closest thing to Action Recording)
+HISTORY_FILES = ("~/.bash_history", "~/.zsh_history", "~/.local/share/fish/fish_history", "~/.python_history")
+HISTORY_RULES = [
+    ("WT-H001", "Script piped into a shell from an unknown host", "high", ["ASI05", "AST02"],
+     r"(curl|wget)[^\n|]{0,200}\|\s*(sudo\s+)?(ba|z)?sh\b"),
+    ("WT-H002", "Decoded payload executed", "critical", ["ASI05"], r"base64\s+(-d|--decode)[^\n]{0,80}\|\s*(ba|z)?sh|python3?\s+-c\s+['\"].{0,40}(exec|b64decode)"),
+    ("WT-H003", "Reverse shell pattern", "critical", ["ASI05", "ASI10"],
+     r"(bash\s+-i\s*>&\s*/dev/tcp/|nc(at)?\s+[^\n]{0,40}-e\s|mkfifo\s+/tmp/[^\n]{0,60}\bnc\b|socat\s+[^\n]{0,60}exec:)"),
+    ("WT-H004", "Credential store read", "high", ["ASI03"],
+     r"(cat|less|head|tail|cp|scp|base64)\s+[^\n]{0,40}(\.ssh/id_|\.aws/credentials|\.git-credentials|\.netrc|credentials\.json|cookie)"),
+    ("WT-H005", "File uploaded with curl", "high", ["ASI04"], r"curl\s[^\n]{0,200}(-d\s*@|--data(-binary)?\s*@|-F\s*\S*=@|-T\s)"),
+    ("WT-H006", "History tampering", "high", ["ASI10"], r"(history\s+-c|unset\s+HISTFILE|HISTFILE=/dev/null|>\s*~?/?\.?bash_history|shred\s+[^\n]*history)"),
+    ("WT-H007", "World-writable permissions", "medium", ["ASI03"], r"chmod\s+(-R\s+)?(0?777|a\+rwx|o\+w)\b"),
+    ("WT-H008", "New persistence added", "medium", ["ASI10"], r"(crontab\s+(-\s*$|-r|[^\s-])|>>\s*~?/?\.(bashrc|profile|zshrc)|systemctl\s+(--user\s+)?enable)"),
+    ("WT-H009", "Environment dumped to a file or the network", "high", ["ASI03"], r"\b(env|printenv|set)\s*(>|\|\s*(curl|nc|tee))"),
+]
+
+
+def history_findings(rules):
+    out, offsets = [], load_json(state_path("history_offsets.json"), {})
+    compiled = [(i, t, s, o, re.compile(rx, re.I | re.M)) for i, t, s, o, rx in HISTORY_RULES]
+    secret = next(r["rx"] for r in rules["rules"] if r["id"] == SECRET_RULE)
+    for hf in HISTORY_FILES:
+        p = os.path.expanduser(hf)
+        if not os.path.isfile(p):
+            continue
+        size = os.path.getsize(p)
+        start = offsets.get(p, 0)
+        if start > size:  # truncated or rotated
+            start = 0
+            out.append(finding("WT-H006", "Shell history shrank since last check", "medium", ["ASI10"], p,
+                               f"{offsets.get(p)} → {size} bytes", "Something cleared or rotated the history. Confirm it was you."))
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            chunk = f.read()
+        offsets[p] = size
+        for n, line in enumerate(chunk.splitlines(), 1):
+            line = re.sub(r"^: \d+:\d+;", "", line)  # zsh extended history prefix
+            for rid, title, sev, owasp, rx in compiled:
+                if rx.search(line):
+                    if rid == "WT-H001" and KNOWN_INSTALLERS.search(line):
+                        continue
+                    shown = secret.sub(lambda m: mask(m.group(0)), line)[:160]
+                    out.append(finding(rid, title, sev, owasp, f"{p}:+{n}", shown,
+                                       "Find which Bot or session ran this (Agent Computer view, routine runs). If none of yours meant to, run /watchtower-incident."))
+                    break
+    save_json(state_path("history_offsets.json"), offsets)
+    return out
+
+
+# ---------------------------------------------------------------- canaries (zero-token tripwires)
+CANARY_SPECS = [
+    ("customers", "/workspace/.archive/customers-export-2025.csv",
+     "name,email,phone,card_last4,notes\nDana Whitfield,{tok}@example.com,555-0101,4417,priority account\n"),
+    ("cloud-keys", "~/.config/backup/aws-credentials.bak",
+     "[default]\naws_access_key_id = AKIA{tokU}\naws_secret_access_key = {tok}{tok}\n"),
+    ("api-env", "/workspace/.archive/payments.env", "STRIPE_SECRET_KEY=rk_live_{tok}{tok}\nPAYOUT_ACCOUNT=acct_{tok}\n"),
+]
+
+
+def canary_paths():
+    reg = load_json(state_path("canaries.json"), {})
+    return {os.path.expanduser(v["path"]) for v in reg.values()}
+
+
+def cmd_canary(args):
+    reg = load_json(state_path("canaries.json"), {})
+    if args.action == "plant":
+        import secrets as _s
+        for name, path, body in CANARY_SPECS:
+            p = os.path.expanduser(path)
+            if name in reg and os.path.exists(p):
+                continue
+            tok = _s.token_hex(8)
+            content = body.format(tok=tok, tokU=tok.upper()[:16])
+            if args.token_file and name == "cloud-keys":
+                content = open(args.token_file).read()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+            st = os.stat(p)
+            os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # atime < mtime so the next read updates atime
+            reg[name] = {"path": path, "token": tok, "atime": os.stat(p).st_atime, "planted": now()}
+        save_json(state_path("canaries.json"), reg)
+        probe = state_path("atime-probe")
+        with open(probe, "w") as f:
+            f.write("x")
+        st = os.stat(probe)
+        os.utime(probe, (st.st_mtime - 86400, st.st_mtime))
+        before = os.stat(probe).st_atime
+        open(probe).read()
+        reads_tracked = os.stat(probe).st_atime > before + 1
+        os.remove(probe)
+        print(f"Planted {len(reg)} canaries: " + ", ".join(v["path"] for v in reg.values()))
+        if not reads_tracked:
+            print("Note: this filesystem doesn't record reads, so canaries will catch deletion and copying, not reading.")
+        ledger({"event": "canary-plant", "count": len(reg)})
+        return 0
+    if args.action == "remove":
+        for v in reg.values():
+            try:
+                os.remove(os.path.expanduser(v["path"]))
+            except OSError:
+                pass
+        save_json(state_path("canaries.json"), {})
+        print("Canaries removed.")
+        return 0
+    fs = canary_findings()
+    print(json.dumps([compact(f) for f in fs], indent=1) if fs else "CANARIES_QUIET")
+    return 0
+
+
+def canary_findings():
+    reg = load_json(state_path("canaries.json"), {})
+    out, changed = [], False
+    for name, v in reg.items():
+        p = os.path.expanduser(v["path"])
+        if not os.path.exists(p):
+            out.append(finding("WT-K002", "Canary file deleted or moved", "high", ["ASI10"], p, name,
+                               "Something removed a decoy. Check recent routine runs, then re-plant with `wt.py canary plant`."))
+            continue
+        st = os.stat(p)
+        if st.st_atime > v["atime"] + 1:
+            out.append(finding("WT-K001", "Canary file was read", "critical", ["ASI03", "ASI10"], p,
+                               f"{name} read at {dt.datetime.fromtimestamp(st.st_atime, dt.timezone.utc).isoformat(timespec='minutes')}",
+                               "Nothing legitimate needs this decoy. Find which Bot or routine read it (Agent Computer view, run history). "
+                               "It may be a Bot searching all files, or a skill hunting for credentials. Run /watchtower-incident."))
+            os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # re-arm
+            v["atime"] = os.stat(p).st_atime
+            changed = True
+    if changed:
+        save_json(state_path("canaries.json"), reg)
+    return out
+
+
+def canary_copies(text, path):
+    reg = load_json(state_path("canaries.json"), {})
+    for name, v in reg.items():
+        if v.get("token") and v["token"] in text and os.path.expanduser(v["path"]) != path:
+            return finding("WT-K003", "Canary value copied into another file", "critical", ["ASI03", "ASI04"], path, name,
+                           "A decoy's contents turned up somewhere else: something read it and wrote it out. Run /watchtower-incident.")
+    return None
+
+
+# ---------------------------------------------------------------- roll-call: memories, routines, connectors per Bot
+MEMORY_DIRECTIVE = re.compile(
+    r"(?i)\b(always|never|from now on|whenever|every time|automatically|by default|without asking|don'?t ask|skip (the )?approval|"
+    r"no need to (ask|confirm)|treat .{0,30} as (trusted|authori[sz]ed)|has (admin|full) (access|permission))\b")
+PRIVATE_DATA = re.compile(r"(?i)\b(gmail|outlook|email|drive|docs|notion|slack|calendar|granola|dropbox|supabase|crm|hubspot|salesforce)\b")
+UNTRUSTED_IN = re.compile(r"(?i)\b(web|browser|search|x\b|twitter|rss|inbox|incoming|reddit|scrape|tinyfish|fetch)\b")
+EXTERNAL_OUT = re.compile(r"(?i)\b(send|reply|post|publish|tweet|email|message|slack|share|upload|webhook|x\b)\b")
+
+
+def rollcall_findings(rdir):
+    rules = load_rules()
+    out, bots = [], []
+    if not os.path.isdir(rdir):
+        return out, bots
+    for fn in sorted(os.listdir(rdir)):
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(rdir, fn)
+        d = load_json(p, None)
+        if not isinstance(d, dict):
+            out.append(finding("WT-R010", "Roll-call reply did not parse", "low", ["ASI07"], p, fn,
+                               "Ask that Bot again; a Bot that won't describe itself is worth a closer look."))
+            continue
+        name = d.get("name") or fn[:-5]
+        bots.append(name)
+        where = f"rollcall:{name}"
+        mems = d.get("memories") or []
+        mems = mems if isinstance(mems, list) else [mems]
+        for i, m in enumerate(mems, 1):
+            t = m if isinstance(m, str) else json.dumps(m)
+            for f in scan_text(t, f"{where}:memory{i}", rules, kind="reference"):
+                f["owasp"] = ["ASI06"] + [o for o in f["owasp"] if o != "ASI06"]
+                out.append(f)
+            if MEMORY_DIRECTIVE.search(t) and (EXTERNAL_OUT.search(t) or re.search(r"(?i)approv|permission|trust|access", t)):
+                out.append(finding("WT-M010", "Memory acts as a standing instruction", "medium", ["ASI06"], f"{where}:memory{i}", t[:150],
+                                   "Memories steer every future run, and Auto Review doesn't check memory writes. "
+                                   "If you didn't put this there on purpose, remove it in that Bot's memory settings."))
+        for r in d.get("routines") or []:
+            if isinstance(r, dict):
+                t = " ".join(str(r.get(k, "")) for k in ("schedule", "trigger", "instructions", "prompt"))
+                out += scan_text(t, f"{where}:routine:{r.get('name', '?')}", rules, kind="routine")
+        if d.get("description"):
+            out += scan_text(str(d["description"]), f"{where}:description", rules, kind="description")
+        conns = " ".join(map(str, d.get("connectors") or []))
+        routines_text = " ".join(json.dumps(r) for r in d.get("routines") or [])
+        if PRIVATE_DATA.search(conns) and UNTRUSTED_IN.search(conns + " " + routines_text) and EXTERNAL_OUT.search(conns + " " + routines_text):
+            out.append(finding("WT-L001", "Lethal trifecta: private data + untrusted input + a way out", "high", ["ASI01", "ASI02"], where,
+                               conns[:150],
+                               "This Bot can read private data, reads content strangers control, and can send outward. "
+                               "That's the combination prompt injection needs. Split the jobs across Bots or put Ask first on every send."))
+    save_json(state_path("rollcall_findings.json"), {"at": now(), "bots": bots, "findings": out})
+    return out, bots
+
+
+def cmd_rollcall(args):
+    rdir = args.dir or os.path.join(home(), "exports", "rollcall")
+    fs, bots = rollcall_findings(rdir)
+    print(fit({"bots": bots, "findings": [compact(f) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs)}))
+    ledger({"event": "rollcall", "bots": len(bots), "findings": len(fs)})
+    return 0
+
+
+ROLLCALL_PROMPT = ("Watchtower roll-call. Reply with only a JSON object, no prose: "
+                   '{"name": "...", "description": "...", "skills": ["..."], '
+                   '"routines": [{"name": "...", "schedule": "...", "instructions": "..."}], '
+                   '"connectors": ["..."], "memories": ["each stored memory, verbatim"]}')
+
+
+# ---------------------------------------------------------------- pre-publish check (before Share → Create template)
+PREPUB_RULES = [
+    ("WT-PP01", "Email address", "medium", r"[\w.+-]+@[\w-]+\.[\w.-]+"),
+    ("WT-PP02", "Phone number", "medium", r"(?<!\d)(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)"),
+    ("WT-PP03", "Private network address or internal host", "high",
+     r"\b(10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|[\w-]+\.(internal|local|corp|lan))\b"),
+    ("WT-PP04", "Link to a private doc, drive or workspace", "high",
+     r"(docs\.google\.com/\S+|drive\.google\.com/\S+|notion\.so/\S+|[\w-]+\.slack\.com/\S+|airtable\.com/\S+|app\.hubspot\.com/\S+|1[\w-]{30,}\b)"),
+    ("WT-PP05", "Path that only exists on your computer", "medium", r"(/home/box/\S+|/workspace/\S+|/Users/\w+/\S+)"),
+    ("WT-PP06", "Depends on something templates don't carry", "medium",
+     r"(?i)\b(mcp server|custom mcp|run (the|this|my) script|\.py\b|\.sh\b|my local|localhost:\d+)"),
+]
+
+
+def cmd_prepublish(args):
+    rules = load_rules()
+    paths = []
+    if args.path == "-":
+        texts = [("stdin", sys.stdin.read())]
+    else:
+        for root, _, files in (os.walk(args.path) if os.path.isdir(args.path) else [(os.path.dirname(args.path), [], [os.path.basename(args.path)])]):
+            for fn in files:
+                paths.append(os.path.join(root, fn))
+        texts = [(p, read_text(p) or "") for p in paths]
+    fs = []
+    for where, t in texts:
+        fs += [f for f in scan_text(t, where, rules, kind="template") if f["rule"] in ("WT-T011", "WT-T013", "WT-T007", "WT-T008", "WT-T005", "WT-T006")]
+        for rid, title, sev, rx in PREPUB_RULES:
+            for m in re.finditer(rx, t):
+                ev = m.group(0)
+                if rid == "WT-PP01" and re.search(r"(?i)(example\.(com|org)|noreply|no-reply)", ev):
+                    continue
+                if rid == "WT-PP05" and "/workspace/watchtower" in ev:
+                    continue
+                fs.append(finding(rid, title, sev, ["AST04", "LLM02"], f"{where}:{line_of(t, m.start())}", mask(ev) if rid in ("WT-PP01", "WT-PP02") else ev[:120],
+                                  "Remove or generalize it before you create the template: anything in a description, skill or routine ships to every installer."))
+        if not has_approval(t, rules) and rules["write_verbs"].search(t):
+            fs.append(finding("WT-PP07", "No approval boundary", "high", ["ASI02"], where, "no approval line",
+                              "Add: never send, post, buy, publish, delete, or change settings without my approval."))
+    fs = sort_findings(dedupe(fs))
+    blocking = [f for f in fs if f["severity"] in ("critical", "high")]
+    result = {"verdict": "FAIL" if blocking else "PASS", "blocking": len(blocking), "findings": [compact(f) for f in fs][:40]}
+    print(fit(result) if args.json else
+          f"Pre-publish: {result['verdict']} ({len(blocking)} blocking, {len(fs)} total)\n" +
+          "\n".join(f"  [{f['severity'].upper()}] {f['title']} @ {f['where']} :: {f['evidence']}" for f in fs[:40]))
+    return 1 if blocking else 0
+
+
+# ---------------------------------------------------------------- incident mode (evidence first, containment with approval)
+CONTAINMENT = [
+    "Pause every routine on the affected Bot (and any Bot that shares its connectors).",
+    "In the Grok Bot browser, sign out of sensitive sites; then log out all sessions from each site's security settings.",
+    "Disconnect connectors the affected Bot uses (Marketplace → Your plugins) and revoke them in the source service.",
+    "Rotate CLI credentials on the computer (GitHub CLI, cloud CLIs) and any key found in the evidence.",
+    "Disable or delete the skill, plugin or template that triggered this; keep a copy in /workspace/watchtower/incidents for review.",
+    "If you can't explain what ran, reset the cloud computer (Settings → Computer) after saving what you need.",
+]
+
+
+def cmd_incident(args):
+    rules = load_rules()
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%MZ")
+    idir = os.path.join(home(), "incidents")
+    os.makedirs(idir, exist_ok=True)
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    secret = next(r["rx"] for r in rules["rules"] if r["id"] == SECRET_RULE)
+    clean = lambda t: secret.sub(lambda m: mask(m.group(0)), t or "")
+    _, ps, _ = run(["ps", "-eo", "pid,ppid,user,etime,cmd", "--sort=-etime"], 20)
+    _, net, _ = run(["ss", "-tunp"], 20)
+    _, cron, _ = run(["crontab", "-l"], 10)
+    _, timers, _ = run(["systemctl", "--user", "list-timers", "--all", "--no-pager"], 10)
+    recent = []
+    for r in [os.path.expanduser("~"), "/workspace"]:
+        for p in walk([r], max_depth=6):
+            try:
+                if os.path.getmtime(p) > dt.datetime.now().timestamp() - 86400 and p not in canary_paths():
+                    recent.append(p)
+            except OSError:
+                pass
+    tails = []
+    for hf in HISTORY_FILES:
+        p = os.path.expanduser(hf)
+        if os.path.isfile(p):
+            with open(p, errors="replace") as f:
+                tails += [f"{hf}: {clean(l.rstrip())[:200]}" for l in f.readlines()[-40:]]
+    hot = [f for f in snap.get("findings", []) if f["severity"] in ("critical", "high")]
+    ledger_tail = []
+    try:
+        with open(state_path("ledger.jsonl")) as f:
+            ledger_tail = f.readlines()[-20:]
+    except OSError:
+        pass
+    md = [f"# Watchtower incident {ts}", "", f"Reported: {args.note or '(no description given)'}", "",
+          "## Containment checklist (each step needs your yes)", ""] + [f"{i}. [ ] {c}" for i, c in enumerate(CONTAINMENT, 1)] + [
+          "", "## Open critical and high findings", ""] + [f"- {f['severity']} {f['rule']} {f['title']} at `{f['where']}` ({f['evidence']})" for f in hot[:40]] + [
+          "", "## Canaries", "", "\n".join(f"- {f['title']} at `{f['where']}`" for f in canary_findings()) or "- quiet",
+          "", "## Files changed in the last 24 hours", ""] + [f"- `{p}`" for p in sorted(recent)[:150]] + [
+          "", "## Shell history (last 40 lines per file, secrets masked)", "", "```"] + tails + ["```",
+          "", "## Processes", "", "```", clean(ps)[:8000], "```", "", "## Network connections", "", "```", clean(net)[:6000], "```",
+          "", "## Scheduled jobs", "", "```", clean(cron)[:2000], clean(timers)[:2000], "```",
+          "", "## Watchtower ledger (last 20 runs)", "", "```"] + [l.rstrip() for l in ledger_tail] + ["```", ""]
+    path = os.path.join(idir, f"incident-{ts}.md")
+    with open(path, "w") as f:
+        f.write("\n".join(md))
+    ledger({"event": "incident", "file": path, "hot": len(hot)})
+    print(fit({"evidence_pack": path, "open_critical_high": len(hot), "changed_24h": len(recent),
+               "top": [compact(f) for f in hot[:5]], "containment": CONTAINMENT}))
+    return 0
+
+
+# ---------------------------------------------------------------- OWASP Top 10 (2021) code review for code your Bots write
+CODE_RULES = [
+    ("A01", "Broken access control", "high", r"(?i)(@app\.route\([^)]*\)\s*\n\s*def\s+\w+\([^)]*\):(?![\s\S]{0,200}(login_required|auth|current_user))|cors\(\s*\w+\s*,\s*origins\s*=\s*['\"]\*|Access-Control-Allow-Origin['\"]?\s*[:,]\s*['\"]\*)"),
+    ("A02", "Cryptographic failure", "high", r"(?i)(hashlib\.(md5|sha1)\(|createHash\(['\"](md5|sha1)|verify\s*=\s*False|rejectUnauthorized\s*:\s*false|ssl\._create_unverified_context|Math\.random\(\)[^\n]{0,40}(token|secret|password|key))"),
+    ("A03", "Injection", "critical", r"(?i)((execute|executemany|raw|query)\(\s*f?['\"][^'\"]*(select|insert|update|delete)[^'\"]*['\"]\s*(%|\+|\.format)|(execute|query)\(\s*f['\"][^'\"]*\{|subprocess\.\w+\([^)]*shell\s*=\s*True|os\.system\(|child_process\.exec\(|\beval\(|new Function\(|innerHTML\s*=|dangerouslySetInnerHTML|document\.write\()"),
+    ("A04", "Insecure design", "medium", r"(?i)(TODO[^\n]{0,40}(auth|security|validate)|password\s*==\s*['\"])"),
+    ("A05", "Security misconfiguration", "medium", r"(?i)(debug\s*=\s*True|app\.run\([^)]*debug\s*=\s*True|DEBUG\s*=\s*True|ALLOWED_HOSTS\s*=\s*\[\s*['\"]\*|helmet\s*\(\s*\{\s*contentSecurityPolicy\s*:\s*false)"),
+    ("A06", "Vulnerable component pinned loosely", "low", r"(?im)^\s*[\w.-]+\s*(>=|\*|latest)\s*$"),
+    ("A07", "Identification and authentication failure", "high", r"(?i)(jwt\.decode\([^)]*verify\s*=\s*False|algorithms\s*=\s*\[\s*['\"]none|password\s*=\s*['\"][^'\"]{4,}['\"]|session\.permanent\s*=\s*True)"),
+    ("A08", "Software or data integrity failure", "high", r"(?i)(pickle\.loads?\(|yaml\.load\((?![^)]*Loader\s*=\s*yaml\.SafeLoader)|marshal\.loads\(|unserialize\(|<script[^>]+src=['\"]https?://(?![^'\"]*integrity))"),
+    ("A09", "Security logging failure", "low", r"(?i)except\s*(Exception)?\s*:\s*\n\s*pass\b"),
+    ("A10", "Server-side request forgery", "high", r"(?i)(requests\.(get|post)\(\s*(request\.|req\.|params|url_from|user)|fetch\(\s*req\.(query|body|params)|urlopen\(\s*request\.)"),
+]
+CODE_EXT = {".py", ".js", ".jsx", ".ts", ".tsx", ".php", ".rb", ".go", ".java", ".html", ".txt"}
+
+
+def cmd_codescan(args):
+    rules = load_rules()
+    out = []
+    files = [p for p in walk([args.path], max_depth=10) if os.path.splitext(p)[1].lower() in CODE_EXT] if os.path.isdir(args.path) else [args.path]
+    secret = next(r for r in rules["rules"] if r["id"] == SECRET_RULE)
+    for p in files[:3000]:
+        t = read_text(p, limit=500_000)
+        if not t:
+            continue
+        if os.path.basename(p) not in ("requirements.txt",) and p.endswith(".txt"):
+            continue
+        for cid, title, sev, rx in CODE_RULES:
+            if cid == "A06" and not p.endswith("requirements.txt"):
+                continue
+            for m in re.finditer(rx, t):
+                out.append(finding(f"WT-W{cid}", f"OWASP {cid}:2021 {title}", sev, [f"{cid}:2021"], f"{p}:{line_of(t, m.start())}",
+                                   m.group(0).strip()[:120], CODE_FIX[cid]))
+        for m in secret["rx"].finditer(t):
+            if looks_real_secret(m.group(0)):
+                out.append(finding("WT-WA07s", "OWASP A07:2021 Hard-coded secret", "critical", ["A07:2021"], f"{p}:{line_of(t, m.start())}",
+                                   mask(m.group(0)), "Move it to an environment variable or secret store and revoke the exposed one."))
+    semgrep = tool("semgrep")
+    note = "semgrep found and used too" if semgrep else "Watchtower patterns only; install semgrep for deeper analysis"
+    if semgrep:
+        code, so, _ = run([semgrep, "--config", "p/owasp-top-ten", "--json", "--quiet", args.path], 900)
+        try:
+            for r in json.loads(so).get("results", []):
+                out.append(finding("WT-WSG", f"semgrep: {r.get('check_id', '').split('.')[-1]}", (r.get("extra", {}).get("severity") or "medium").lower().replace("error", "high").replace("warning", "medium").replace("info", "low"),
+                                   ["OWASP"], f"{r.get('path')}:{r.get('start', {}).get('line')}", r.get("extra", {}).get("message", "")[:120],
+                                   "See the semgrep rule for the fix.", source="semgrep"))
+        except ValueError:
+            pass
+    out = sort_findings(dedupe(out))
+    print(fit({"files": len(files), "engine": note, "by_severity": by_sev(out), "findings": [compact(f) for f in out][:40]}))
+    ledger({"event": "codescan", "path": args.path, "findings": len(out)})
+    return 0
+
+
+CODE_FIX = {
+    "A01": "Check the caller's identity and permission on every route; never allow every origin.",
+    "A02": "Use bcrypt/argon2 for passwords, SHA-256+ for integrity, keep TLS verification on, use `secrets` for tokens.",
+    "A03": "Use parameterized queries and argument lists (no shell=True); never build HTML with innerHTML from input.",
+    "A04": "Finish the security TODO before shipping; compare secrets with a constant-time check.",
+    "A05": "Turn debug off in anything reachable; set explicit allowed hosts and a content-security policy.",
+    "A06": "Pin exact versions and audit them (`pip-audit`, `npm audit`).",
+    "A07": "Verify JWT signatures with an explicit algorithm; never hard-code passwords.",
+    "A08": "Don't deserialize untrusted data with pickle/yaml.load; add integrity hashes to third-party scripts.",
+    "A09": "Log the exception instead of swallowing it, so failures and attacks leave a trace.",
+    "A10": "Allow-list destination hosts before fetching a URL that came from a user.",
+}
+
+
+# ---------------------------------------------------------------- weekly threat brief
+FEEDS_PATH = os.path.join(HERE, "..", "rules", "feeds.json")
+WHY = [
+    (r"(?i)\bmcp\b|model context protocol", "You run MCP connectors; a poisoned tool description reaches every Bot that loads it."),
+    (r"(?i)\bskills?\b", "Grok Bot templates install skills; the same trick could ship inside a marketplace template."),
+    (r"(?i)prompt[- ]injection|indirect injection", "Your Bots read web pages, email and X posts, which is exactly where injected instructions hide."),
+    (r"(?i)npm|pypi|package|typosquat|dependency", "Your cloud computer installs packages on request; a poisoned package runs with every Bot's logins."),
+    (r"(?i)exfiltrat|data leak|steal", "Shared browser sessions and files mean one compromised Bot can reach all your accounts."),
+    (r"(?i)memory|persisten", "Auto Review does not check memory writes; a poisoned memory steers every future run."),
+    (r"(?i)browser|extension|chrome", "Every Bot shares one browser profile and its logged-in sessions."),
+    (r"(?i)cursor|grok|xai|x\.ai", "This touches the platform your Bots run on."),
+]
+
+
+def http_get(url, timeout=15, accept="*/*"):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"Watchtower/{VERSION} (+threat brief)", "Accept": accept})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(3_000_000).decode("utf-8", errors="replace")
+
+
+def strip_tags(t):
+    t = re.sub(r"(?is)<(script|style).*?</\1>", " ", t or "")
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = html.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def parse_date(s):
+    from email.utils import parsedate_to_datetime
+    s = (s or "").strip()
+    for fn in (lambda x: parsedate_to_datetime(x), lambda x: dt.datetime.fromisoformat(x.replace("Z", "+00:00"))):
+        try:
+            d = fn(s)
+            return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return None
+
+
+def parse_feed(xml_text):
+    import xml.etree.ElementTree as ET
+    items = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+    strip_ns = lambda t: t.split("}")[-1]
+    for el in root.iter():
+        tag = strip_ns(el.tag)
+        if tag not in ("item", "entry"):
+            continue
+        d = {}
+        for c in el:
+            ct = strip_ns(c.tag)
+            if ct == "title":
+                d["title"] = strip_tags(c.text or "")
+            elif ct == "link":
+                d["link"] = c.attrib.get("href") or (c.text or "").strip() or d.get("link", "")
+            elif ct in ("pubDate", "published", "updated", "date") and "date" not in d:
+                d["date"] = parse_date(c.text)
+            elif ct in ("description", "summary", "content", "encoded") and "summary" not in d:
+                d["summary"] = strip_tags(c.text or "")[:400]
+        if d.get("title"):
+            items.append(d)
+    return items
+
+
+def version_of(name):
+    if name == "watchtower":
+        return VERSION
+    exe = tool(name)
+    if not exe:
+        return None
+    for args in (["--version"], ["version"]):
+        code, out_s, err = run([exe] + args, 20)
+        m = re.search(r"v?(\d+\.\d+(\.\d+)?)", out_s + err)
+        if m:
+            return m.group(1)
+    return None
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def gather_brief(cfg, offline=None):
+    """Collect everything the brief needs. offline: dict of url->text for tests."""
+    get = (lambda u, **k: offline[u]) if offline is not None else http_get
+    days = cfg.get("window_days", 7)
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    rel = re.compile(cfg["relevance"])
+    sources, research = [], []
+    for fd in cfg["feeds"]:
+        try:
+            items = parse_feed(get(fd["url"], accept="application/rss+xml, application/atom+xml, application/xml"))
+            sources.append({"name": fd["name"], "url": fd["url"], "status": "ok", "items": len(items)})
+        except Exception as e:  # network, parse, KeyError in offline mode
+            sources.append({"name": fd["name"], "url": fd["url"], "status": f"unavailable ({type(e).__name__})", "items": 0})
+            continue
+        for it in items:
+            if it.get("date") and it["date"] < since:
+                continue
+            text = f"{it['title']} {it.get('summary', '')}"
+            if fd.get("all_relevant") or rel.search(text):
+                why = next((w for rx, w in WHY if re.search(rx, text)), "Relevant to AI agents and the software around them.")
+                research.append({"source": fd["name"], "kind": fd["kind"], "title": it["title"], "link": it.get("link", ""),
+                                 "date": it["date"].date().isoformat() if it.get("date") else "", "summary": it.get("summary", "")[:280], "why": why})
+    seen, dedup = set(), []
+    for r in sorted(research, key=lambda x: x["date"], reverse=True):
+        k = re.sub(r"\W+", "", r["title"].lower())[:60]
+        if k not in seen:
+            seen.add(k)
+            dedup.append(r)
+    research = dedup[:14]
+
+    kev, kev_status = [], "ok"
+    try:
+        data = json.loads(get(cfg["kev_url"], accept="application/json"))
+        watch = re.compile(cfg["kev_watch"])
+        for v in data.get("vulnerabilities", []):
+            added = parse_date(v.get("dateAdded", "") + "T00:00:00+00:00")
+            if added and added >= since:
+                text = f"{v.get('vendorProject')} {v.get('product')}"
+                kev.append({"cve": v.get("cveID"), "vendor": v.get("vendorProject"), "product": v.get("product"),
+                            "name": v.get("vulnerabilityName"), "added": v.get("dateAdded"), "due": v.get("dueDate"),
+                            "ransomware": v.get("knownRansomwareCampaignUse") == "Known", "relevant": bool(watch.search(text)),
+                            "action": (v.get("requiredAction") or "")[:200]})
+        kev.sort(key=lambda x: (not x["relevant"], x["added"]), reverse=False)
+    except Exception as e:
+        kev_status = f"unavailable ({type(e).__name__})"
+    sources.append({"name": "CISA Known Exploited Vulnerabilities", "url": cfg["kev_url"], "status": kev_status, "items": len(kev)})
+
+    updates = []
+    for r in cfg.get("releases", []):
+        if "ken-aisec" in r["repo"]:
+            continue
+        try:
+            rel_ = json.loads(get(f"https://api.github.com/repos/{r['repo']}/releases/latest", accept="application/vnd.github+json"))
+            latest = (rel_.get("tag_name") or "").lstrip("v")
+            have = version_of(r["installed"])
+            if latest and have and vtuple(latest) > vtuple(have):
+                updates.append({"name": r["name"], "have": have, "latest": latest, "url": rel_.get("html_url", "")})
+        except Exception:
+            continue
+
+    pages, page_state = [], load_json(state_path("watch_pages.json"), {})
+    for pg in cfg.get("watch_pages", []):
+        try:
+            text = strip_tags(get(pg["url"], accept="text/html"))
+            m = re.search(r"(?i)last updated[^\w]{0,5}((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? \d{1,2},? \d{4}|\d{4}-\d{2}-\d{2})", text)
+            stamp = m.group(1) if m else hashlib.sha256(text[:20000].encode()).hexdigest()[:16]
+            prev = page_state.get(pg["url"])
+            if prev and prev != stamp:
+                pages.append({"name": pg["name"], "url": pg["url"], "was": prev, "now": stamp})
+            page_state[pg["url"]] = stamp
+        except Exception:
+            continue
+    save_json(state_path("watch_pages.json"), page_state)
+    return {"research": research, "kev": kev, "updates": updates, "pages": pages, "sources": sources, "window_days": days}
+
+
+def brief_actions(b, snap, pkg):
+    acts = []
+    for f in (snap or {}).get("findings", [])[:3]:
+        if f["severity"] in ("critical", "high"):
+            acts.append(("Your setup", f"{f['title']}: {f['fix']}"))
+    for u in b["updates"]:
+        acts.append(("Tooling", f"Update {u['name']} {u['have']} → {u['latest']} (`bash /workspace/watchtower/app/scripts/install.sh --scanners` or re-run setup)."))
+    for k in [k for k in b["kev"] if k["relevant"]][:3]:
+        acts.append(("Exploited now", f"{k['vendor']} {k['product']} ({k['cve']}): {k['action'] or 'apply the vendor fix'}"))
+    for f in (pkg or {}).get("findings", [])[:3]:
+        acts.append(("Packages", f"{f['title']}: {f['fix']}"))
+    for pg in b["pages"]:
+        acts.append(("Platform", f"Re-read “{pg['name']}”: it changed this week."))
+    if not acts:
+        acts.append(("Your setup", "Nothing urgent. Keep the daily watch on and re-vet any template before you add it."))
+    return acts[:8]
+
+
+def render_brief(b, snap, pkg, hist, tag, analyst_note=None):
+    e = html.escape
+    safe = lambda u: html.escape(u) if re.match(r"(?i)^https?://", u or "") else "#"
+    rel_kev = [k for k in b["kev"] if k["relevant"]]
+    score = (snap or {}).get("score", "–")
+    grade = (snap or {}).get("grade", "")
+    hot = [f for f in (snap or {}).get("findings", []) if f["severity"] in ("critical", "high")]
+    pkg_f = (pkg or {}).get("findings", [])
+    acts = brief_actions(b, snap, pkg)
+    ok_sources = sum(1 for s in b["sources"] if s["status"] == "ok")
+    summary = analyst_note or (
+        f"In the last {b['window_days']} days, {len(b['research'])} research and news items touched AI agents, skills, MCP or the software "
+        f"supply chain. CISA added {len(b['kev'])} vulnerabilities to its exploited-in-the-wild catalog, {len(rel_kev)} in software "
+        f"software that runs on this kind of computer. Your Grok Bot posture is {score}/100{(' (' + grade + ')') if grade else ''} with "
+        f"{len(hot)} critical or high finding{'s' if len(hot) != 1 else ''} open"
+        f"{', and ' + str(len(pkg_f)) + ' known-vulnerable Python package' + ('s' if len(pkg_f) != 1 else '') if pkg_f else ''}. "
+        f"The first recommended action below is the one to do today.")
+    pill = lambda t, c: f"<span class='pill {c}'>{e(t)}</span>"
+    research_html = "".join(
+        f"<article class='item'><div class='meta'>{pill(r['kind'], 'k-' + re.sub(r'[^a-z]', '', r['kind']))}<span>{e(r['source'])}</span><span>{e(r['date'])}</span></div>"
+        f"<h3><a href='{safe(r['link'])}' target='_blank' rel='noopener'>{e(r['title'])}</a></h3>"
+        f"{('<p>' + e(r['summary']) + '</p>') if r['summary'] else ''}<p class='why'><b>Why it matters here:</b> {e(r['why'])}</p></article>"
+        for r in b["research"]) or "<p class='empty'>No relevant research this week from the sources that responded.</p>"
+    kev_rows = "".join(
+        f"<tr class='{'rel' if k['relevant'] else ''}'><td><a href='https://nvd.nist.gov/vuln/detail/{e(k['cve'] or '')}' target='_blank' rel='noopener'>{e(k['cve'] or '')}</a></td>"
+        f"<td>{e(k['vendor'] or '')} {e(k['product'] or '')}</td><td>{e(k['name'] or '')}</td><td>{e(k['added'] or '')}</td>"
+        f"<td>{pill('ransomware', 'crit') if k['ransomware'] else ''}{pill('relevant', 'high') if k['relevant'] else ''}</td></tr>"
+        for k in b["kev"][:25])
+    posture_rows = "".join(
+        f"<tr><td>{pill(f['severity'], 'crit' if f['severity'] == 'critical' else 'high')}</td><td>{e(f['title'])}</td><td><code>{e(f['where'][-70:])}</code></td><td>{e(f['fix'])}</td></tr>"
+        for f in hot[:10]) or "<tr><td colspan=4 class='empty'>No critical or high findings open.</td></tr>"
+    upd = "".join(f"<li><b>{e(u['name'])}</b> {e(u['have'])} → <a href='{safe(u['url'])}' target='_blank' rel='noopener'>{e(u['latest'])}</a></li>" for u in b["updates"])
+    pages = "".join(f"<li><a href='{safe(p['url'])}' target='_blank' rel='noopener'>{e(p['name'])}</a> changed ({e(str(p['was']))} → {e(str(p['now']))})</li>" for p in b["pages"])
+    acts_html = "".join(f"<li><span class='tag'>{e(a)}</span>{e(t)}</li>" for a, t in acts)
+    src_rows = "".join(f"<tr><td>{e(s['name'])}</td><td class='{'ok' if s['status'] == 'ok' else 'bad'}'>{e(s['status'])}</td><td>{s['items']}</td></tr>" for s in b["sources"])
+    pts = hist[-12:] if hist else []
+    spark = ""
+    if len(pts) >= 2:
+        w, h = 160, 36
+        step = w / (len(pts) - 1)
+        poly = " ".join(f"{round(i * step, 1)},{round(h - p[1] / 100 * h, 1)}" for i, p in enumerate(pts))
+        spark = f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' aria-label='score trend'><polyline fill='none' stroke='currentColor' stroke-width='2' points='{poly}'/></svg>"
+    generated = dt.datetime.now(dt.timezone.utc).strftime("%d %b %Y %H:%M UTC")
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Watchtower Threat Brief · {e(tag)}</title><style>
+:root{{--bg:#f6f7f9;--paper:#fff;--ink:#14181f;--mut:#5c6673;--line:#e2e6eb;--accent:#0f3d68;--accent2:#c8102e;--amber:#b45309;--ok:#1e7b46}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#0d1117;--paper:#151b23;--ink:#e6e9ee;--mut:#9aa4b2;--line:#283140;--accent:#7cb3e8;--accent2:#ff6b7d;--amber:#f0a83a;--ok:#4cc38a}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}}
+.wrap{{max-width:1040px;margin:0 auto;padding:28px 20px 60px}}
+.mast{{background:var(--accent);color:#fff;border-radius:14px 14px 0 0;padding:22px 28px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}}
+@media(prefers-color-scheme:dark){{.mast{{background:#0f2a45}}}}
+.mast h1{{margin:0;font-size:24px;letter-spacing:.06em;text-transform:uppercase}}.mast .sub{{opacity:.85;font-size:13px;margin-top:4px}}
+.tlp{{background:#000;color:#ffc000;font:700 12px/1 ui-monospace,Menlo,monospace;padding:7px 10px;border-radius:4px;letter-spacing:.05em}}
+.paper{{background:var(--paper);border:1px solid var(--line);border-top:0;border-radius:0 0 14px 14px;padding:26px 28px}}
+h2{{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:34px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line)}}
+h2:first-child{{margin-top:0}}.lead{{font-size:17px;line-height:1.6;margin:0}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:20px}}
+.kpi{{border:1px solid var(--line);border-radius:10px;padding:12px 14px}}.kpi b{{display:block;font-size:28px;line-height:1.1}}.kpi span{{color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
+.kpi.s b{{color:var(--accent)}}.kpi.r b{{color:var(--accent2)}}.kpi svg{{color:var(--accent);margin-top:4px}}
+ol.acts{{padding-left:20px;margin:0}}ol.acts li{{margin:8px 0}}.tag{{display:inline-block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);border:1px solid var(--line);border-radius:4px;padding:1px 6px;margin-right:8px}}
+.item{{border-left:3px solid var(--accent);padding:4px 0 4px 14px;margin:16px 0}}.item h3{{margin:4px 0;font-size:16px}}.item a{{color:var(--ink);text-decoration:none}}.item a:hover{{text-decoration:underline}}
+.item p{{margin:4px 0;color:var(--mut)}}.item p.why{{color:var(--ink)}}.meta{{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--mut)}}
+.pill{{display:inline-block;font-size:11px;font-weight:600;border-radius:999px;padding:1px 8px;margin-right:4px;background:var(--line);color:var(--ink);text-transform:lowercase}}
+.pill.crit{{background:var(--accent2);color:#fff}}.pill.high{{background:var(--amber);color:#fff}}
+.scroll{{overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em}}tr.rel td{{background:color-mix(in srgb,var(--amber) 10%,transparent)}}
+td a{{color:var(--accent)}}code{{font:12px ui-monospace,Menlo,monospace}}.ok{{color:var(--ok)}}.bad{{color:var(--accent2)}}.empty{{color:var(--mut);font-style:italic}}
+.foot{{color:var(--mut);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:14px}}
+@media print{{body{{background:#fff}}.wrap{{padding:0}}.mast{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}a{{color:inherit}}}}
+</style></head><body><div class='wrap'>
+<header class='mast'><div><h1>Watchtower Threat Brief</h1><div class='sub'>Week {e(tag)} · {b['window_days']}-day window · generated {e(generated)}</div></div><div class='tlp'>TLP:AMBER</div></header>
+<main class='paper'>
+<h2>Executive summary</h2><p class='lead'>{e(summary)}</p>
+<div class='kpis'><div class='kpi s'><b>{e(str(score))}</b><span>posture score</span>{spark}</div>
+<div class='kpi r'><b>{len(hot)}</b><span>critical / high open</span></div>
+<div class='kpi'><b>{len(b['research'])}</b><span>relevant research</span></div>
+<div class='kpi r'><b>{len(rel_kev)}</b><span>exploited, relevant</span></div>
+<div class='kpi'><b>{len(pkg_f)}</b><span>vulnerable packages</span></div></div>
+<h2>Recommended actions</h2><ol class='acts'>{acts_html}</ol>
+<h2>Agent and AI security developments</h2>{research_html}
+<h2>Exploited in the wild this week (CISA KEV)</h2>
+<div class='scroll'><table><tr><th>CVE</th><th>Product</th><th>Vulnerability</th><th>Added</th><th></th></tr>{kev_rows or "<tr><td colspan=5 class='empty'>No new entries, or the catalog was unreachable (see sources).</td></tr>"}</table></div>
+<h2>Your exposure</h2>
+<div class='scroll'><table><tr><th>Severity</th><th>Finding</th><th>Where</th><th>Fix</th></tr>{posture_rows}</table></div>
+{('<h3>Tool updates available</h3><ul>' + upd + '</ul>') if upd else ''}
+{('<h3>Platform documentation changes</h3><ul>' + pages + '</ul>') if pages else ''}
+<h2>Sources and method</h2>
+<div class='scroll'><table><tr><th>Source</th><th>Status</th><th>Items</th></tr>{src_rows}</table></div>
+<p class='foot'>{ok_sources} of {len(b['sources'])} sources responded. Items are filtered for relevance to AI agents, skills, MCP and the software supply chain; “why it matters” is matched to how Grok Bot works, not written by a model. Posture data comes from Watchtower {e(VERSION)}'s latest audit of this computer. TLP:AMBER: share with people who help you secure this account. Unavailable sources are listed rather than filled in from old data.</p>
+</main></div></body></html>"""
+
+
+def cmd_brief(args):
+    cfg = load_json(FEEDS_PATH, None)
+    if not cfg:
+        print("ERROR feeds.json missing", file=sys.stderr)
+        return 2
+    offline = load_json(args.offline, None) if args.offline else None
+    b = gather_brief(cfg, offline)
+    snap = load_json(state_path("last_findings.json"), None)
+    pkg = load_json(state_path("package_vulns.json"), None)
+    hist = []
+    try:
+        with open(state_path("score_history.csv")) as f:
+            hist = [(a, int(s), int(n)) for a, s, n in (l.strip().split(",") for l in f if l.strip())]
+    except (OSError, ValueError):
+        pass
+    note = open(args.summary).read().strip() if args.summary else None
+    week = dt.date.today().isocalendar()
+    tag = f"{week[0]}-W{week[1]:02d}"
+    rdir = os.path.join(home(), "reports")
+    os.makedirs(rdir, exist_ok=True)
+    path = os.path.join(rdir, f"threat-brief-{tag}.html")
+    with open(path, "w") as f:
+        f.write(render_brief(b, snap, pkg, hist, tag, note))
+    save_json(state_path("last_brief.json"), dict(b, tag=tag, path=path))
+    ledger({"event": "brief", "week": tag, "research": len(b["research"]), "kev": len(b["kev"])})
+    print(fit({"brief": path, "research": [{"title": r["title"], "source": r["source"]} for r in b["research"][:8]],
+               "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:8],
+               "updates": b["updates"], "doc_changes": [p["name"] for p in b["pages"]],
+               "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"]}))
+    return 0
 
 
 # ---------------------------------------------------------------- main
@@ -964,7 +1832,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    v = sub.add_parser("vet"); v.add_argument("path"); v.add_argument("--json", action="store_true")
+    v = sub.add_parser("vet"); v.add_argument("path"); v.add_argument("--json", action="store_true"); v.add_argument("--deep", action="store_true")
     for name in ("audit", "daily", "baseline"):
         p = sub.add_parser(name)
         p.add_argument("--roots", nargs="*")
@@ -972,8 +1840,16 @@ def main(argv=None):
     sub.add_parser("report")
     sub.add_parser("breakdown")
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
+    c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
+    r = sub.add_parser("rollcall"); r.add_argument("--dir")
+    pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
+    ic = sub.add_parser("incident"); ic.add_argument("--note")
+    cs = sub.add_parser("codescan"); cs.add_argument("path")
+    br = sub.add_parser("brief"); br.add_argument("--summary"); br.add_argument("--offline")
     a = ap.parse_args(argv)
-    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show}[a.cmd](a)
+    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
+            "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
+            "codescan": cmd_codescan, "brief": cmd_brief}[a.cmd](a)
 
 
 if __name__ == "__main__":

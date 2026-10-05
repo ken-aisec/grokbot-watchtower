@@ -1,0 +1,99 @@
+{
+ "window_days": 7,
+ "relevance": "(?i)(prompt[- ]injection|agent|agentic|\\bmcp\\b|model context protocol|\\bskills?\\b|llm|copilot|cursor|claude code|grok|codex|supply[- ]chain|typosquat|malicious (package|npm|pypi|extension)|exfiltrat|jailbreak|tool poisoning|ai (security|red team))",
+ "feeds": [
+  {
+   "name": "Trail of Bits",
+   "url": "https://blog.trailofbits.com/feed/",
+   "kind": "research"
+  },
+  {
+   "name": "Simon Willison: prompt injection",
+   "url": "https://simonwillison.net/tags/prompt-injection.atom",
+   "kind": "research",
+   "all_relevant": true
+  },
+  {
+   "name": "Embrace The Red",
+   "url": "https://embracethered.com/blog/index.xml",
+   "kind": "research"
+  },
+  {
+   "name": "Snyk Labs",
+   "url": "https://labs.snyk.io/rss.xml",
+   "kind": "research"
+  },
+  {
+   "name": "Invariant Labs",
+   "url": "https://invariantlabs.ai/blog/rss.xml",
+   "kind": "research"
+  },
+  {
+   "name": "Cloud Security Alliance Labs",
+   "url": "https://labs.cloudsecurityalliance.org/feed/",
+   "kind": "research"
+  },
+  {
+   "name": "OWASP GenAI Security Project",
+   "url": "https://genai.owasp.org/feed/",
+   "kind": "standards"
+  },
+  {
+   "name": "Socket (package supply chain)",
+   "url": "https://socket.dev/api/blog/feed.atom",
+   "kind": "supply-chain"
+  },
+  {
+   "name": "GitHub Security Lab",
+   "url": "https://github.blog/tag/github-security-lab/feed/",
+   "kind": "research"
+  },
+  {
+   "name": "The Hacker News",
+   "url": "https://feeds.feedburner.com/TheHackersNews",
+   "kind": "news"
+  }
+ ],
+ "kev_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+ "kev_watch": "(?i)(chrom|linux kernel|\\bkernel\\b|python|node\\.?js|openssh|\\bgit\\b|\\bcurl\\b|libcurl|openssl|\\bsudo\\b|glibc|docker|containerd|runc)",
+ "releases": [
+  {
+   "name": "Watchtower",
+   "repo": "ken-aisec/grokbot-watchtower",
+   "installed": "watchtower"
+  },
+  {
+   "name": "SkillSpector",
+   "repo": "NVIDIA/SkillSpector",
+   "installed": "skillspector"
+  },
+  {
+   "name": "husk",
+   "repo": "ctrl-adam/Husk",
+   "installed": "husk"
+  },
+  {
+   "name": "gitleaks",
+   "repo": "gitleaks/gitleaks",
+   "installed": "gitleaks"
+  }
+ ],
+ "watch_pages": [
+  {
+   "name": "Grok Bot: approvals, security and privacy",
+   "url": "https://docs.x.ai/grok-bot/approvals-security-and-privacy"
+  },
+  {
+   "name": "Grok Bot: security",
+   "url": "https://docs.x.ai/grok-bot/security"
+  },
+  {
+   "name": "Grok Bot: skills, routines and automations",
+   "url": "https://docs.x.ai/grok-bot/skills-routines-and-automations"
+  },
+  {
+   "name": "OWASP Agentic Skills Top 10",
+   "url": "https://owasp.org/www-project-agentic-skills-top-10/"
+  }
+ ]
+}

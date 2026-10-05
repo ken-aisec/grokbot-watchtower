@@ -5,12 +5,15 @@
 set -euo pipefail
 WT_HOME="${WATCHTOWER_HOME:-/workspace/watchtower}"
 REPO="https://github.com/ken-aisec/grokbot-watchtower"
-GITLEAKS_VERSION="8.21.2"
+GITLEAKS_VERSION="8.30.1"
 
 if [[ "${1:-}" == "--scanners" ]]; then
   python3 -m venv "$WT_HOME/.venv"
   "$WT_HOME/.venv/bin/pip" install --quiet --upgrade pip
-  "$WT_HOME/.venv/bin/pip" install --quiet "git+https://github.com/NVIDIA/SkillSpector" husk-scanner pip-audit
+  # Pinned: a security tool that installs unpinned scanners is its own supply-chain risk.
+  "$WT_HOME/.venv/bin/pip" install --quiet \
+    "skillspector @ git+https://github.com/NVIDIA/SkillSpector@a50b9c93835c94f7d36329f11c6599abbb9c74ee" \
+    "husk-scanner==1.3.5" "pip-audit==2.10.1"
   mkdir -p "$WT_HOME/bin"
   arch="$(uname -m)"; case "$arch" in x86_64) ga=x64;; aarch64|arm64) ga=arm64;; *) echo "skip gitleaks: $arch"; ga="";; esac
   if [[ -n "$ga" ]]; then
@@ -21,7 +24,8 @@ if [[ "${1:-}" == "--scanners" ]]; then
     (cd /tmp && grep " $tgz\$" gitleaks_checksums.txt | sha256sum -c -)
     tar -xzf "/tmp/$tgz" -C "$WT_HOME/bin" gitleaks
   fi
-  echo "Scanners installed. Add to PATH in routines: export PATH=$WT_HOME/.venv/bin:$WT_HOME/bin:\$PATH"
+  "$WT_HOME/.venv/bin/skillspector" --version && "$WT_HOME/bin/gitleaks" version || true
+  echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."
   exit 0
 fi
 

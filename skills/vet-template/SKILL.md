@@ -13,7 +13,7 @@ One of: an `https://x.ai/bot/...` template link, a GitHub skill URL, a path on t
    - x.ai link: the public preview shows only the title and description, not skills or routines. Click **Download** (never Add to Grok Bot), save the file to `/workspace/watchtower/vet/<slug>/`, unpack it if it is an archive, and vet every file inside. Never run anything from it. If no download is offered, vet the description and say plainly: "Description only: skills and routines not visible, so this cannot be rated Install."
    - GitHub URL: `git clone --depth 1 <url> /workspace/watchtower/vet/<slug>`; never run anything inside it.
    - Pasted text: save it verbatim.
-2. Run `python3 /workspace/watchtower/app/watchtower/wt.py vet <file> --json` for each text file (for a folder, run it on SKILL.md and every script). If SkillSpector is installed, also run `skillspector scan <folder> --no-llm --format json --output /workspace/watchtower/vet/<slug>-ss.json`.
+2. Run `python3 /workspace/watchtower/app/watchtower/wt.py vet <file> --deep --json` on each SKILL.md and script (for a folder, point it at the SKILL.md inside). `--deep` adds SkillSpector and husk when they're installed; a WT-X003 finding means two engines agree.
 3. Judge. The script gives the verdict; you add only what it cannot know:
    - Does what the skill does match what its description claims? A "notes formatter" that reads credentials is a mismatch.
    - Is the author identifiable (an X handle, a GitHub history)? Anonymous plus broad permissions means Do not install.

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.0 — 2026-10-05 (full feature set)
+- Three engines: SkillSpector and husk run on your own skills plus anything new or changed; two engines agreeing is a corroborated critical. Scanners are found in Watchtower's own folder (fixes "SkillSpector not installed" when it was).
+- Weekly threat brief: professional HTML with relevant research, CISA exploited vulnerabilities, tool updates, Grok Bot doc changes, your exposure and recommended actions. Hostile feed content is escaped and non-http links are dropped.
+- Roll-call memory audit: poisoned memories, standing-instruction memories, unsafe routines, lethal-trifecta Bots.
+- Canary tripwires for reads, deletion and copying.
+- Shell-history review, incremental, secrets masked.
+- Pre-publish check before sharing a template.
+- Incident mode: evidence pack and approval-gated containment.
+- OWASP Top 10 (2021) code review, plus semgrep when present.
+- gitleaks skips caches; pip-audit checks the computer's Python, not Watchtower's; one finding per vulnerable package.
+- Installer pins every scanner. Monthly roll-call routine. 34 tests.
+
 ## v0.1.5 — 2026-10-05 (fourth real audit: no real criticals left)
 - Official installers (x.ai CLI, Tailscale, Slack CLI, Cursor, Helm and others) piped to shell are medium or low; unknown hosts stay critical.
 - Supporting files that document or detect attacks (a skill-scanner's pattern lists) have their matches downgraded to low and kept visible. A SKILL.md, the file a Bot actually follows, is never downgraded this way.
