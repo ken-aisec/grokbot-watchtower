@@ -10,7 +10,8 @@
 - Incident mode: evidence pack and approval-gated containment.
 - OWASP Top 10 (2021) code review, plus semgrep when present.
 - gitleaks skips caches; pip-audit checks the computer's Python, not Watchtower's; one finding per vulnerable package.
-- Installer pins every scanner. Monthly roll-call routine. 34 tests.
+- One-time detections (shell history, canary trips) stay open for 14 days instead of looking fixed the next day.
+- Installer pins every scanner. Monthly roll-call routine. 36 tests, isolated from the real home folder.
 
 ## v0.1.5 — 2026-10-05 (fourth real audit: no real criticals left)
 - Official installers (x.ai CLI, Tailscale, Slack CLI, Cursor, Helm and others) piped to shell are medium or low; unknown hosts stay critical.

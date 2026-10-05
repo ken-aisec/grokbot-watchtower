@@ -81,7 +81,7 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 
 ## Tests
 
-`make test` runs 34 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs 36 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 

@@ -591,10 +591,9 @@ def audit(roots, exports, quick=False):
         notes.append("Grok Bot settings.json not found: Auto Review rules and local execution checked from exports only.")
 
     # 5b. tripwires and shell history (zero tokens)
-    fs += canary_findings()
+    fs += remember_events(canary_findings() + history_findings(rules))
     if not load_json(state_path("canaries.json"), {}):
         notes.append("No canaries planted: run `wt.py canary plant` for zero-cost tripwires.")
-    fs += history_findings(rules)
     rc = load_json(state_path("rollcall_findings.json"), None)
     if rc and rc.get("at", "") >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=35)).isoformat():
         fs += rc.get("findings", [])
@@ -1133,6 +1132,24 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}td,th{{border-bottom:
 <p class='mut' style='margin-top:20px'>Watchtower {VERSION}. Scanners can be bypassed; this is evidence, not proof.</p></body></html>"""
 
 
+# ---------------------------------------------------------------- one-time events (history, canaries) stay open
+EVENT_DAYS = 14
+
+
+def remember_events(new):
+    """History lines and canary trips happen once. Keep them open for EVENT_DAYS so the next run
+    doesn't report them as fixed; suppress one (wt.py show + suppressions.json) to close it sooner."""
+    store = load_json(state_path("events.json"), [])
+    known = {e["key"] for e in store}
+    for f in new:
+        if f["key"] not in known:
+            store.append(dict(f, first_seen=now()))
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=EVENT_DAYS)).isoformat()
+    store = [e for e in store if e.get("first_seen", "") >= cutoff]
+    save_json(state_path("events.json"), store)
+    return [{k: v for k, v in e.items() if k != "first_seen"} for e in store]
+
+
 # ---------------------------------------------------------------- shell history (closest thing to Action Recording)
 HISTORY_FILES = ("~/.bash_history", "~/.zsh_history", "~/.local/share/fish/fish_history", "~/.python_history")
 HISTORY_RULES = [
@@ -1223,7 +1240,8 @@ def cmd_canary(args):
         st = os.stat(probe)
         os.utime(probe, (st.st_mtime - 86400, st.st_mtime))
         before = os.stat(probe).st_atime
-        open(probe).read()
+        with open(probe) as pf:
+            pf.read()
         reads_tracked = os.stat(probe).st_atime > before + 1
         os.remove(probe)
         print(f"Planted {len(reg)} canaries: " + ", ".join(v["path"] for v in reg.values()))
