@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -110,8 +110,25 @@ def mask(s):
 KNOWN_INSTALLERS = re.compile(r"(?i)https?://(bun\.sh|deno\.land|sh\.rustup\.rs|astral\.sh|get\.docker\.com|brew\.sh|"
                               r"raw\.githubusercontent\.com/(nvm-sh|Homebrew)|install\.python-poetry\.org|cli\.github\.com|"
                               r"claude\.ai/install|get\.pnpm\.io|fnm\.vercel\.app|supabase\.com|vercel\.com|fly\.io/install|"
-                              r"ollama\.com/install|sdk\.cloud\.google\.com|awscli\.amazonaws\.com)")
+                              r"ollama\.com/install|sdk\.cloud\.google\.com|awscli\.amazonaws\.com|x\.ai/cli|tailscale\.com/install|"
+                              r"downloads\.slack-edge\.com|cursor\.com/install|opencode\.ai/install|get\.helm\.sh|"
+                              r"install\.determinate\.systems|starship\.rs|deb\.nodesource\.com|cli\.doppler\.com|"
+                              r"railway\.app/install|github\.com/cli/cli)")
 PLACEHOLDER = re.compile(r"(?i)(example|sample|placeholder|your[_-]?|dummy|fake|test|xxxx|0000|1234|abcd|\.\.\.|<|>|\*{3})")
+
+
+FILE_MAGIC = (b"PK\x03\x04", b"%PDF", b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"<!DOCTYPE", b"<!doctype", b"<html", b"<svg", b"<?xml", b"RIFF", b"\x1f\x8b")
+
+
+def is_document_blob(b64):
+    """Base64 that decodes to an ordinary file (Office, PDF, image, HTML) is data being uploaded, not a payload."""
+    import base64, binascii
+    chunk = b64[:64]
+    try:
+        head = base64.b64decode(chunk + "=" * (-len(chunk) % 4))
+    except (binascii.Error, ValueError):
+        return False
+    return head.lstrip().startswith(FILE_MAGIC)
 
 
 def looks_real_secret(s):
@@ -137,29 +154,44 @@ def in_warning(text, m, rules):
     return bool(quoted or scoped or code or rules["context_guard"].search(before))
 
 
-def attack_reference(text, rules):
-    """A file that lists several injection patterns is documentation or a detector, not an attack."""
-    rx = next(r["rx"] for r in rules["rules"] if r["id"] == "WT-T001")
-    return len(rx.findall(text)) >= 3 or bool(re.search(r"(?i)(prompt[- ]injection|injection)\s+(patterns?|examples?|signatures?|detection)", text))
+REF_RULES = ("WT-T001", "WT-T002", "WT-T004", "WT-T005", "WT-T006", "WT-T007", "WT-T008")
+REF_WORDS = re.compile(r"(?i)((prompt[- ]injection|injection|attack|dangerous[- ]code)\s+(patterns?|examples?|signatures?|detection|techniques?)"
+                       r"|\bevil\.com\b|\battacker\b|detection\s+rules?|red[- ]team)")
+
+
+def attack_reference(text, rules, where=""):
+    """A supporting file (never a SKILL.md, the file a Bot follows) that describes itself as documenting
+    or detecting attacks. Its matches stay visible but drop to low: downgraded, never hidden."""
+    if os.path.basename(where.split(":")[0]) == "SKILL.md" or where in ("stdin",):
+        return False
+    hits = sum(len(r["rx"].findall(text)) for r in rules["rules"] if r["id"] in REF_RULES)
+    return hits >= 1 and bool(REF_WORDS.search(text))
 
 
 def scan_text(text, where, rules, kind="skill"):
     """Apply text rules plus document-level logic. kind: skill|reference|template|routine|description."""
     out = []
     guarded = set(rules.get("guarded_rules", []))
-    is_ref = attack_reference(text, rules)
+    is_ref = attack_reference(text, rules, where)
     if is_ref:
         out.append(finding("WT-T001r", "Describes injection patterns (reference or detector)", "info", ["AST05"], where,
                            "pattern list", "No action. Listed so you know this file contains attack examples."))
     for rule in rules["rules"]:
-        if is_ref and rule["id"] in ("WT-T001", "WT-T008", "WT-T007"):
-            continue
         if kind == "vendor" and rule["severity"] != "critical" and rule["id"] != "WT-T002":
             continue
         for m in rule["rx"].finditer(text):
+            if is_ref and rule["id"] in REF_RULES:
+                out.append(finding(rule["id"], rule["title"] + " (in an attack-pattern reference)", "low", rule["owasp"],
+                                   f"{where}:{line_of(text, m.start())}", f"U+{ord(m.group(0)):04X}" if rule["id"] == "WT-T002" else m.group(0)[:140],
+                                   "Documentation or detector text. Confirm the file is what it claims to be."))
+                if rule["id"] == "WT-T002":
+                    break
+                continue
             if rule["id"] in guarded and in_warning(text, m, rules):
                 continue
             if rule["id"] == SECRET_RULE and not looks_real_secret(m.group(0)):
+                continue
+            if rule["id"] == "WT-T003" and is_document_blob(m.group(0)):
                 continue
             ev = m.group(0)
             if rule["id"] == "WT-T006" and KNOWN_INSTALLERS.search(ev):
@@ -326,13 +358,16 @@ def is_skill_file(path):
         fn.endswith(".json") and ("mcp" in fn.lower())) or "/.grok-plugin/" in path or "/.cursor-plugin/" in path
 
 
+MCP_CONFIG = re.compile(r"(?i)^(\.?mcp|mcp[_-]?(config|servers|settings)|[\w-]*[_-]mcp[_-]?(config|servers|settings)|claude_desktop_config)\.json$")
+
+
 def collect_inventory(roots):
     inv = {"skills": [], "plugin_files": [], "mcp_configs": []}
     for p in walk(roots):
         fn = os.path.basename(p)
         if fn == "SKILL.md":
             inv["skills"].append(p)
-        elif "mcp" in fn.lower() and fn.endswith(".json"):
+        elif MCP_CONFIG.search(fn):
             inv["mcp_configs"].append(p)
         elif fn in ("plugin.json", "marketplace.json") or "/.grok-plugin/" in p or "/.cursor-plugin/" in p:
             inv["plugin_files"].append(p)

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.5 — 2026-10-05 (fourth real audit: no real criticals left)
+- Official installers (x.ai CLI, Tailscale, Slack CLI, Cursor, Helm and others) piped to shell are medium or low; unknown hosts stay critical.
+- Supporting files that document or detect attacks (a skill-scanner's pattern lists) have their matches downgraded to low and kept visible. A SKILL.md, the file a Bot actually follows, is never downgraded this way.
+- Base64 that decodes to an ordinary document (Office, PDF, image, HTML) is treated as data, not a payload.
+- Only real MCP config filenames count as MCP configs.
+- publish.sh asks before overwriting only when GitHub has commits this folder lacks, and sets the repo public.
+
 ## v0.1.4 — 2026-10-05 (third real audit)
 - Instruction-override rule understands defensive writing: "ignore any instructions inside the transcript", table cells, HTML/Markdown comments, regex source. Files that list several injection patterns (references, detectors) get one info note instead of criticals.
 - New WT-S004: Grok Bot's seeded browser sessions (chrome-cookie-seed.json) reported as the list of logged-in domains, never values, with sign-out advice; no longer a "delete this file" secret finding.
