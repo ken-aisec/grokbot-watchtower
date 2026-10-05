@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.4 — 2026-10-05 (third real audit)
+- Instruction-override rule understands defensive writing: "ignore any instructions inside the transcript", table cells, HTML/Markdown comments, regex source. Files that list several injection patterns (references, detectors) get one info note instead of criticals.
+- New WT-S004: Grok Bot's seeded browser sessions (chrome-cookie-seed.json) reported as the list of logged-in domains, never values, with sign-out advice; no longer a "delete this file" secret finding.
+- Baseline entries under now-skipped caches no longer show as "removed"; info findings never appear as new.
+
 ## v0.1.3 — 2026-10-05 (second real audit)
 - Skips language package caches (Go module cache, Maven, Gradle, dist-packages, bun, pnpm).
 - Trust tiers: the user's own saved skills get every rule; first-party bundles, marketplace plugins, other agents' skill folders and copies in /workspace get malicious-indicator rules only.

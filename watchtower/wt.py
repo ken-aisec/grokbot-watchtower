@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -131,15 +131,29 @@ def in_warning(text, m, rules):
     sentence_start = max(before.rfind(". "), before.rfind("\n"))
     before = before[sentence_start + 1:] if sentence_start >= 0 else before
     after = text[m.end():m.end() + 40]
-    quoted = before.rstrip().endswith(("\"", "“", "'", "`")) and after[:2].strip().startswith(("\"", "”", "'", "`", ",", "."))
-    return quoted or bool(rules["context_guard"].search(before))
+    quoted = before.rstrip().endswith(("\"", "“", "'", "`", "(", "[")) or before.rstrip().endswith("|")
+    scoped = re.match(r"(?i)\s*(inside|in\s+(the|any|this|that)|within|from\s+(the|any)|embedded|contained|found\s+in|that\s+appear)", after)
+    code = re.search(r"(<!--|\[//\]|r\"|\\s[+*]|\(\?i\))", before + after)
+    return bool(quoted or scoped or code or rules["context_guard"].search(before))
+
+
+def attack_reference(text, rules):
+    """A file that lists several injection patterns is documentation or a detector, not an attack."""
+    rx = next(r["rx"] for r in rules["rules"] if r["id"] == "WT-T001")
+    return len(rx.findall(text)) >= 3 or bool(re.search(r"(?i)(prompt[- ]injection|injection)\s+(patterns?|examples?|signatures?|detection)", text))
 
 
 def scan_text(text, where, rules, kind="skill"):
     """Apply text rules plus document-level logic. kind: skill|reference|template|routine|description."""
     out = []
     guarded = set(rules.get("guarded_rules", []))
+    is_ref = attack_reference(text, rules)
+    if is_ref:
+        out.append(finding("WT-T001r", "Describes injection patterns (reference or detector)", "info", ["AST05"], where,
+                           "pattern list", "No action. Listed so you know this file contains attack examples."))
     for rule in rules["rules"]:
+        if is_ref and rule["id"] in ("WT-T001", "WT-T008", "WT-T007"):
+            continue
         if kind == "vendor" and rule["severity"] != "critical" and rule["id"] != "WT-T002":
             continue
         for m in rule["rx"].finditer(text):
@@ -393,6 +407,31 @@ def skill_tier(path):
     return "vendor"
 
 
+SESSION_FILES = ("chrome-cookie-seed.json", "cookie-seed.json", "cookies.json")
+
+
+def browser_sessions(roots):
+    """Grok Bot seeds the shared browser with login cookies. Report which domains, never values."""
+    out = []
+    for r in [os.path.expanduser("~/sand-data"), os.path.expanduser("~/agent-data")] + list(roots):
+        if not os.path.isdir(r):
+            continue
+        for fn in SESSION_FILES:
+            p = os.path.join(r, fn)
+            data = load_json(p, None)
+            if data is None:
+                continue
+            items = data if isinstance(data, list) else data.get("cookies", []) if isinstance(data, dict) else []
+            domains = sorted({str(c.get("domain", "")).lstrip(".") for c in items if isinstance(c, dict) and c.get("domain")})
+            sensitive = [d for d in domains if re.search(r"(anthropic|claude|openai|x\.ai|github|google|microsoft|aws|stripe|bank|paypal|slack|notion)", d)]
+            out.append(finding("WT-S004", "Logged-in browser sessions shared by every Bot", "high" if sensitive else "medium",
+                               ["ASI03", "AST06"], p, f"{len(domains)} domains; sensitive: {', '.join(sensitive[:8]) or 'none'}",
+                               "Every Bot can reuse these logins. In the Grok Bot browser, sign out of sites no Bot needs; "
+                               "for AI consoles and admin sites, also log out all sessions from that site's security settings."))
+            break
+    return out
+
+
 def is_vendor(path):
     return skill_tier(path) == "vendor"
 
@@ -436,6 +475,8 @@ def audit(roots, exports, quick=False):
                 fs.append(finding("WT-I002", "New skill or plugin file", "low", ["AST09"], p, h[:12],
                                   "Vet it (`wt vet`), then run `wt baseline` to accept it."))
         for p in base:
+            if any(x in p for x in SKIP_PATH_PARTS):
+                continue
             if p not in manifest and not p.startswith("persist:"):
                 fs.append(finding("WT-I003", "Skill or plugin file removed", "info", ["AST09"], p, "missing", "Confirm you removed it."))
     else:
@@ -454,8 +495,9 @@ def audit(roots, exports, quick=False):
     # 4. secrets in files (known CLI credential files reported separately)
     fs += cli_credentials()
     known = {os.path.join(os.path.expanduser("~"), k) for k in KNOWN_CRED_FILES}
+    fs += browser_sessions(roots)
     for p in walk(roots, max_depth=6):
-        if p in known:
+        if p in known or os.path.basename(p) in SESSION_FILES:
             continue
         if os.path.splitext(p)[1].lower() not in TEXT_EXT:
             continue
@@ -487,7 +529,7 @@ def audit(roots, exports, quick=False):
             elif low.startswith("settings") and low.endswith(".json"):
                 fs += lint_settings(load_json(p, {}), f"export:{fn}")
     else:
-        notes.append("No exports folder: routines, descriptions and Auto Review rules not checked. Run /watchtower-setup step 4.")
+        notes.append("No exports folder: routine text not checked (Auto Review rules come from settings.json).")
 
     nat = native_settings()
     if nat:
@@ -675,7 +717,7 @@ def run_audit(args, quick):
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys = {f["key"] for f in prev.get("findings", [])}
     cur_keys = {f["key"] for f in live}
-    new = [f for f in live if f["key"] not in prev_keys]
+    new = [f for f in live if f["key"] not in prev_keys and f["severity"] != "info"]
     fixed = [f for f in prev.get("findings", []) if f["key"] not in cur_keys]
     s, g = score(live)
     if not load_json(state_path("baseline.json"), {}):

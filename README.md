@@ -28,8 +28,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.1.3/scripts/install.sh
-head -40 install.sh && bash install.sh v0.1.3
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.1.4/scripts/install.sh
+head -40 install.sh && bash install.sh v0.1.4
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
 
