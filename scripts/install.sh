@@ -6,6 +6,8 @@ set -euo pipefail
 WT_HOME="${WATCHTOWER_HOME:-/workspace/watchtower}"
 REPO="https://github.com/ken-aisec/grokbot-watchtower"
 GITLEAKS_VERSION="8.30.1"
+TRUFFLEHOG_VERSION="3.97.9"
+OSV_VERSION="2.6.0"
 
 if [[ "${1:-}" == "--scanners" ]]; then
   python3 -m venv "$WT_HOME/.venv"
@@ -23,6 +25,19 @@ if [[ "${1:-}" == "--scanners" ]]; then
     curl -fsSL -o /tmp/gitleaks_checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
     (cd /tmp && grep " $tgz\$" gitleaks_checksums.txt | sha256sum -c -)
     tar -xzf "/tmp/$tgz" -C "$WT_HOME/bin" gitleaks
+    # TruffleHog: tells live keys from dead ones (asks each key's own provider)
+    th="trufflehog_${TRUFFLEHOG_VERSION}_linux_$( [ "$ga" = x64 ] && echo amd64 || echo arm64 ).tar.gz"
+    tb="https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}"
+    curl -fsSL -o "/tmp/$th" "$tb/$th"
+    curl -fsSL -o /tmp/trufflehog_checksums.txt "$tb/trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt"
+    (cd /tmp && grep " $th\$" trufflehog_checksums.txt | sha256sum -c -)
+    tar -xzf "/tmp/$th" -C "$WT_HOME/bin" trufflehog
+    # OSV-Scanner: known holes in Node, Go and other project dependencies
+    ob="osv-scanner_linux_$( [ "$ga" = x64 ] && echo amd64 || echo arm64 )"
+    curl -fsSL -o "$WT_HOME/bin/osv-scanner" "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/$ob"
+    curl -fsSL -o /tmp/osv_sums.txt "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_SHA256SUMS"
+    (cd "$WT_HOME/bin" && grep " $ob\$" /tmp/osv_sums.txt | sed "s/$ob/osv-scanner/" | sha256sum -c -)
+    chmod +x "$WT_HOME/bin/osv-scanner"
   fi
   "$WT_HOME/.venv/bin/skillspector" --version && "$WT_HOME/bin/gitleaks" version || true
   echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."

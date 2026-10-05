@@ -453,6 +453,49 @@ class Features(unittest.TestCase):
         self.assertEqual([n for n, _ in todo[0]["links"]], ["AWS", "Square"])
         self.assertIn("Auto-review", todo[1]["how"])
 
+    def test_live_dead_keys_drive_severity_and_links(self):
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
+        chat = os.path.join(self.tmp, "sessions", "a.jsonl"); old = os.path.join(self.tmp, "sessions", "b.jsonl")
+        os.makedirs(os.path.dirname(chat))
+        open(chat, "w").write("x"); open(old, "w").write("y")
+        lines = [{"DetectorName": "AWS", "Verified": True, "Raw": "SECRET-1", "SourceMetadata": {"Data": {"Filesystem": {"file": chat, "line": 1}}},
+                  "ExtraData": {"rotation_guide": "https://howtorotate.com/docs/tutorials/aws/"}},
+                 {"DetectorName": "Github", "Verified": False, "Raw": "SECRET-2", "SourceMetadata": {"Data": {"Filesystem": {"file": old, "line": 1}}}}]
+        fake = os.path.join(bindir, "trufflehog")
+        open(fake, "w").write("#!/bin/sh\ncat <<'EOF'\n" + "\n".join(json.dumps(l) for l in lines) + "\nEOF\n")
+        os.chmod(fake, 0o755)
+        F = wt.finding
+        fs = [F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], chat + ":1", "1 hit(s): aws-access-token", "f"),
+              F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], old + ":1", "1 hit(s): github-pat", "f")]
+        st = wt.trufflehog_status([chat, old], [])
+        self.assertNotIn("SECRET-1", json.dumps(st))                              # raw values never stored
+        out = {f["where"]: f for f in wt.apply_key_status(fs, st)}
+        self.assertEqual(out[chat + ":1"]["severity"], "critical")
+        self.assertEqual(out[old + ":1"]["severity"], "low")
+        todo = wt.needs_you(list(out.values()))
+        self.assertEqual(todo[0]["title"], "Keys that still work are sitting in files")
+        self.assertEqual(todo[0]["links"][0][0], "AWS")
+        self.assertIn("1 live", todo[0]["rows"][0]["reason"])
+
+    def test_drilldown_names_and_fix_reaches_flagged_chat_logs(self):
+        F = wt.finding
+        r = wt.item_row(F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/home/box/sand-data/workflows/inbox-triage", "risk 70; Privilege Escalation: Credential Access", "f"))
+        self.assertEqual(r["name"], "inbox-triage")
+        self.assertIn("Credential Access", r["reason"])
+        sess = os.path.join(self.tmp, "grok", "sessions"); code_dir = os.path.join(self.tmp, "proj")
+        os.makedirs(sess); os.makedirs(code_dir)
+        key = "ghp_" + fake_key(36)
+        open(os.path.join(sess, "s1.json"), "w").write('{"msg": "' + key + '"}')
+        open(os.path.join(code_dir, "settings.py"), "w").write('TOKEN = "' + key + '"')
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": [
+            F("WT-S002", "x", "critical", ["ASI03"], os.path.join(sess, "s1.json") + ":1", "e", "f"),
+            F("WT-S002", "x", "critical", ["ASI03"], os.path.join(code_dir, "settings.py") + ":1", "e", "f")]})
+        targets = wt.scrub_targets_from_findings()
+        self.assertEqual(targets, [os.path.join(sess, "s1.json")])                 # chat log yes, code no
+        code, o = self.out("fix", "--apply", "--roots", self.tmp)
+        self.assertNotIn(key, open(os.path.join(sess, "s1.json")).read())
+        self.assertIn(key, open(os.path.join(code_dir, "settings.py")).read())
+
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")
         os.makedirs(d)

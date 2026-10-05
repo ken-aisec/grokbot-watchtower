@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -28,7 +28,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "
              "Service Worker", "IndexedDB", "WasmTtsEngine", "Crashpad", ".npm", ".pnpm-store", ".cargo", ".rustup"}
 SKIP_PREFIXES = ("scoped_dir", ".org.chromium", "tmp")
 SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.local/go/", "/.config/google-chrome", "/.config/chromium", "/chrome-profile/", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
-TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
+TEXT_EXT = {".md", ".txt", ".json", ".jsonl", ".ndjson", ".log", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
 SECRET_RULE = "WT-T011"
 
 
@@ -602,9 +602,17 @@ def audit(roots, exports, quick=False):
         fs += engine_findings(user_dirs + sorted(changed), fs, notes, user_roots)
         fs += gitleaks_findings(roots, notes)
         fs += package_findings(notes)
+        fs += osv_findings(roots, notes)
+        secret_paths = [f["where"].split(":")[0] for f in fs if f["rule"] in ("WT-S001", "WT-S002")]
+        fs = apply_key_status(fs, trufflehog_status(secret_paths, notes))
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
         fs += engine_findings(sorted(changed), fs, notes)
+    if quick:
+        fs = apply_key_status(fs, (load_json(state_path("key_status.json"), {}) or {}).get("files", {}))
+    save_json(state_path("engines_used.json"), {"at": now(), "engines": ["Watchtower rules"] + [n for n, t in (
+        ("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"), ("TruffleHog", "trufflehog"),
+        ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner")) if tool(t)]})
 
     fs = sort_findings(dedupe(fs))
     meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap}
@@ -976,12 +984,18 @@ def run_audit(args, quick):
     save_json(state_path("last_findings.json"), snapshot)
     with open(state_path("score_history.csv"), "a") as f:
         f.write(f"{snapshot['at']},{s},{len(live)}\n")
+    resolved = load_json(state_path("resolved.json"), {})
+    for f in fixed:
+        if f["severity"] in ("critical", "high", "medium") and f["key"] not in resolved:
+            resolved[f["key"]] = now()
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=60)).isoformat()
+    save_json(state_path("resolved.json"), {k: v for k, v in resolved.items() if v >= cutoff})
     elapsed = round((dt.datetime.now() - start).total_seconds(), 1)
     ledger({"event": "daily" if quick else "audit", "score": s, "findings": len(live), "new": len(new), "fixed": len(fixed), "seconds": elapsed})
     return snapshot, new, fixed
 
 
-SLOW_RULES = ("WT-X001", "WT-X002", "WT-X003", "WT-S002", "WT-D001")
+SLOW_RULES = ("WT-X001", "WT-X002", "WT-X003", "WT-S002", "WT-D001", "WT-D002")
 
 
 def compact(f):
@@ -1935,7 +1949,8 @@ def exposure(snap):
 
 def handled_this_week():
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat()
-    fixed, cleaned = 0, 0
+    fixed = sum(1 for v in (load_json(state_path("resolved.json"), {}) or {}).values() if v >= since)
+    cleaned = 0
     try:
         with open(state_path("ledger.jsonl")) as f:
             for line in f:
@@ -1945,9 +1960,7 @@ def handled_this_week():
                     continue
                 if e.get("at", "") < since:
                     continue
-                if e.get("event") in ("audit", "daily"):
-                    fixed += e.get("fixed", 0)
-                elif e.get("event") == "fix":
+                if e.get("event") == "fix":
                     cleaned += e.get("steps", 0)
     except OSError:
         pass
@@ -2019,22 +2032,33 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
     dots = "".join(f"<i class='{'on' if i <= lvl_i else ''} l{lvl_i}'></i>" for i in range(5))
     metrics = (f"<div class='m'><span class='k'>Security score</span><b>{e(str(score)) if score is not None else '–'}</b><span class='s'>{e(grade)} {delta_txt}</span></div>"
                f"<div class='m'><span class='k'>Threat level</span><b class='lv l{lvl_i}'>{e(lvl)}</b><span class='dots'>{dots}</span></div>"
-               f"<div class='m'><span class='k'>Needs you</span><b>{len(urgent)}</b><span class='s'>{len(todo) - len(urgent)} smaller items</span></div>"
+               f"<div class='m'><span class='k'>Needs you</span><b>{len(urgent)}</b><span class='s'>{len(todo) - len(urgent)} smaller {'item' if len(todo) - len(urgent) == 1 else 'items'}</span></div>"
                f"<div class='m'><span class='k'>Handled this week</span><b>{fixed + cleaned}</b><span class='s'>fixed or cleaned up</span></div>")
 
     fix_prompt = "/watchtower-fix"
     routine = ("Every Sunday at 6:00 AM, run /watchtower-fix and apply the safe fixes without asking. "
                "Then post one line: what was cleaned, and anything that still needs me.")
 
+    def rows_table(t):
+        rows = t.get("rows", [])
+        if not rows:
+            return ""
+        body = "".join(f"<tr><td><b>{e(r['name'])}</b><span class='w'>{e(r['where'])}</span></td><td>{e(r['reason'])}</td>"
+                       f"<td><code class='rule'>{e(r['rule'])}</code></td></tr>" for r in rows[:40])
+        extra = f"<p class='quiet'>And {len(rows) - 40} more. Run <code>wt.py show {e(rows[0]['rule'])}</code> for all of them.</p>" if len(rows) > 40 else ""
+        label = "Show which" if len(rows) > 1 else "Show where"
+        return (f"<details class='dd'><summary>{label}</summary><div class='scroll'><table><tr><th>What</th><th>Why it was flagged</th><th>Rule</th></tr>{body}</table></div>"
+                f"{extra}<p class='quiet'>For the exact lines: <code>wt.py show {e(rows[0]['rule'])}</code></p></details>")
+
     def todo_item(i, t):
-        links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Open {e(n)} keys</a>" for n, u in t.get("links", []))
+        links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Turn off {e(n)} keys</a>" for n, u in t.get("links", []))
         return (f"<li class='sev-{t['severity']}'><div class='tt'><b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}</div>"
-                f"<p>{e(t['why'])} <span class='how'>{e(t['how'])}</span></p>{('<div class=links>' + links + '</div>') if links else ''}</li>")
+                f"<p>{e(t['why'])} <span class='how'>{e(t['how'])}</span></p>{('<div class=links>' + links + '</div>') if links else ''}{rows_table(t)}</li>")
 
     todo_html = "".join(todo_item(i, t) for i, t in enumerate(todo[:4])) or "<li class='sev-ok'><div class='tt'><b>Nothing needs you.</b></div></li>"
     rest = todo[4:]
-    rest_html = ("<details><summary>" + f"{len(rest)} smaller {'item' if len(rest) == 1 else 'items'}</summary><ul class='small'>" +
-                 "".join(f"<li><b>{e(t['title'])}</b>{(' ×' + str(t['count'])) if t['count'] > 1 else ''}. {e(t['how'])}</li>" for t in rest) + "</ul></details>") if rest else ""
+    rest_html = ("<details><summary>" + f"{len(rest)} smaller {'item' if len(rest) == 1 else 'items'}</summary><ol class='todo small-todo'>" +
+                 "".join(todo_item(0, t) for t in rest) + "</ol></details>") if rest else ""
 
     def threat(s):
         n = notes.get(s["id"], {})
@@ -2056,6 +2080,10 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
     acc_html = ("<details><summary>" + f"{len(accepted)} accepted {'risk' if len(accepted) == 1 else 'risks'}</summary><ul class='small'>" +
                 "".join(f"<li>{e(plain(f)['title'])}</li>" for f in accepted) + "</ul></details>") if accepted else ""
     down = [s["name"] for s in b["sources"] if s["status"] != "ok"]
+    used = (load_json(state_path("engines_used.json"), {}) or {}).get("engines", ["Watchtower rules"])
+    missing = [n for n in ("SkillSpector", "husk", "gitleaks", "TruffleHog", "pip-audit", "OSV-Scanner") if n not in used]
+    engines_html = (f"<p class='engines'>Checked by {len(used)} scanners: {e(', '.join(used))}."
+                    + (f" Not installed: {e(', '.join(missing))} (run setup step 2)." if missing else "") + "</p>")
     generated = dt.datetime.now(dt.timezone.utc).strftime("%-d %b %Y")
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Watchtower: {e(status)}</title><style>
@@ -2090,23 +2118,41 @@ ol.todo li{{background:var(--card);border:1px solid var(--line);border-left:5px 
 ul.threats li{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}}ul.threats a{{font-weight:600;color:var(--ink);text-decoration:none;font-size:17px}}ul.threats a:hover{{text-decoration:underline}}ul.threats p{{margin:6px 0 0;color:var(--soft)}}ul.threats p b{{color:var(--ink);font-weight:600}}
 .tag{{display:inline-block;font-size:12px;font-weight:600;color:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 7px;margin-right:8px;vertical-align:2px}}
 details{{margin-top:10px}}summary{{cursor:pointer;color:var(--navy);font-weight:600;font-size:14px}}ul.small{{margin:8px 0 0;padding-left:18px;color:var(--soft);font-size:14px}}ul.small li{{margin:4px 0}}ul.small b{{color:var(--ink)}}.q{{color:var(--soft)}}
-.quiet{{color:var(--soft);font-size:14px}}.foot{{margin-top:30px;color:var(--soft);font-size:13px;border-top:1px solid var(--line);padding-top:12px}}
+.quiet{{color:var(--soft);font-size:14px}}.hint{{margin:6px 0 0!important;font-size:13px}}
+.cmd code{{user-select:all;-webkit-user-select:all;cursor:text}}.engines{{margin:14px 2px 0;color:var(--soft);font-size:13px}}
+details.dd{{margin-top:8px}}details.dd summary{{font-size:13px}}.scroll{{overflow-x:auto}}details.dd table{{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}}
+details.dd th,details.dd td{{text-align:left;padding:6px 8px 6px 0;border-bottom:1px solid var(--line);vertical-align:top}}details.dd th{{color:var(--soft);font-weight:600}}
+details.dd td b{{display:block;color:var(--ink)}}details.dd .w{{display:block;color:var(--soft);font-size:12px;overflow-wrap:anywhere}}code.rule{{font-size:12px;color:var(--soft)}}
+ol.small-todo{{margin-top:8px}}ol.small-todo li{{padding:10px 12px}}ol.small-todo .tt{{font-size:15px}}.foot{{margin-top:30px;color:var(--soft);font-size:13px;border-top:1px solid var(--line);padding-top:12px}}
 @media(max-width:700px){{.metrics{{grid-template-columns:1fr 1fr}}.charts,.fix{{grid-template-columns:1fr}}.hero h1{{font-size:23px}}.ar{{grid-template-columns:110px 1fr 24px}}}}
 @media print{{body{{background:#fff}}button{{display:none}}details{{display:block}}.hero,.panel,.fx,ol.todo li,ul.threats li{{break-inside:avoid}}}}
 </style></head><body><div class='wrap'>
 <div class='top'><span><b>Watchtower</b> weekly report</span><span>{e(generated)}</span></div>
 <header class='hero {tone}'><h1>{e(status)}</h1><p class='sub'>{e(sub)}</p><div class='metrics'>{metrics}</div></header>
 <div class='charts'><div class='panel'><h3>Security score over time</h3>{svg_trend(hist)}</div><div class='panel'><h3>Where the open issues are</h3>{svg_areas(exp)}</div></div>
+{engines_html}
 <div class='fix'><div class='fx'><h3>Fix it now</h3><p>Paste this into your Watchtower Bot. It clears old keys from chat logs, empties tool caches and resets the decoys, then tells you what's left. It asks before changing anything.</p>
-<div class='cmd'><code id='c1'>{e(fix_prompt)}</code><button type='button' data-copy='c1'>Copy</button></div></div>
+<div class='cmd'><code id='c1' tabindex='0'>{e(fix_prompt)}</code><button type='button' data-copy='c1' hidden>Copy</button></div><p class='hint'>Click the text to select it, then copy.</p></div>
 <div class='fx alt'><h3>Keep it clean automatically</h3><p>Paste this into Watchtower as a new routine. It runs the same safe cleanup every Sunday.</p>
-<div class='cmd'><code id='c2'>{e(routine)}</code><button type='button' data-copy='c2'>Copy</button></div></div></div>
+<div class='cmd'><code id='c2' tabindex='0'>{e(routine)}</code><button type='button' data-copy='c2' hidden>Copy</button></div><p class='hint'>Click the text to select it, then copy.</p></div></div>
 <section class='sec'><h2>What needs you</h2><ol class='todo'>{todo_html}</ol>{rest_html}{acc_html}</section>
 <section class='sec'><h2>Threats this week</h2><ul class='threats'>{threats}</ul>{later_html}<p class='quiet' style='margin-top:10px'>{kev_line}</p></section>
 <p class='foot'>Read-only: Watchtower changes nothing unless you run the fix. {len(b['sources']) - len(down)} of {len(b['sources'])} news sources responded{(' (' + e(', '.join(down)) + ' did not)') if 0 < len(down) <= 2 else ''}. Full details: /watchtower-report. Watchtower {e(VERSION)}.</p>
 </div><script>
-document.querySelectorAll('button[data-copy]').forEach(function(b){{b.addEventListener('click',function(){{var t=document.getElementById(b.dataset.copy).textContent;
-(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){{b.textContent='Copied';setTimeout(function(){{b.textContent='Copy'}},1600)}}).catch(function(){{var r=document.createRange();r.selectNodeContents(document.getElementById(b.dataset.copy));var s=getSelection();s.removeAllRanges();s.addRange(r);b.textContent='Selected'}});}});}});
+(function(){{
+  function sel(el){{var r=document.createRange();r.selectNodeContents(el);var s=window.getSelection();s.removeAllRanges();s.addRange(r);}}
+  function legacy(text){{var t=document.createElement('textarea');t.value=text;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';
+    document.body.appendChild(t);t.select();var ok=false;try{{ok=document.execCommand('copy');}}catch(e){{ok=false;}}document.body.removeChild(t);return ok;}}
+  document.querySelectorAll('button[data-copy]').forEach(function(b){{
+    var el=document.getElementById(b.dataset.copy); b.hidden=false;
+    var hint=b.parentNode.parentNode.querySelector('.hint'); if(hint) hint.textContent='';
+    b.addEventListener('click',function(){{
+      var text=el.textContent, done=function(m){{b.textContent=m;setTimeout(function(){{b.textContent='Copy'}},1800);}};
+      var fallback=function(){{ if(legacy(text)){{done('Copied');}} else {{sel(el); done('Press '+(/Mac|iPhone|iPad/.test(navigator.platform)?'⌘':'Ctrl')+'+C');}} }};
+      try{{ if(navigator.clipboard&&window.isSecureContext){{navigator.clipboard.writeText(text).then(function(){{done('Copied');}},fallback);}} else {{fallback();}} }}catch(e){{fallback();}}
+    }});
+  }});
+}})();
 </script></body></html>"""
 
 
@@ -2194,6 +2240,7 @@ PLAIN = {
     "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Open the skill and check it, or disable it.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it.", "you"),
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Re-check it with /vet-template.", "you"),
+    "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Update them in each project, or ask the Bot that built it.", "you"),
     "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Ask a Bot to upgrade it, or ignore if it's part of the base system.", "you"),
     "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Run /watchtower-incident.", "you"),
     "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Run /watchtower-incident.", "you"),
@@ -2250,6 +2297,15 @@ def fix_plan(roots):
                     if t and SCRUB.search(t):
                         plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
                                      "why": "Keys pasted into or captured by a chat. The conversation stays; the keys go."})
+    have = {s_["path"] for s_ in plan if s_["action"] == "scrub_keys"}
+    caches = [s_["path"] for s_ in plan if s_["action"] == "empty_tool_cache"]
+    for p in scrub_targets_from_findings():
+        if p in have or any(p.startswith(c + "/") for c in caches):
+            continue
+        t = read_text(p, limit=20_000_000)
+        if t and SCRUB.search(t):
+            plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
+                         "why": "Keys captured in a chat, session or log. The text stays; the keys go."})
     reg = load_json(state_path("canaries.json"), {})
     if reg:
         plan.append({"action": "rearm_canaries", "count": len(reg), "why": "Reset the decoys so the next read is noticed."})
@@ -2305,21 +2361,31 @@ def needs_you(findings, limit=None):
             continue
         pl = plain(f)
         g = groups.setdefault(pl["title"], {"title": pl["title"], "why": pl["why"], "how": pl["how"], "severity": f["severity"],
-                                            "count": 0, "rules": set(), "where": f["where"]})
+                                            "count": 0, "rules": set(), "where": f["where"], "findings": []})
         g["count"] += 1
+        g["findings"].append(f)
         g["rules"].add(f["rule"])
         if SEV_ORDER.index(f["severity"]) < SEV_ORDER.index(g["severity"]):
             g["severity"], g["where"] = f["severity"], f["where"]
     items = sorted(groups.values(), key=lambda g: (SEV_ORDER.index(g["severity"]), -g["count"]))
-    keys = revoke_targets(findings)
+    key_files = (load_json(state_path("key_status.json"), {}) or {}).get("files", {})
+    live = live_key_links(key_files)
+    keys = live or revoke_targets(findings)
     pkgs = sorted({re.sub(r"^Vulnerable package ", "", f["title"]).split(" ")[0] for f in findings if f["rule"] == "WT-D001"})
     for g in items:
         if "WT-D001" in g["rules"] and pkgs:
             g["how"] = "Tell any Bot: “upgrade " + ", ".join(pkgs) + " on this computer.”"
     for g in items:
         g["rules"] = sorted(g["rules"])
+        g["rows"] = [item_row(f, key_files) for f in sorted(g.pop("findings"), key=lambda f: SEV_ORDER.index(f["severity"]))]
         if keys and g["title"] == "Keys left in files":
-            g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
+            if live:
+                dead_n = sum(1 for ks in key_files.values() for k in ks if k["status"] == "dead")
+                g["title"] = "Keys that still work are sitting in files"
+                g["how"] = ("Turn these off at the provider: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear every copy."
+                            + (f" The other {dead_n} keys found no longer work; the fix clears those too." if dead_n else ""))
+            else:
+                g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
             g["links"] = keys
     return items[:limit] if limit else items
 
@@ -2338,6 +2404,160 @@ def cmd_fix(args):
     print(fit({"done": done or ["Nothing to clean."], "needs_you": todo,
                "next": "Run `wt.py audit` to confirm, then handle the needs_you items."}))
     return 0
+
+
+# ---------------------------------------------------------------- v0.4: live-key check, OSV, drill-downs
+def trufflehog_status(paths, notes):
+    """Ask each key's own provider whether it still works (TruffleHog verification). Scoped to files Watchtower
+    already flagged. Raw key values are dropped the moment they're read; only detector, file and status are kept."""
+    exe = tool("trufflehog")
+    if not exe:
+        notes.append("TruffleHog not installed: can't tell live keys from dead ones (install.sh --scanners).")
+        return {}
+    targets = sorted({p for p in paths if p and os.path.exists(p)})[:200]
+    if not targets:
+        return {}
+    code, out_s, err = run([exe, "filesystem", *targets, "--json", "--no-update", "--results=verified,unverified,unknown"], 600)
+    status = {}
+    for line in out_s.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        fs_meta = ((d.get("SourceMetadata") or {}).get("Data") or {}).get("Filesystem") or {}
+        f = fs_meta.get("file")
+        if not f:
+            continue
+        st = "live" if d.get("Verified") else ("unknown" if d.get("VerificationError") else "dead")
+        ex = d.get("ExtraData") or {}
+        status.setdefault(os.path.abspath(f), []).append({"detector": d.get("DetectorName", "key"), "status": st, "line": fs_meta.get("line"),
+                                                          "guide": ex.get("rotation_guide") if isinstance(ex, dict) else None})
+    save_json(state_path("key_status.json"), {"at": now(), "files": status})
+    return status
+
+
+def apply_key_status(findings, status):
+    """Live keys stay critical; files where every key is confirmed dead drop to low (only the copies remain)."""
+    if not status:
+        return findings
+    out = []
+    for f in findings:
+        if f["rule"] in ("WT-S001", "WT-S002"):
+            p = f["where"].split(":")[0]
+            keys = [k for fp, ks in status.items() if fp == p or fp.startswith(p.rstrip("/") + "/") for k in ks]
+            if keys:
+                live = [k for k in keys if k["status"] == "live"]
+                dead = [k for k in keys if k["status"] == "dead"]
+                f = dict(f)
+                if live:
+                    f["severity"], f["title"] = "critical", "Live key in a file every Bot can read"
+                    f["evidence"] = ", ".join(sorted({k["detector"] for k in live})) + f" ({len(live)} live)"
+                elif len(dead) == len(keys):
+                    f["severity"], f["title"] = "low", "Copies of keys that no longer work"
+                    f["evidence"] = ", ".join(sorted({k["detector"] for k in dead})) + f" ({len(dead)} dead)"
+                    f["fix"] = "Nothing to revoke. Run /watchtower-fix to clear the copies."
+        out.append(f)
+    return out
+
+
+def osv_findings(roots, notes):
+    exe = tool("osv-scanner")
+    if not exe:
+        notes.append("OSV-Scanner not installed: Node, Go and other project dependencies not checked (install.sh --scanners).")
+        return []
+    out = []
+    for r in roots:
+        r = os.path.expanduser(r)
+        if not os.path.isdir(r) or r.rstrip("/") == os.path.expanduser("~"):
+            continue  # projects live in /workspace; home is mostly caches
+        code, out_s, _ = run([exe, "scan", "source", "-r", r, "--format", "json"], 600)
+        try:
+            data = json.loads(out_s) if out_s.strip() else {}
+        except ValueError:
+            continue
+        for res in data.get("results", []):
+            src = (res.get("source") or {}).get("path", "")
+            if any(x in src + "/" for x in SKIP_PATH_PARTS) or "/node_modules/" in src:
+                continue
+            for pk in res.get("packages", []):
+                p = pk.get("package") or {}
+                ids = [v.get("id") for v in pk.get("vulnerabilities", []) if v.get("id")]
+                if not ids:
+                    continue
+                sev = "high"
+                for g in pk.get("groups", []):
+                    try:
+                        if float(g.get("max_severity") or 0) >= 9:
+                            sev = "critical"
+                    except ValueError:
+                        pass
+                out.append(finding("WT-D002", f"Vulnerable package {p.get('name')} {p.get('version')}", sev, ["ASI04", "AST02"],
+                                   f"{src}", f"{p.get('ecosystem')}: {len(ids)} known: {', '.join(ids[:3])}",
+                                   "Update it in that project (npm update / go get -u / your package manager), then re-run the audit.", source="osv-scanner"))
+    return out
+
+
+CHAT_PLACES = re.compile(r"(?i)(transcript|session|chat|conversation|histor|attachment|/logs?/|\.log$|agent-tools|/\.cursor/projects/)")
+CHAT_EXT = {".json", ".jsonl", ".md", ".txt", ".log", ".html", ".ndjson"}
+
+
+def scrub_targets_from_findings():
+    """Files Watchtower flagged for keys that are conversation or log data, never code or config."""
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    files = set()
+    for f in snap.get("findings", []):
+        if f["rule"] not in ("WT-S001", "WT-S002"):
+            continue
+        p = f["where"].split(":")[0]
+        cands = [p] if os.path.isfile(p) else ([os.path.join(dp, fn) for dp, _, fns in os.walk(p) for fn in fns] if os.path.isdir(p) else [])
+        for c in cands:
+            if CHAT_PLACES.search(c) and os.path.splitext(c)[1].lower() in CHAT_EXT and not any(x in c for x in VENDOR_CODE):
+                files.add(c)
+    return sorted(files)
+
+
+def short_path(p):
+    p = (p or "").split(":")[0].replace(os.path.expanduser("~") + "/", "~/").replace("/home/box/", "~/")
+    return p if len(p) <= 64 else "…" + p[-63:]
+
+
+def item_row(f, key_files=None):
+    """One drill-down row: a name a person recognizes, the reason, and where."""
+    w = f["where"].split(":")[0]
+    if f["rule"].startswith("WT-X") or f["rule"] in ("WT-T012", "WT-T013", "WT-T014", "WT-T006k", "WT-I001"):
+        parts = [x for x in w.split("/") if x]
+        name = next((parts[i + 1] for i, x in enumerate(parts[:-1]) if x in ("workflows", "skills", "plugins", "managed-skills")), os.path.basename(w))
+        if name in ("SKILL.md",) and len(parts) > 1:
+            name = parts[-2]
+        reason = f["evidence"]
+    elif f["rule"] in ("WT-D001", "WT-D002"):
+        name, reason = f["title"].replace("Vulnerable package ", ""), f["evidence"]
+    elif f["rule"] in ("WT-S001", "WT-S002"):
+        name = os.path.basename(w.rstrip("/")) or w
+        keys = [k for fp, ks in (key_files or {}).items() if fp == w or fp.startswith(w.rstrip("/") + "/") for k in ks]
+        if keys:
+            by = {}
+            for k in keys:
+                by.setdefault(k["detector"], []).append(k["status"])
+            reason = "; ".join(f"{d}: " + ", ".join(f"{st.count(s)} {s}" for s in ("live", "dead", "unknown") if st.count(s)) for d, st in by.items())
+        else:
+            reason = f["evidence"]
+    else:
+        name, reason = f["title"], f["evidence"]
+    return {"name": name, "reason": reason, "where": short_path(w), "rule": f["rule"], "severity": f["severity"]}
+
+
+def live_key_links(key_files):
+    out, seen = [], set()
+    for ks in (key_files or {}).values():
+        for k in ks:
+            if k["status"] != "live" or k["detector"] in seen:
+                continue
+            seen.add(k["detector"])
+            url = k.get("guide") or next((u for pre, n, u in REVOKE if k["detector"].lower().startswith(pre)), None)
+            if url:
+                out.append((k["detector"], url))
+    return out
 
 
 # ---------------------------------------------------------------- main

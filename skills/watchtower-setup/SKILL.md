@@ -10,13 +10,18 @@ Tell the user up front: "Setup only writes inside /workspace/watchtower, plus th
 ## 1. Install the pinned release
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.3.0/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.4.0/scripts/install.sh
 head -40 install.sh
 ```
-Show the user those 40 lines, then run `bash install.sh v0.3.0`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
+Show the user those 40 lines, then run `bash install.sh v0.4.0`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
 
 ## 2. Scanning engines (recommended)
-Say: "Watchtower checks skills with its own rules. Adding NVIDIA SkillSpector and husk gives two independent engines, so a finding two of them agree on is far more trustworthy. gitleaks finds secrets and pip-audit checks installed packages. All pinned, about a minute, installed in /workspace/watchtower only. Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`.
+Say: "Watchtower checks skills with its own rules. These add independent checks, all pinned and installed in /workspace/watchtower only, in about two minutes:
+- NVIDIA SkillSpector and husk: two more skill scanners, so a skill two of them flag is very likely a real problem.
+- gitleaks: finds keys and passwords left in files.
+- TruffleHog: tells you which of those keys still work. To check a key it sends it to that key's own provider (an AWS key to AWS, a GitHub token to GitHub) and nowhere else.
+- pip-audit and OSV-Scanner: known security holes in installed software and project dependencies.
+Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`.
 
 ## 3. Baseline, canaries, first audit
 1. `python3 /workspace/watchtower/app/watchtower/wt.py baseline`

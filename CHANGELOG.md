@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.0 — 2026-10-05 (dig in, live keys, working copy)
+- Every item in the weekly report has a "Show which" drill-down: the skill, file or package by name, why it was flagged, where, and the command for the exact lines.
+- TruffleHog checks which leaked keys still work. Live keys stay critical with a direct link to turn them off; confirmed-dead keys drop to low and the fix clears them. Raw key values are never stored.
+- OSV-Scanner checks project dependencies (Node, Go and others) in /workspace.
+- The fix now clears keys from any flagged chat, session or log file (for example ~/.grok/sessions), never from code or config.
+- Copy buttons work in sandboxed viewers (clipboard, then a fallback, then select-and-press-⌘C); with scripts blocked, one click selects the whole command.
+- "Handled this week" counts distinct findings resolved, not audit churn. The report names every scanner that ran.
+- Watchtower's own secret check now reads .jsonl, .ndjson and .log files.
+
 ## v0.3.0 — 2026-10-05 (the easy fix button)
 - Weekly report rebuilt for non-experts: one status line, four metrics (score, threat level, needs you, handled this week), a score trend chart and an open-issues chart, a copyable "Fix it now" command and weekly-tidy routine, plain-language to-dos with direct links to turn off leaked keys, and three threats with one line each on why you care and what to do. Everything else folds away.
 - New `/watchtower-fix` and `wt.py fix [--apply]`: removes keys from chat transcripts (the conversation stays), empties tool-overflow caches, resets decoys, prunes old reports. Preview by default; never revokes, uninstalls or changes settings.

@@ -30,7 +30,7 @@ Every finding carries a rule ID, severity, file and line (secrets masked), the f
 
 ## Three engines, one verdict
 
-Skills are checked by Watchtower's own rules, [NVIDIA SkillSpector](https://github.com/nvidia/skillspector) and [husk](https://github.com/ctrl-adam/Husk). A skill flagged by one engine is a lead. A skill flagged by two is a corroborated critical. Your own skills, and any skill that's new or changed, get all three every day; marketplace and first-party skills are checked for malicious indicators, not style. gitleaks covers secrets and pip-audit covers installed packages.
+Skills are checked by Watchtower's own rules, [NVIDIA SkillSpector](https://github.com/nvidia/skillspector) and [husk](https://github.com/ctrl-adam/Husk). A skill flagged by one engine is a lead. A skill flagged by two is a corroborated critical. Your own skills, and any skill that's new or changed, get all three every day; marketplace and first-party skills are checked for malicious indicators, not style. gitleaks finds keys left in files and TruffleHog checks which of them still work, so you only revoke the live ones. pip-audit and OSV-Scanner cover known holes in installed software and project dependencies. The weekly report says which scanners checked your setup.
 
 ## Tripwires
 
@@ -49,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.3.0/scripts/install.sh
-head -40 install.sh && bash install.sh v0.3.0
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.4.0/scripts/install.sh
+head -40 install.sh && bash install.sh v0.4.0
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -85,7 +85,7 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 
 ## Tests
 
-`make test` runs 42 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs 44 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 
