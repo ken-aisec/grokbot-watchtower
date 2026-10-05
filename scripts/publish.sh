@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
-# One-time publish: needs the GitHub CLI (`gh auth login` first).
+# Publish to GitHub. Works whether or not the repo already exists. Needs the GitHub CLI (`gh auth login`).
+# Safe to rerun.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
-echo "Publishing as $OWNER/grokbot-watchtower"
-grep -rl GITHUB_OWNER --exclude-dir=.git . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
+REPO="$OWNER/grokbot-watchtower"
+TAG="v0.1.3"
+echo "Publishing $REPO ($TAG)"
+if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
+  grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
+  git add -A && git commit -qm "Set repository owner to $OWNER"
+fi
 python3 -m unittest discover -s tests -q
-git add -A && git commit -qm "Set repository owner to $OWNER"
-bash scripts/make-manifest.sh && git add MANIFEST.sha256 && git commit -qm "Manifest for v0.1.2"
-gh repo create "$OWNER/grokbot-watchtower" --public --source . --push \
-  --description "Read-only security watch for Grok Bot: vet templates before install, audit skills, routines and approvals, weekly report."
-git tag -a v0.1.2 -m "Watchtower v0.1.2" && git push -q origin v0.1.2
-echo "Done: https://github.com/$OWNER/grokbot-watchtower (tag v0.1.2)"
+bash scripts/make-manifest.sh
+git add MANIFEST.sha256 && { git diff --cached --quiet || git commit -qm "Manifest for $TAG"; }
+if gh repo view "$REPO" >/dev/null 2>&1; then
+  echo "Repo exists; pushing to it."
+  if [ "$(gh api "repos/$REPO/commits" -q 'length' 2>/dev/null || echo 0)" != "0" ]; then
+    echo "The repo already has commits (for example a README). Overwrite them with this one? Type yes:"
+    read -r ok; [ "$ok" = "yes" ] || { echo "Stopped. Nothing pushed."; exit 1; }
+    FORCE="--force"
+  fi
+  git remote get-url origin >/dev/null 2>&1 || git remote add origin "https://github.com/$REPO.git"
+  git push -u ${FORCE:-} origin main
+else
+  gh repo create "$REPO" --public --source . --push \
+    --description "Read-only security watch for Grok Bot: vet templates before install, audit skills, routines and approvals, weekly report."
+fi
+git tag -f -a "$TAG" -m "Watchtower $TAG" && git push -f origin "$TAG"
+echo "Done: https://github.com/$REPO (tag $TAG)"

@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -27,6 +27,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "
              "google-chrome", "chromium", "Chrome", "BraveSoftware", "mozilla", "Cache", "Code Cache", "GPUCache",
              "Service Worker", "IndexedDB", "WasmTtsEngine", "Crashpad", ".npm", ".pnpm-store", ".cargo", ".rustup"}
 SKIP_PREFIXES = ("scoped_dir", ".org.chromium", "tmp")
+SKIP_PATH_PARTS = ("/go/pkg/", "/pkg/mod/", "/.m2/", "/.gradle/", "/dist-packages/", "/.bun/install/", "/.local/share/pnpm/")
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".env", ".cfg", ".ini", ""}
 SECRET_RULE = "WT-T011"
 
@@ -106,6 +107,23 @@ def mask(s):
 
 
 # ---------------------------------------------------------------- text analysis
+KNOWN_INSTALLERS = re.compile(r"(?i)https?://(bun\.sh|deno\.land|sh\.rustup\.rs|astral\.sh|get\.docker\.com|brew\.sh|"
+                              r"raw\.githubusercontent\.com/(nvm-sh|Homebrew)|install\.python-poetry\.org|cli\.github\.com|"
+                              r"claude\.ai/install|get\.pnpm\.io|fnm\.vercel\.app|supabase\.com|vercel\.com|fly\.io/install|"
+                              r"ollama\.com/install|sdk\.cloud\.google\.com|awscli\.amazonaws\.com)")
+PLACEHOLDER = re.compile(r"(?i)(example|sample|placeholder|your[_-]?|dummy|fake|test|xxxx|0000|1234|abcd|\.\.\.|<|>|\*{3})")
+
+
+def looks_real_secret(s):
+    """Drop documentation placeholders: example words, repeated characters, or low character variety."""
+    if PLACEHOLDER.search(s):
+        return False
+    body = re.sub(r"^(sk-(proj|ant|svcacct|admin)-|sk-|ghp_|github_pat_|xox[baprs]-|xai-|AKIA|AIza)", "", s)
+    if len(set(body)) < 10 or re.search(r"(.)\1{5,}", body):
+        return False
+    return True
+
+
 def in_warning(text, m, rules):
     """True when the match sits inside defensive prose: negated, quoted, or described as an attack."""
     lo = max(0, m.start() - 90)
@@ -122,12 +140,19 @@ def scan_text(text, where, rules, kind="skill"):
     out = []
     guarded = set(rules.get("guarded_rules", []))
     for rule in rules["rules"]:
-        if kind == "vendor" and rule["severity"] not in ("critical", "high"):
+        if kind == "vendor" and rule["severity"] != "critical" and rule["id"] != "WT-T002":
             continue
         for m in rule["rx"].finditer(text):
             if rule["id"] in guarded and in_warning(text, m, rules):
                 continue
+            if rule["id"] == SECRET_RULE and not looks_real_secret(m.group(0)):
+                continue
             ev = m.group(0)
+            if rule["id"] == "WT-T006" and KNOWN_INSTALLERS.search(ev):
+                out.append(finding("WT-T006k", "Known installer piped to shell", "medium" if kind != "vendor" else "low",
+                                   ["ASI05", "AST02"], f"{where}:{line_of(text, m.start())}", ev[:140],
+                                   "A well-known installer, but still unpinned. Prefer a package manager or a pinned, checksummed download."))
+                continue
             if rule["id"] == SECRET_RULE:
                 ev = mask(ev)
             elif rule["id"] == "WT-T002":
@@ -271,6 +296,9 @@ def walk(roots, max_depth=8):
             if dirpath.count("/") - base >= max_depth:
                 dirnames[:] = []
             ap = os.path.abspath(dirpath)
+            if any(x in ap + "/" for x in SKIP_PATH_PARTS):
+                dirnames[:] = []
+                continue
             if ap.startswith(os.path.abspath(home())) or ap.startswith(SELF_ROOT):
                 dirnames[:] = []
                 continue
@@ -354,9 +382,19 @@ def cli_credentials():
     return out
 
 
+USER_SKILL_DIRS = ("/sand-data/workflows/", "/agent-data/workflows/")
+
+
+def skill_tier(path):
+    """user: the user's own saved skills (full rules). Everything else (first-party bundles, marketplace
+    plugins, other agents' skill folders, copies sitting in /workspace) gets malicious-indicator rules only."""
+    if any(x in path for x in USER_SKILL_DIRS):
+        return "user"
+    return "vendor"
+
+
 def is_vendor(path):
-    """Skills shipped by managed or marketplace plugins, as opposed to the user's own workflows."""
-    return any(x in path for x in ("/managed-skills/", "/plugins/", "/plugin-cache/", "/.grok-plugin/", "/.cursor-plugin/"))
+    return skill_tier(path) == "vendor"
 
 
 # ---------------------------------------------------------------- audit
@@ -425,7 +463,7 @@ def audit(roots, exports, quick=False):
         if not t:
             continue
         rule = next(r for r in rules["rules"] if r["id"] == SECRET_RULE)
-        hits = list(rule["rx"].finditer(t))
+        hits = [m for m in rule["rx"].finditer(t) if looks_real_secret(m.group(0))]
         if hits:
             m = hits[0]
             fs.append(finding("WT-S001", "Secret stored in a file on the shared computer", "critical", ["ASI03", "LLM02"],
@@ -716,6 +754,25 @@ def cmd_breakdown(args):
     return 0
 
 
+def cmd_show(args):
+    snap = load_json(state_path("last_findings.json"), None)
+    if not snap:
+        print("ERROR no audit yet", file=sys.stderr)
+        return 2
+    rows = [f for f in snap["findings"] if f["rule"] == args.rule][: args.limit]
+    for f in rows:
+        print(f"{f['severity']} {f['rule']} {f['where']}\n  evidence: {f['evidence']}")
+        path, _, ln = f["where"].rpartition(":")
+        if args.rule in ("WT-T011", "WT-S001", "WT-S002", "WT-S003") or not ln.isdigit():
+            continue
+        t = read_text(path) or ""
+        lines = t.splitlines()
+        i = int(ln) - 1
+        ctx = " ".join(lines[max(0, i - 1): i + 2])[:300]
+        print(f"  context: {ctx}")
+    return 0
+
+
 def by_sev(fs):
     c = {s: 0 for s in SEV_ORDER}
     for f in fs:
@@ -837,8 +894,9 @@ def main(argv=None):
         p.add_argument("--exports")
     sub.add_parser("report")
     sub.add_parser("breakdown")
+    sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     a = ap.parse_args(argv)
-    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown}[a.cmd](a)
+    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show}[a.cmd](a)
 
 
 if __name__ == "__main__":

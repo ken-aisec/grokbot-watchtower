@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3 — 2026-10-05 (second real audit)
+- Skips language package caches (Go module cache, Maven, Gradle, dist-packages, bun, pnpm).
+- Trust tiers: the user's own saved skills get every rule; first-party bundles, marketplace plugins, other agents' skill folders and copies in /workspace get malicious-indicator rules only.
+- Known installers piped to shell (bun, rustup, uv, Homebrew, Docker, nvm…) are medium, low in vendor skills; unknown hosts stay critical.
+- Placeholder and low-variety keys in documentation are ignored.
+- New `wt.py show RULE` prints evidence with surrounding context (never for secrets).
+- `publish.sh` works with a repo that already exists and is safe to rerun.
+
 ## v0.1.2 — 2026-10-05 (noise fixes from the first real audit)
 - Skips browser profiles and caches (Chrome scoped_dir, WasmTtsEngine, Cache dirs) and package caches.
 - Tighter OpenAI-style key pattern: `sk-SK-…` Slovak voice names were matching.
