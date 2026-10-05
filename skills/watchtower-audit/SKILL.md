@@ -13,7 +13,7 @@ description: Full security posture audit of this Grok Bot computer and roster - 
    - The three fixes worth doing, each with the exact click path or command from `fix`.
    - Coverage gaps from `notes` in one line (for example, "SkillSpector not installed" or "no roll-call in 35 days").
    - For any finding, `wt.py show <RULE>` prints the evidence with surrounding lines (never for secrets).
-4. If the user wants to accept a risk, add `{"key": "<key>", "reason": "<their words>", "expires": "<date 90 days out>"}` to /workspace/watchtower/state/suppressions.json, with their yes.
+4. If the user says a finding is fine on purpose, run `wt.py accept <RULE> "<name or path>" --reason "<their words>"` (90 days by default, `--days N` to change). It stops counting against the score and appears under accepted risks until it expires, then comes back for a re-check. Only do this with the user's yes, one finding at a time. `wt.py accept --list` shows what's accepted.
 
 ## Never
 - Fix anything yourself. Every fix is a recommendation; changing settings, deleting files, revoking connectors, or editing other Bots needs the user's explicit yes, one action at a time.

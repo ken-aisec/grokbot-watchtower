@@ -13,9 +13,9 @@ Commands
 
 State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
-import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
+import argparse, datetime as dt, hashlib, html, json, math, os, re, shutil, subprocess, sys
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -212,7 +212,10 @@ def scan_text(text, where, rules, kind="skill"):
     writes = rules["write_verbs"].search(text)
     approved = has_approval(text, rules)
     if writes and not approved and kind not in ("reference", "vendor"):
-        out.append(finding("WT-T013", "External action with no approval line", "medium" if kind == "skill" else "high", ["ASI02", "AST03", "LLM06"],
+        strong = STRONG_VERBS.search(text)
+        sev = ("medium" if strong else "low") if kind == "skill" else ("high" if strong else "medium")
+        writes = strong or writes
+        out.append(finding("WT-T013", "External action with no approval line", sev, ["ASI02", "AST03", "LLM06"],
                            f"{where}:{line_of(text, writes.start())}", writes.group(0),
                            "Add to the description or routine: never send, post, buy, publish or delete without my approval."))
     if kind in ("routine", "template"):
@@ -227,6 +230,7 @@ def scan_text(text, where, rules, kind="skill"):
     return dedupe(out)
 
 
+STRONG_VERBS = re.compile(r"(?i)\b(send|sends|sending|publish|publishes|purchase|purchases|buy|buys|pay|pays|transfer|transfers|submit|submits|deploy|deploys|invite|invites|tweet|tweets)\b")
 NEGATION = re.compile(r"(?i)(don'?t|do\s+not|never|no\s+need\s+to|without)\s+$")
 
 
@@ -262,22 +266,29 @@ def dedupe(findings):
     return out
 
 
-SCORE_BUDGET = {"critical": (20, 60), "high": (6, 30), "medium": (2, 10), "low": (1, 3)}  # per risk type, cap per tier
+SCORE_ERA = "s2"   # bump when the formula changes; older history is then hidden instead of compared
+SCORE_BASE = {"critical": 12, "high": 5, "medium": 1.5, "low": 0.3}   # per kind of risk
+SCORE_CAP = {"critical": 50, "high": 25, "medium": 12, "low": 3}      # per severity tier
 
 
 def score(findings):
-    """Score the kinds of risk, not the number of files. Each rule counts once at its worst severity:
-    a critical costs 20 (three or more criticals floor the tier at 60), a high 6 (cap 30), a medium 2 (cap 10),
-    lows together at most 3. One live secret moves the score; 300 skills with the same style issue don't."""
-    worst = {}
+    """Score the kinds of risk, not the number of files. Each rule counts once at its worst severity, a little
+    more when it appears many times (up to x1.5), so one finding appearing or vanishing moves the score by at most
+    12 points, not 20. 300 skills with the same style issue cost about 2; one live key about 12."""
+    worst, count = {}, {}
     for f in findings:
         sev = f["severity"]
-        if sev in SCORE_BUDGET and (f["rule"] not in worst or SEV_ORDER.index(sev) < SEV_ORDER.index(worst[f["rule"]])):
-            worst[f["rule"]] = sev
-    penalty = 0
-    for sev, (each, cap) in SCORE_BUDGET.items():
-        penalty += min(cap, each * sum(1 for v in worst.values() if v == sev))
-    s = max(0, 100 - penalty)
+        if sev not in SCORE_BASE:
+            continue
+        r = f["rule"]
+        count[r] = count.get(r, 0) + 1
+        if r not in worst or SEV_ORDER.index(sev) < SEV_ORDER.index(worst[r]):
+            worst[r] = sev
+    tiers = {k: 0.0 for k in SCORE_BASE}
+    for r, sev in worst.items():
+        tiers[sev] += SCORE_BASE[sev] * (1 + 0.5 * min(1.0, math.log10(count[r])))
+    penalty = sum(min(SCORE_CAP[k], v) for k, v in tiers.items())
+    s = max(0, 100 - round(penalty))
     grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 65 else "D" if s >= 50 else "F"
     return s, grade
 
@@ -604,12 +615,13 @@ def audit(roots, exports, quick=False):
         fs += package_findings(notes)
         fs += osv_findings(roots, notes)
         secret_paths = [f["where"].split(":")[0] for f in fs if f["rule"] in ("WT-S001", "WT-S002")]
-        fs = apply_key_status(fs, trufflehog_status(secret_paths, notes))
+        fs = apply_key_status(fs, trufflehog_status(secret_paths, notes), ran=bool(tool("trufflehog")))
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
         fs += engine_findings(sorted(changed), fs, notes)
     if quick:
-        fs = apply_key_status(fs, (load_json(state_path("key_status.json"), {}) or {}).get("files", {}))
+        ks = load_json(state_path("key_status.json"), {}) or {}
+        fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
     save_json(state_path("engines_used.json"), {"at": now(), "engines": ["Watchtower rules"] + [n for n, t in (
         ("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"), ("TruffleHog", "trufflehog"),
         ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner")) if tool(t)]})
@@ -790,8 +802,8 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=()):
 GITLEAKS_CONFIG = r"""[extend]
 useDefault = true
 
-[allowlist]
-description = "Watchtower: package caches and its own state"
+[[allowlists]]
+description = "Watchtower: package caches, tests, lockfiles, headers and its own state"
 paths = [
   '''(^|/)(go/pkg|pkg/mod|\.local/go|node_modules|\.cache|\.npm|\.venv|site-packages|dist-packages)/''',
   '''(^|/)\.config/(google-chrome[^/]*|chromium[^/]*|BraveSoftware)/''',
@@ -802,12 +814,23 @@ paths = [
   '''(^|/)(\.codex/auth\.json|\.claude/\.credentials\.json|\.config/gh/hosts\.yml|\.aws/credentials|\.git-credentials|\.netrc|\.docker/config\.json|\.npmrc)$''',
   '''(^|/)watchtower/(state|reports|app|\.venv|bin)/''',
   '''chrome-cookie-seed\.json$''',
+  '''\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|py)$''',
+  '''(^|/)(tests?|__tests__|fixtures?|testdata)/''',
+  '''\.h$''',
+  '''(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum|Cargo\.lock|marketplace\.json)$''',
 ]
 regexTarget = "line"
 regexes = [
   '''(?i)x-amz-(credential|signature|security-token)=''',
   '''(?i)[?&](AWSAccessKeyId|Signature|Expires)=''',
+  '''(?i)(authorization|x-api-key|api[_-]?key|token)[^\n]{0,30}(\$\{?[A-Za-z_]+\}?|<[^>]{1,40}>|your[_ -]?(token|key|api)|x{4,}|\*{3,}|\.\.\.)''',
 ]
+
+[[allowlists]]
+description = "A bare 40-character hex string is a git commit, not a Sourcegraph token"
+targetRules = ["sourcegraph-access-token"]
+regexTarget = "secret"
+regexes = ['''^[a-fA-F0-9]{40}$''']
 """
 
 
@@ -852,8 +875,16 @@ def gitleaks_findings(roots, notes):
         r = os.path.expanduser(r)
         if not os.path.isdir(r):
             continue
-        run([exe, "detect", "--source", r, "--no-git", "--redact", "--config", cfg, "--report-format", "json",
-             "--report-path", tmp, "--exit-code", "0", "--max-target-megabytes", "5"], 600)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        code, _, err = run([exe, "detect", "--source", r, "--no-git", "--redact", "--config", cfg, "--report-format", "json",
+                            "--report-path", tmp, "--exit-code", "0", "--max-target-megabytes", "5"], 600)
+        if code != 0 or not os.path.exists(tmp):
+            reason = next((l for l in re.sub(r"\x1b\[[0-9;]*m", "", err).splitlines() if "FTL" in l or "error" in l.lower()), err.strip()[:160] or "no report written")
+            notes.append(f"gitleaks FAILED on {r} ({reason.strip()[-160:]}): secrets there were NOT checked by gitleaks.")
+            continue
         per_file = {}
         for leak in load_json(tmp, []) or []:
             per_file.setdefault(leak.get("File"), []).append(leak)
@@ -944,11 +975,53 @@ def find_key(obj, keys):
     return None
 
 
+def is_accepted(f, sup, today):
+    for s_ in sup:
+        if s_.get("expires", "9999") < today:
+            continue
+        if s_.get("key") and s_["key"] == f["key"]:
+            return True
+        # rule + text match survives rescans that change a finding's evidence (and so its key)
+        if s_.get("rule") == f["rule"] and s_.get("match") and s_["match"] in f"{f['where']} {f['title']} {f['evidence']}":
+            return True
+    return False
+
+
 def active(findings):
     sup = load_json(state_path("suppressions.json"), [])
     today = dt.date.today().isoformat()
-    live = {s["key"] for s in sup if s.get("expires", "9999") >= today}
-    return [f for f in findings if f["key"] not in live], [f for f in findings if f["key"] in live]
+    acc = [f for f in findings if is_accepted(f, sup, today)]
+    keys = {f["key"] for f in acc}
+    return [f for f in findings if f["key"] not in keys], acc
+
+
+def cmd_accept(args):
+    """Accept a risk on purpose: it stops counting against the score and shows under 'accepted risks' until it expires."""
+    sup = load_json(state_path("suppressions.json"), [])
+    today = dt.date.today().isoformat()
+    if args.list or not args.rule:
+        for s_ in sup:
+            state = "expired" if s_.get("expires", "9999") < today else "active"
+            print(f"{state:8} {s_.get('rule', '-'):9} {s_.get('match') or s_.get('key', '')[:12]:40} until {s_.get('expires')}  {s_.get('reason', '')}")
+        if not sup:
+            print("No accepted risks.")
+        return 0
+    if args.remove:
+        keep = [s_ for s_ in sup if not (s_.get("rule") == args.rule and s_.get("match") == args.where)]
+        save_json(state_path("suppressions.json"), keep)
+        print(f"Removed {len(sup) - len(keep)} accepted risk(s).")
+        return 0
+    if not args.where or not args.reason:
+        print("ERROR give a rule, the name or path it applies to, and --reason in your own words", file=sys.stderr)
+        return 2
+    days = max(1, min(args.days, 365))
+    exp = (dt.date.today() + dt.timedelta(days=days)).isoformat()
+    sup = [s_ for s_ in sup if not (s_.get("rule") == args.rule and s_.get("match") == args.where)]
+    sup.append({"rule": args.rule, "match": args.where, "reason": args.reason[:200], "expires": exp, "added": now()})
+    save_json(state_path("suppressions.json"), sup)
+    ledger({"event": "accept", "rule": args.rule, "match": args.where, "expires": exp})
+    print(f"Accepted {args.rule} for “{args.where}” until {exp}. It will show under accepted risks, then come back for a re-check.")
+    return 0
 
 
 def ledger(event):
@@ -983,7 +1056,7 @@ def run_audit(args, quick):
                 "inventory": meta["inventory"], "notes": meta["notes"]}
     save_json(state_path("last_findings.json"), snapshot)
     with open(state_path("score_history.csv"), "a") as f:
-        f.write(f"{snapshot['at']},{s},{len(live)}\n")
+        f.write(f"{snapshot['at']},{s},{len(live)},{'daily' if quick else 'full'},{score_fingerprint()}\n")
     resolved = load_json(state_path("resolved.json"), {})
     for f in fixed:
         if f["severity"] in ("critical", "high", "medium") and f["key"] not in resolved:
@@ -993,6 +1066,35 @@ def run_audit(args, quick):
     elapsed = round((dt.datetime.now() - start).total_seconds(), 1)
     ledger({"event": "daily" if quick else "audit", "score": s, "findings": len(live), "new": len(new), "fixed": len(fixed), "seconds": elapsed})
     return snapshot, new, fixed
+
+
+def score_fingerprint():
+    """What was measuring: formula era, Watchtower version, and which scanners ran. When it changes between two
+    audits, a score change may be Watchtower looking at more (or differently), not your setup changing."""
+    used = (load_json(state_path("engines_used.json"), {}) or {}).get("engines", [])
+    return f"{SCORE_ERA}:{VERSION}|" + "+".join(sorted(used))
+
+
+def load_history():
+    """Full audits in the current scoring era. Each row: (time, score, findings, changed, fingerprint) where
+    changed means Watchtower itself differed from the previous audit. Older rows used other formulas and are hidden."""
+    rows, prev = [], None
+    try:
+        with open(state_path("score_history.csv")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        parts = line.strip().split(",", 4)
+        if len(parts) < 5 or parts[3] != "full" or not parts[4].startswith(SCORE_ERA + ":"):
+            continue
+        try:
+            a, sc, n = parts[0], int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        rows.append((a, sc, n, prev is not None and parts[4] != prev, parts[4]))
+        prev = parts[4]
+    return rows
 
 
 SLOW_RULES = ("WT-X001", "WT-X002", "WT-X003", "WT-S002", "WT-D001", "WT-D002")
@@ -1095,14 +1197,7 @@ def cmd_report(args):
     if not snap:
         print("ERROR no audit yet: run `wt audit` first", file=sys.stderr)
         return 2
-    hist = []
-    try:
-        with open(state_path("score_history.csv")) as f:
-            for line in f:
-                a, s, n = line.strip().split(",")
-                hist.append((a, int(s), int(n)))
-    except OSError:
-        pass
+    hist = load_history()
     week = dt.date.today().isocalendar()
     tag = f"{week[0]}-W{week[1]:02d}"
     rdir = os.path.join(home(), "reports")
@@ -1978,9 +2073,12 @@ def svg_trend(hist):
     area = f"{pad},{h - pad} " + line + f" {xy[-1][0]:.1f},{h - pad}"
     grid = "".join(f"<line x1='{pad}' x2='{w - pad}' y1='{pad + (h - 2 * pad) * (1 - v / 100):.1f}' y2='{pad + (h - 2 * pad) * (1 - v / 100):.1f}' class='g'/>" for v in (50, 80))
     last = xy[-1]
+    rings = "".join(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='5' class='ring'/>" for (x, y), pt in zip(xy, pts) if len(pt) > 3 and pt[3])
+    note = ("<p class='quiet' style='margin:6px 0 0'>○ Watchtower itself changed here (a new version or scanner), "
+            "so a jump at that point isn't new problems.</p>") if rings else ""
     return (f"<svg viewBox='0 0 {w} {h}' class='trend' role='img' aria-label='Security score over the last {len(pts)} checks, now {pts[-1][1]}'>"
-            f"{grid}<polygon points='{area}' class='a'/><polyline points='{line}' class='l'/><circle cx='{last[0]:.1f}' cy='{last[1]:.1f}' r='4' class='d'/></svg>"
-            f"<div class='axis'><span>{pts[0][0][5:10]}</span><span>now</span></div>")
+            f"{grid}<polygon points='{area}' class='a'/><polyline points='{line}' class='l'/>{rings}<circle cx='{last[0]:.1f}' cy='{last[1]:.1f}' r='4' class='d'/></svg>"
+            f"<div class='axis'><span>{pts[0][0][5:10]}</span><span>now</span></div>{note}")
 
 
 def svg_areas(exp):
@@ -2012,9 +2110,10 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
     todo = needs_you(fs)
     urgent = [t for t in todo if t["severity"] in ("critical", "high")]
     fixed, cleaned = handled_this_week()
-    delta = None
+    delta, why_changed = None, ""
     if len(hist) >= 2:
-        delta = hist[-1][1] - hist[max(0, len(hist) - 8)][1]
+        delta = hist[-1][1] - hist[-2][1]
+        why_changed = " · Watchtower updated" if len(hist[-1]) > 3 and hist[-1][3] else ""
     exp = [dict(r, area=AREA_SHORT.get(r["area"], r["area"])) for r in exposure(snap)]
     rel_kev = [k for k in b["kev"] if k["relevant"]]
     accepted = (snap or {}).get("suppressed", [])
@@ -2028,7 +2127,11 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
         status, tone = "You're in good shape. Nothing needs you this week.", "ok"
     sub = analyst_note or (f"The biggest outside threat: {stories[0]['title']}." if stories else "No major new threats this week.")
 
-    delta_txt = "" if delta in (None, 0) else (f"<span class='up'>▲ {delta}</span>" if delta > 0 else f"<span class='down'>▼ {abs(delta)}</span>")
+    if delta in (None, 0):
+        delta_txt = ""
+    else:
+        cls = "q" if why_changed else ("up" if delta > 0 else "down")
+        delta_txt = f"<span class='{cls}'>{'▲' if delta > 0 else '▼'} {abs(delta)} since last check{e(why_changed)}</span>"
     dots = "".join(f"<i class='{'on' if i <= lvl_i else ''} l{lvl_i}'></i>" for i in range(5))
     metrics = (f"<div class='m'><span class='k'>Security score</span><b>{e(str(score)) if score is not None else '–'}</b><span class='s'>{e(grade)} {delta_txt}</span></div>"
                f"<div class='m'><span class='k'>Threat level</span><b class='lv l{lvl_i}'>{e(lvl)}</b><span class='dots'>{dots}</span></div>"
@@ -2048,7 +2151,8 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
         extra = f"<p class='quiet'>And {len(rows) - 40} more. Run <code>wt.py show {e(rows[0]['rule'])}</code> for all of them.</p>" if len(rows) > 40 else ""
         label = "Show which" if len(rows) > 1 else "Show where"
         return (f"<details class='dd'><summary>{label}</summary><div class='scroll'><table><tr><th>What</th><th>Why it was flagged</th><th>Rule</th></tr>{body}</table></div>"
-                f"{extra}<p class='quiet'>For the exact lines: <code>wt.py show {e(rows[0]['rule'])}</code></p></details>")
+                f"{extra}<p class='quiet'>For the exact lines: <code>wt.py show {e(rows[0]['rule'])}</code>. "
+                f"Fine on purpose? Tell Watchtower: <code>accept {e(rows[0]['rule'])} {e(rows[0]['name'])} because …</code></p></details>")
 
     def todo_item(i, t):
         links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Turn off {e(n)} keys</a>" for n, u in t.get("links", []))
@@ -2102,7 +2206,7 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
 .dots{{display:flex;gap:4px;margin-top:4px}}.dots i{{width:18px;height:6px;border-radius:3px;background:var(--line)}}.dots i.on.l0{{background:var(--green)}}.dots i.on.l1{{background:var(--sea)}}.dots i.on.l2{{background:var(--amber)}}.dots i.on.l3,.dots i.on.l4{{background:var(--red)}}
 .charts{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}}.panel{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}}
 .panel h3,.sec h2{{margin:0 0 8px;font-size:15px;color:var(--soft);font-weight:600}}
-.trend{{width:100%;height:auto;display:block}}.trend .l{{fill:none;stroke:var(--navy);stroke-width:2.5;stroke-linejoin:round}}.trend .a{{fill:var(--navy);opacity:.10}}.trend .d{{fill:var(--navy)}}.trend .g{{stroke:var(--line);stroke-dasharray:3 4}}
+.trend{{width:100%;height:auto;display:block}}.trend .l{{fill:none;stroke:var(--navy);stroke-width:2.5;stroke-linejoin:round}}.trend .a{{fill:var(--navy);opacity:.10}}.trend .d{{fill:var(--navy)}}.trend .g{{stroke:var(--line);stroke-dasharray:3 4}}.trend .ring{{fill:var(--card);stroke:var(--amber);stroke-width:2}}
 .axis{{display:flex;justify-content:space-between;color:var(--soft);font-size:12px}}
 .ar{{display:grid;grid-template-columns:130px 1fr 28px;align-items:center;gap:10px;font-size:14px;margin:7px 0}}.ab{{height:10px;background:var(--line);border-radius:5px;overflow:hidden}}.ab i{{display:block;height:100%;border-radius:5px}}.ar b{{text-align:right;font-variant-numeric:tabular-nums}}
 .sev-critical{{background:var(--red)}}.sev-high{{background:var(--amber)}}.sev-medium{{background:var(--sea)}}
@@ -2170,12 +2274,7 @@ def cmd_brief(args):
     b = last if (reuse and last and last.get("tag") == tag and offline is None) else gather_brief(cfg, offline)
     snap = load_json(state_path("last_findings.json"), None)
     pkg = load_json(state_path("package_vulns.json"), None)
-    hist = []
-    try:
-        with open(state_path("score_history.csv")) as f:
-            hist = [(a, int(s), int(n)) for a, s, n in (l.strip().split(",") for l in f if l.strip())]
-    except (OSError, ValueError):
-        pass
+    hist = load_history()
     note = open(args.summary).read().strip() if getattr(args, "summary", None) else None
     notes = load_json(args.notes, {}) if getattr(args, "notes", None) else {}
     rdir = os.path.join(home(), "reports")
@@ -2251,8 +2350,21 @@ PLAIN = {
 }
 
 
+KEY_LIVE, KEY_DEAD, KEY_UNSURE, KEY_MAYBE = ("Live key in a file every Bot can read", "Copies of keys that no longer work",
+                                             "Keys the provider didn't answer for", "Looks like a key (pattern match, not confirmed)")
+FIXTURE_PATH = re.compile(r"(?i)(\.test\.|\.spec\.|/tests?/|/__tests__/|/fixtures?/|/testdata/|/docs?/|/examples?/|/references?/|\.md$|\.h$|\.eml$)")
+
+
+PLAIN_BY_TITLE = {
+    KEY_LIVE: ("Keys that still work are sitting in files", "Every Bot can read them and use them.", "Turn them off at the provider, then run /watchtower-fix.", "you"),
+    KEY_DEAD: ("Old key copies (they no longer work)", "Nothing to revoke; they're just clutter.", "Run /watchtower-fix to clear them.", "auto"),
+    KEY_UNSURE: ("Keys we couldn't check", "The provider didn't answer, so we can't say if they work.", "If you recognize one, turn it off; otherwise ignore.", "you"),
+    KEY_MAYBE: ("Strings that look like keys", "A pattern matched, but no provider confirmed a working key. Usually test data or docs.", "Skim the list; only act if one is a real key.", "you"),
+}
+
+
 def plain(f):
-    t = PLAIN.get(f["rule"])
+    t = PLAIN_BY_TITLE.get(f["title"]) or PLAIN.get(f["rule"])
     if t:
         return {"title": t[0], "why": t[1], "how": t[2], "who": t[3]}
     return {"title": f["title"], "why": "", "how": f["fix"], "who": "you"}
@@ -2378,14 +2490,11 @@ def needs_you(findings, limit=None):
     for g in items:
         g["rules"] = sorted(g["rules"])
         g["rows"] = [item_row(f, key_files) for f in sorted(g.pop("findings"), key=lambda f: SEV_ORDER.index(f["severity"]))]
-        if keys and g["title"] == "Keys left in files":
-            if live:
-                dead_n = sum(1 for ks in key_files.values() for k in ks if k["status"] == "dead")
-                g["title"] = "Keys that still work are sitting in files"
-                g["how"] = ("Turn these off at the provider: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear every copy."
-                            + (f" The other {dead_n} keys found no longer work; the fix clears those too." if dead_n else ""))
-            else:
-                g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
+        if g["title"] == "Keys that still work are sitting in files" and live:
+            g["how"] = "Turn these off at the provider: " + ", ".join(n for n, _ in live) + ". Then run /watchtower-fix to clear every copy."
+            g["links"] = live
+        elif g["title"] == "Keys left in files" and keys:   # TruffleHog isn't installed: best guess from key types
+            g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
             g["links"] = keys
     return items[:limit] if limit else items
 
@@ -2416,8 +2525,12 @@ def trufflehog_status(paths, notes):
         return {}
     targets = sorted({p for p in paths if p and os.path.exists(p)})[:200]
     if not targets:
+        save_json(state_path("key_status.json"), {"at": now(), "ran": True, "files": {}})
         return {}
     code, out_s, err = run([exe, "filesystem", *targets, "--json", "--no-update", "--results=verified,unverified,unknown"], 600)
+    if code not in (0, 183) and not out_s.strip():
+        notes.append(f"TruffleHog FAILED ({err.strip()[-140:] or 'no output'}): live/dead key status is unavailable this run.")
+        return {}
     status = {}
     for line in out_s.splitlines():
         try:
@@ -2432,68 +2545,98 @@ def trufflehog_status(paths, notes):
         ex = d.get("ExtraData") or {}
         status.setdefault(os.path.abspath(f), []).append({"detector": d.get("DetectorName", "key"), "status": st, "line": fs_meta.get("line"),
                                                           "guide": ex.get("rotation_guide") if isinstance(ex, dict) else None})
-    save_json(state_path("key_status.json"), {"at": now(), "files": status})
+    save_json(state_path("key_status.json"), {"at": now(), "ran": True, "files": status})
     return status
 
 
-def apply_key_status(findings, status):
-    """Live keys stay critical; files where every key is confirmed dead drop to low (only the copies remain)."""
-    if not status:
+def apply_key_status(findings, status, ran=None):
+    """TruffleHog asks each key's own provider whether it works, so when it ran it is the authority:
+    working key = critical. Provider said no = low (copies only). Provider didn't answer = medium.
+    Gitleaks matched a pattern but TruffleHog found no key = medium, low in tests and docs.
+    If every answer was 'didn't answer' (providers unreachable), don't guess: keep gitleaks' severity."""
+    ran = bool(status) if ran is None else ran
+    if not ran:
+        return findings
+    if status and all(k["status"] == "unknown" for ks in status.values() for k in ks):
         return findings
     out = []
     for f in findings:
         if f["rule"] in ("WT-S001", "WT-S002"):
             p = f["where"].split(":")[0]
             keys = [k for fp, ks in status.items() if fp == p or fp.startswith(p.rstrip("/") + "/") for k in ks]
-            if keys:
-                live = [k for k in keys if k["status"] == "live"]
-                dead = [k for k in keys if k["status"] == "dead"]
-                f = dict(f)
-                if live:
-                    f["severity"], f["title"] = "critical", "Live key in a file every Bot can read"
-                    f["evidence"] = ", ".join(sorted({k["detector"] for k in live})) + f" ({len(live)} live)"
-                elif len(dead) == len(keys):
-                    f["severity"], f["title"] = "low", "Copies of keys that no longer work"
-                    f["evidence"] = ", ".join(sorted({k["detector"] for k in dead})) + f" ({len(dead)} dead)"
-                    f["fix"] = "Nothing to revoke. Run /watchtower-fix to clear the copies."
+            f = dict(f)
+            live = [k for k in keys if k["status"] == "live"]
+            dead = [k for k in keys if k["status"] == "dead"]
+            unsure = [k for k in keys if k["status"] == "unknown"]
+            names = lambda ks: ", ".join(sorted({k["detector"] for k in ks}))
+            if live:
+                f["severity"], f["title"] = "critical", KEY_LIVE
+                f["evidence"] = f"{names(live)} ({len(live)} live)"
+                f["fix"] = "Turn the key off at its provider, then run /watchtower-fix to clear every copy."
+            elif unsure:
+                f["severity"], f["title"] = "medium", KEY_UNSURE
+                f["evidence"] = f"{names(unsure)} ({len(unsure)} unchecked)"
+                f["fix"] = "The provider didn't answer. If you recognize the key, treat it as live and turn it off."
+            elif dead:
+                f["severity"], f["title"] = "low", KEY_DEAD
+                f["evidence"] = f"{names(dead)} ({len(dead)} dead)"
+                f["fix"] = "Nothing to revoke. Run /watchtower-fix to clear the copies."
+            else:
+                f["severity"] = "low" if (FIXTURE_PATH.search(p) and os.path.basename(p) != "SKILL.md") else ("medium" if SEV_ORDER.index(f["severity"]) < SEV_ORDER.index("medium") else f["severity"])
+                f["title"] = KEY_MAYBE
+                f["fix"] = "Pattern match only. If one is a real key, turn it off at its provider; test files and docs are usually safe."
         out.append(f)
     return out
 
 
+OSV_SKIP = ("/.cursor/", "/skill-hunt", "/skill-review", "/candidates/", "/spike/", "/node_modules/", "/vendor/")
+
+
 def osv_findings(roots, notes):
+    """Known holes in project dependencies. One finding per package and version, however many projects use it.
+    Never critical: a vulnerable library in a lockfile is not an exploited attack, and it isn't reachable until
+    a project actually uses the bad code path. High only when the worst advisory scores 7 or more."""
     exe = tool("osv-scanner")
     if not exe:
         notes.append("OSV-Scanner not installed: Node, Go and other project dependencies not checked (install.sh --scanners).")
         return []
-    out = []
+    pkgs = {}
     for r in roots:
         r = os.path.expanduser(r)
         if not os.path.isdir(r) or r.rstrip("/") == os.path.expanduser("~"):
             continue  # projects live in /workspace; home is mostly caches
-        code, out_s, _ = run([exe, "scan", "source", "-r", r, "--format", "json"], 600)
+        code, out_s, err = run([exe, "scan", "source", "-r", r, "--format", "json"], 600)
         try:
             data = json.loads(out_s) if out_s.strip() else {}
         except ValueError:
+            notes.append(f"OSV-Scanner FAILED on {r} ({err.strip()[-120:] or 'unreadable output'}): project dependencies there were NOT checked.")
             continue
         for res in data.get("results", []):
             src = (res.get("source") or {}).get("path", "")
-            if any(x in src + "/" for x in SKIP_PATH_PARTS) or "/node_modules/" in src:
+            if any(x in src + "/" for x in SKIP_PATH_PARTS) or any(x in src for x in OSV_SKIP):
                 continue
             for pk in res.get("packages", []):
                 p = pk.get("package") or {}
                 ids = [v.get("id") for v in pk.get("vulnerabilities", []) if v.get("id")]
                 if not ids:
                     continue
-                sev = "high"
+                worst = 0.0
                 for g in pk.get("groups", []):
                     try:
-                        if float(g.get("max_severity") or 0) >= 9:
-                            sev = "critical"
+                        worst = max(worst, float(g.get("max_severity") or 0))
                     except ValueError:
                         pass
-                out.append(finding("WT-D002", f"Vulnerable package {p.get('name')} {p.get('version')}", sev, ["ASI04", "AST02"],
-                                   f"{src}", f"{p.get('ecosystem')}: {len(ids)} known: {', '.join(ids[:3])}",
-                                   "Update it in that project (npm update / go get -u / your package manager), then re-run the audit.", source="osv-scanner"))
+                d = pkgs.setdefault((p.get("ecosystem"), p.get("name"), p.get("version")), {"ids": set(), "sev": 0.0, "dirs": set()})
+                d["ids"].update(ids)
+                d["sev"] = max(d["sev"], worst)
+                d["dirs"].add(os.path.dirname(src))
+    out = []
+    for (eco, name, ver), d in sorted(pkgs.items(), key=lambda kv: str(kv[0])):
+        dirs = sorted(d["dirs"])
+        ids = sorted(d["ids"])
+        out.append(finding("WT-D002", f"Vulnerable package {name} {ver}", "high" if d["sev"] >= 7 else "medium", ["ASI04", "AST02"], dirs[0],
+                           f"{eco}: {len(ids)} known: {', '.join(ids[:3])}" + (f" · used in {len(dirs)} projects" if len(dirs) > 1 else ""),
+                           "Update it in that project (npm update, go get -u, or your package manager), then re-run the audit.", source="osv-scanner"))
     return out
 
 
@@ -2575,6 +2718,8 @@ def main(argv=None):
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
     fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
+    ac = sub.add_parser("accept"); ac.add_argument("rule", nargs="?"); ac.add_argument("where", nargs="?")
+    ac.add_argument("--reason"); ac.add_argument("--days", type=int, default=90); ac.add_argument("--list", action="store_true"); ac.add_argument("--remove", action="store_true")
     ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule")
     r = sub.add_parser("rollcall"); r.add_argument("--dir")
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
@@ -2584,7 +2729,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
-            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix}[a.cmd](a)
+            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept}[a.cmd](a)
 
 
 if __name__ == "__main__":

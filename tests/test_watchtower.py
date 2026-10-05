@@ -188,13 +188,13 @@ class FalsePositives(unittest.TestCase):
              [F(r, "x", "high", ["ASI03"], "/x", "e", "f") for r in ("WT-X001", "WT-D001", "WT-S003")] + \
              [F(r, "x", "medium", ["ASI02"], "/m", "e", "f") for r in ("WT-T013", "WT-T012", "WT-T014", "WT-A003", "WT-X002")] * 30
         s, g = wt.score(fs)
-        self.assertTrue(45 <= s <= 60, s)
+        self.assertTrue(55 <= s <= 70, s)
 
     def test_score_counts_risks_not_files(self):
         f = [wt.finding("WT-T013", "x", "medium", ["ASI02"], f"/s{i}", "send", "fix") for i in range(300)]
         self.assertGreaterEqual(wt.score(f)[0], 90)
         f.append(wt.finding("WT-S001", "secret", "critical", ["ASI03"], "/k", "ghp_…", "fix"))
-        self.assertLess(wt.score(f)[0], 80)
+        self.assertLess(wt.score(f)[0], 90)
 
 
 class Lints(unittest.TestCase):
@@ -495,6 +495,98 @@ class Features(unittest.TestCase):
         code, o = self.out("fix", "--apply", "--roots", self.tmp)
         self.assertNotIn(key, open(os.path.join(sess, "s1.json")).read())
         self.assertIn(key, open(os.path.join(code_dir, "settings.py")).read())
+
+    def test_score_moves_gently(self):
+        F = wt.finding
+        base = [F("WT-X001", "x", "high", ["AST01"], "/a", "e", "f")]
+        one = wt.score(base + [F("WT-S002", "x", "critical", ["ASI03"], "/k", "e", "f")])[0]
+        many = wt.score(base + [F("WT-S002", "x", "critical", ["ASI03"], f"/k{i}", "e", "f") for i in range(60)])[0]
+        self.assertLessEqual(wt.score(base)[0] - one, 12)      # a critical appearing costs at most 12
+        self.assertLessEqual(one - many, 7)                     # sixty more of the same cost at most 6 more
+        self.assertEqual(wt.score([F("WT-T013", "x", "low", ["ASI02"], "/a", "e", "f")] * 50)[0], 100 - round(0.3 * 1.5))
+
+    def test_history_shows_only_comparable_full_audits(self):
+        old = [("2026-10-05T08:00:00+00:00", 0, 90), ("2026-10-05T09:00:00+00:00", 41, 80)]           # old formula, 3 columns
+        with open(wt.state_path("score_history.csv"), "w") as f:
+            for a, sc, n in old:
+                f.write(f"{a},{sc},{n}\n")
+            f.write(f"2026-10-06T08:00:00+00:00,60,10,full,{wt.SCORE_ERA}:0.4.1|gitleaks+husk\n")
+            f.write(f"2026-10-06T09:00:00+00:00,57,9,daily,{wt.SCORE_ERA}:0.4.1|gitleaks+husk\n")  # daily runs never plotted
+            f.write(f"2026-10-13T08:00:00+00:00,58,9,full,{wt.SCORE_ERA}:0.4.1|gitleaks+husk\n")
+            f.write(f"2026-10-20T08:00:00+00:00,40,20,full,{wt.SCORE_ERA}:0.4.1|gitleaks+husk+osv-scanner\n")
+        h = wt.load_history()
+        self.assertEqual([r[1] for r in h], [60, 58, 40])
+        self.assertEqual([r[3] for r in h], [False, False, True])   # the third audit ran with a new scanner
+        page = wt.svg_trend(h)
+        self.assertIn("class='ring'", page)
+        self.assertIn("Watchtower itself changed here", page)
+
+    def test_osv_one_finding_per_package_never_critical(self):
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
+        def res(path, sev):
+            return {"source": {"path": path}, "packages": [{"package": {"name": "dompurify", "version": "3.4.15", "ecosystem": "npm"},
+                    "vulnerabilities": [{"id": "GHSA-p98j"}], "groups": [{"max_severity": sev}]}]}
+        data = {"results": [res("/ws/a/package-lock.json", "9.8"), res("/ws/b/package-lock.json", "9.8"), res("/ws/c/package-lock.json", "9.8"),
+                            res("/ws/.cursor/projects/x/package-lock.json", "9.8"),
+                            {"source": {"path": "/ws/a/package-lock.json"}, "packages": [{"package": {"name": "esbuild", "version": "0.18.20", "ecosystem": "npm"},
+                             "vulnerabilities": [{"id": "GHSA-67mh"}], "groups": [{"max_severity": "5.3"}]}]}]}
+        fake = os.path.join(bindir, "osv-scanner")
+        open(fake, "w").write("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(data) + "\nEOF\n"); os.chmod(fake, 0o755)
+        ws = os.path.join(self.tmp, "ws"); os.makedirs(ws)
+        fs = wt.osv_findings([ws], [])
+        by = {f["title"]: f for f in fs}
+        self.assertEqual(len(fs), 2)
+        self.assertEqual(by["Vulnerable package dompurify 3.4.15"]["severity"], "high")
+        self.assertIn("used in 3 projects", by["Vulnerable package dompurify 3.4.15"]["evidence"])
+        self.assertEqual(by["Vulnerable package esbuild 0.18.20"]["severity"], "medium")
+        self.assertNotIn("critical", {f["severity"] for f in fs})
+
+    def test_trufflehog_is_the_authority_on_keys(self):
+        F = wt.finding
+        look = F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], "/ws/skills/a/SKILL.md:3", "5 hit(s): curl-auth-header", "f")
+        test = F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], "/ws/app/helper.test.ts:1", "1 hit(s): generic-api-key", "f")
+        live = F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], "/ws/notes.txt:1", "1 hit(s): github-pat", "f")
+        st = {"/ws/notes.txt": [{"detector": "Github", "status": "live", "line": 1}]}
+        out = {f["where"]: f for f in wt.apply_key_status([look, test, live], st, ran=True)}
+        self.assertEqual(out["/ws/notes.txt:1"]["severity"], "critical")
+        self.assertEqual(out["/ws/skills/a/SKILL.md:3"]["severity"], "medium")     # pattern only: never critical
+        self.assertEqual(out["/ws/app/helper.test.ts:1"]["severity"], "low")       # tests and docs
+        # TruffleHog ran and found nothing: nothing is critical
+        self.assertEqual({f["severity"] for f in wt.apply_key_status([look, live], {}, ran=True)}, {"medium"})
+        # providers unreachable (every answer 'unknown'): don't guess, keep gitleaks' severity
+        unreachable = {"/ws/notes.txt": [{"detector": "Github", "status": "unknown", "line": 1}]}
+        self.assertEqual(wt.apply_key_status([live], unreachable, ran=True)[0]["severity"], "critical")
+        # TruffleHog not installed: unchanged
+        self.assertEqual(wt.apply_key_status([live], {}, ran=False)[0]["severity"], "critical")
+
+    def test_scanner_failure_is_reported_not_swallowed(self):
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
+        fake = os.path.join(bindir, "gitleaks")
+        open(fake, "w").write("#!/bin/sh\necho 'FTL Failed to load config error=bad' >&2\nexit 1\n"); os.chmod(fake, 0o755)
+        ws = os.path.join(self.tmp, "ws2"); os.makedirs(ws)
+        notes = []
+        self.assertEqual(wt.gitleaks_findings([ws], notes), [])
+        self.assertTrue(any("gitleaks FAILED" in n and "NOT checked" in n for n in notes), notes)
+
+    def test_weak_verbs_are_low(self):
+        r = wt.load_rules()
+        weak = wt.scan_text("Remove duplicate keywords. Post the summary here and reply to the thread.", "/w/seo/SKILL.md", r, kind="skill")
+        strong = wt.scan_text("Send the report to the client when ready.", "/w/seo/SKILL.md", r, kind="skill")
+        self.assertEqual([f["severity"] for f in weak if f["rule"] == "WT-T013"], ["low"])
+        self.assertEqual([f["severity"] for f in strong if f["rule"] == "WT-T013"], ["medium"])
+
+    def test_accept_survives_rescans_and_expires(self):
+        F = wt.finding
+        f1 = F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/home/box/sand-data/workflows/assessment-deck-2", "risk 100", "f")
+        f2 = dict(f1, key="different", evidence="risk 97")                      # evidence changed after a scanner update
+        code, o = self.out("accept", "WT-X001", "assessment-deck-2", "--reason", "my deck builder embeds base64 html")
+        self.assertIn("Accepted", o)
+        live, acc = wt.active([f2])
+        self.assertEqual((len(live), len(acc)), (0, 1))
+        wt.save_json(wt.state_path("suppressions.json"), [{"rule": "WT-X001", "match": "assessment-deck-2", "expires": "2020-01-01"}])
+        self.assertEqual(len(wt.active([f1])[0]), 1)                            # expired: counts again
+        code, o = self.out("accept", "--list")
+        self.assertIn("expired", o)
 
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")

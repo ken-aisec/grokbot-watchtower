@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1 — 2026-10-05 (a score you can trust: stability pass)
+- The score history only shows full audits measured with the current formula. Older scores (earlier formulas) and daily runs no longer appear, so the trend line isn't comparing different measuring sticks. A ring on the chart and "Watchtower updated" next to the change mark audits where a new version or scanner was added, since a jump there isn't new problems.
+- Smoother score: one kind of finding appearing or vanishing moves it by at most 12 points (was 20), and many of the same kind add at most 50% more.
+- Keys: when TruffleHog runs, only a key its provider confirms still works is critical. Pattern-only matches (curl placeholders, test data, docs) are medium, low in tests and docs. If providers can't be reached, severities are left alone.
+- Dependencies: one finding per package and version, however many projects use it; never critical; high only when the worst advisory scores 7 or more.
+- gitleaks ignores test files, lockfiles, headers, marketplace manifests, env-variable placeholders in curl examples, and 40-character commit hashes.
+- Fixed: a gitleaks config error made it quit silently and Watchtower reported no secrets. Any scanner that fails now says so in the report notes ("NOT checked").
+- "Sends or posts without asking" is medium only for real outward verbs (send, publish, buy, pay, deploy); post, reply, remove and merge are low.
+- New `wt.py accept RULE WHERE --reason "..."`: accept a risk on purpose; it survives rescans and expires after 90 days.
+
 ## v0.4.0 — 2026-10-05 (dig in, live keys, working copy)
 - Every item in the weekly report has a "Show which" drill-down: the skill, file or package by name, why it was flagged, where, and the command for the exact lines.
 - TruffleHog checks which leaked keys still work. Live keys stay critical with a direct link to turn them off; confirmed-dead keys drop to low and the fix clears them. Raw key values are never stored.

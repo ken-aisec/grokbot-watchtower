@@ -49,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.4.0/scripts/install.sh
-head -40 install.sh && bash install.sh v0.4.0
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.4.1/scripts/install.sh
+head -40 install.sh && bash install.sh v0.4.1
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -65,6 +65,7 @@ wt.py brief [--summary F]     weekly threat brief (HTML)
 wt.py rollcall                analyze saved roll-call replies
 wt.py prepublish PATH         check a Bot before sharing it as a template
 wt.py fix [--apply]            safe cleanup (preview by default)
+wt.py accept RULE WHERE --reason "..."   accept a risk on purpose (90 days)
 wt.py events list|clear        one-time detections
 wt.py canary plant|status|remove
 wt.py incident --note "..."   evidence pack + containment checklist
