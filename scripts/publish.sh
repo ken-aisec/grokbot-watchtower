@@ -5,13 +5,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
-TAG="v0.2.2"
+TAG="v0.3.0"
 echo "Publishing $REPO ($TAG)"
 if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
   grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
   git add -A && git commit -qm "Set repository owner to $OWNER"
 fi
-python3 -m unittest discover -s tests -q
+python3 -W ignore::ResourceWarning -m unittest discover -s tests -q
 bash scripts/make-manifest.sh
 git add MANIFEST.sha256 && { git diff --cached --quiet || git commit -qm "Manifest for $TAG"; }
 if gh repo view "$REPO" >/dev/null 2>&1; then

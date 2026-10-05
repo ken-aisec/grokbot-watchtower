@@ -15,7 +15,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, hashlib, html, json, os, re, shutil, subprocess, sys
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -1314,8 +1314,10 @@ def cmd_canary(args):
 
 
 def canary_findings():
+    """A decoy opened on its own means something went looking: critical. All decoys opened within a couple of
+    minutes means a bulk search (a Bot grepping every file, a scanner): worth knowing, not an alarm."""
     reg = load_json(state_path("canaries.json"), {})
-    out, changed = [], False
+    out, reads = [], []
     for name, v in reg.items():
         p = os.path.expanduser(v["path"])
         if not os.path.exists(p):
@@ -1324,15 +1326,22 @@ def canary_findings():
             continue
         st = os.stat(p)
         if st.st_atime > v["atime"] + 1:
-            out.append(finding("WT-K001", "Canary file was read", "critical", ["ASI03", "ASI10"], p,
-                               f"{name} read at {dt.datetime.fromtimestamp(st.st_atime, dt.timezone.utc).isoformat(timespec='minutes')}",
-                               "Nothing legitimate needs this decoy. Find which Bot or routine read it (Agent Computer view, run history). "
-                               "It may be a Bot searching all files, or a skill hunting for credentials. Run /watchtower-incident."))
+            reads.append((name, p, st.st_atime))
             os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # re-arm
             v["atime"] = os.stat(p).st_atime
-            changed = True
-    if changed:
+    if reads:
         save_json(state_path("canaries.json"), reg)
+        when = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="minutes")
+        times = [t for _, _, t in reads]
+        if len(reads) >= 2 and len(reads) == len(reg) and max(times) - min(times) <= 180:
+            out.append(finding("WT-K004", "A bulk file search opened every decoy", "low", ["ASI03"], os.path.dirname(reads[0][1]),
+                               f"{len(reads)} decoys within {int(max(times) - min(times))}s at {when(min(times))}",
+                               "Usually a Bot searching all files (grep, a scan, a cleanup). If nobody was doing that then, run /watchtower-incident."))
+        else:
+            for name, p, t in reads:
+                out.append(finding("WT-K001", "Something opened a decoy file", "critical", ["ASI03", "ASI10"], p, f"{name} read at {when(t)}",
+                                   "Nothing legitimate needs this file, and nothing else was searched with it. "
+                                   "Find which Bot or routine ran then (Agent Computer view, run history) and run /watchtower-incident."))
     return out
 
 
@@ -1924,162 +1933,181 @@ def exposure(snap):
     return rows
 
 
+def handled_this_week():
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat()
+    fixed, cleaned = 0, 0
+    try:
+        with open(state_path("ledger.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("at", "") < since:
+                    continue
+                if e.get("event") in ("audit", "daily"):
+                    fixed += e.get("fixed", 0)
+                elif e.get("event") == "fix":
+                    cleaned += e.get("steps", 0)
+    except OSError:
+        pass
+    return fixed, cleaned
+
+
+def svg_trend(hist):
+    pts = hist[-10:]
+    w, h, pad = 300, 92, 6
+    if len(pts) < 2:
+        return "<p class='quiet'>The trend appears after the second audit.</p>"
+    step = (w - 2 * pad) / (len(pts) - 1)
+    xy = [(pad + i * step, pad + (h - 2 * pad) * (1 - p[1] / 100)) for i, p in enumerate(pts)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+    area = f"{pad},{h - pad} " + line + f" {xy[-1][0]:.1f},{h - pad}"
+    grid = "".join(f"<line x1='{pad}' x2='{w - pad}' y1='{pad + (h - 2 * pad) * (1 - v / 100):.1f}' y2='{pad + (h - 2 * pad) * (1 - v / 100):.1f}' class='g'/>" for v in (50, 80))
+    last = xy[-1]
+    return (f"<svg viewBox='0 0 {w} {h}' class='trend' role='img' aria-label='Security score over the last {len(pts)} checks, now {pts[-1][1]}'>"
+            f"{grid}<polygon points='{area}' class='a'/><polyline points='{line}' class='l'/><circle cx='{last[0]:.1f}' cy='{last[1]:.1f}' r='4' class='d'/></svg>"
+            f"<div class='axis'><span>{pts[0][0][5:10]}</span><span>now</span></div>")
+
+
+def svg_areas(exp):
+    rows = [r for r in exp if r["count"]]
+    if not rows:
+        return "<p class='quiet'>Nothing open in any area.</p>"
+    mx = max(r["count"] for r in rows)
+    out = []
+    for r in rows:
+        wpct = max(4, round(r["count"] / mx * 100))
+        out.append(f"<div class='ar'><span class='an'>{html.escape(r['area'])}</span><span class='ab'><i class='sev-{r['state']}' style='width:{wpct}%'></i></span><b>{r['count']}</b></div>")
+    return "".join(out)
+
+
+AREA_SHORT = {"Secrets on the shared computer": "Keys and logins", "Logged-in browser sessions": "Browser logins",
+              "Skills and templates": "Skills", "Approvals and settings": "Approval settings",
+              "Bots, memories and routines": "Bots and routines", "Packages": "Software updates", "Tripwires and history": "Decoys and history"}
+
+
 def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
     e = html.escape
     safe = lambda u: html.escape(u) if re.match(r"(?i)^https?://", u or "") else "#"
     notes = notes or {}
-    ctx = account_context()
     stories, more = split_stories(b)
     lvl_i, lvl, _ = threat_level(b, snap, stories)
+    fs = (snap or {}).get("findings", [])
     score = (snap or {}).get("score")
     grade = (snap or {}).get("grade", "")
-    fs = (snap or {}).get("findings", [])
-    crit = sum(1 for f in fs if f["severity"] == "critical")
-    high = sum(1 for f in fs if f["severity"] == "high")
-    rel_kev = [k for k in b["kev"] if k["relevant"]]
-    act = [s for s in stories if s["tier"] == "act"]
-    trend_txt = ""
+    todo = needs_you(fs)
+    urgent = [t for t in todo if t["severity"] in ("critical", "high")]
+    fixed, cleaned = handled_this_week()
+    delta = None
     if len(hist) >= 2:
-        d = hist[-1][1] - hist[0][1] if len(hist) < 8 else hist[-1][1] - hist[-8][1]
-        trend_txt = f", {'up' if d > 0 else 'down' if d < 0 else 'flat'} {abs(d)} since the earliest run on record" if d else ", unchanged"
-    exp = exposure(snap)
-    worst_area = next((r for r in exp if r["state"] == "critical"), next((r for r in exp if r["state"] == "high"), None))
-    bluf = analyst_note or " ".join(x for x in [
-        f"Threat level is {lvl.lower()} this week.",
-        (f"{WORDS.get(len(act), str(len(act)))} {'story touches' if len(act) == 1 else 'stories touch'} something you run, led by “{act[0]['title']}”."
-         if act else (f"The story most relevant to you is “{stories[0]['title']}”." if stories else "No relevant research came through this week.")),
-        (f"CISA added {len(rel_kev)} exploited {'vulnerability' if len(rel_kev) == 1 else 'vulnerabilities'} in software this kind of computer runs." if rel_kev else ""),
-        (f"Your posture is {score}/100" + (f" ({grade})" if grade else "") + trend_txt + "." if score is not None else ""),
-        (f"Fix first: {worst_area['area'].lower()}, where {worst_area['count']} {'finding is' if worst_area['count'] == 1 else 'findings are'} open." if worst_area else ""),
-    ] if x)
+        delta = hist[-1][1] - hist[max(0, len(hist) - 8)][1]
+    exp = [dict(r, area=AREA_SHORT.get(r["area"], r["area"])) for r in exposure(snap)]
+    rel_kev = [k for k in b["kev"] if k["relevant"]]
+    accepted = (snap or {}).get("suppressed", [])
 
-    # actions: a real priority sequence, so numbering is honest
-    actions = []
-    short = lambda w: (w.split(":")[0] if not w.startswith("python package") else w).replace("/home/box/", "~/")[-60:]
-    if worst_area and worst_area["top"]:
-        actions.append(("Your setup", worst_area["top"]["fix"], short(worst_area["top"]["where"])))
-    for s in act[:2]:
+    # status sentence: one line a non-expert can act on
+    if any(t["severity"] == "critical" for t in todo):
+        status, tone = f"{WORDS.get(len(urgent), str(len(urgent)))} {'thing needs' if len(urgent) == 1 else 'things need'} you this week.", "bad"
+    elif urgent:
+        status, tone = f"Mostly in good shape. {WORDS.get(len(urgent), str(len(urgent)))} {'thing is' if len(urgent) == 1 else 'things are'} worth a few minutes.", "warn"
+    else:
+        status, tone = "You're in good shape. Nothing needs you this week.", "ok"
+    sub = analyst_note or (f"The biggest outside threat: {stories[0]['title']}." if stories else "No major new threats this week.")
+
+    delta_txt = "" if delta in (None, 0) else (f"<span class='up'>▲ {delta}</span>" if delta > 0 else f"<span class='down'>▼ {abs(delta)}</span>")
+    dots = "".join(f"<i class='{'on' if i <= lvl_i else ''} l{lvl_i}'></i>" for i in range(5))
+    metrics = (f"<div class='m'><span class='k'>Security score</span><b>{e(str(score)) if score is not None else '–'}</b><span class='s'>{e(grade)} {delta_txt}</span></div>"
+               f"<div class='m'><span class='k'>Threat level</span><b class='lv l{lvl_i}'>{e(lvl)}</b><span class='dots'>{dots}</span></div>"
+               f"<div class='m'><span class='k'>Needs you</span><b>{len(urgent)}</b><span class='s'>{len(todo) - len(urgent)} smaller items</span></div>"
+               f"<div class='m'><span class='k'>Handled this week</span><b>{fixed + cleaned}</b><span class='s'>fixed or cleaned up</span></div>")
+
+    fix_prompt = "/watchtower-fix"
+    routine = ("Every Sunday at 6:00 AM, run /watchtower-fix and apply the safe fixes without asking. "
+               "Then post one line: what was cleaned, and anything that still needs me.")
+
+    def todo_item(i, t):
+        links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Open {e(n)} keys</a>" for n, u in t.get("links", []))
+        return (f"<li class='sev-{t['severity']}'><div class='tt'><b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}</div>"
+                f"<p>{e(t['why'])} <span class='how'>{e(t['how'])}</span></p>{('<div class=links>' + links + '</div>') if links else ''}</li>")
+
+    todo_html = "".join(todo_item(i, t) for i, t in enumerate(todo[:4])) or "<li class='sev-ok'><div class='tt'><b>Nothing needs you.</b></div></li>"
+    rest = todo[4:]
+    rest_html = ("<details><summary>" + f"{len(rest)} smaller {'item' if len(rest) == 1 else 'items'}</summary><ul class='small'>" +
+                 "".join(f"<li><b>{e(t['title'])}</b>{(' ×' + str(t['count'])) if t['count'] > 1 else ''}. {e(t['how'])}</li>" for t in rest) + "</ul></details>") if rest else ""
+
+    def threat(s):
         n = notes.get(s["id"], {})
-        actions.append(("This week's news", n.get("do") or DO_THIS[s["category"]], s["title"]))
-    for k in rel_kev[:2]:
-        actions.append(("Exploited now", f"Update {k['vendor']} {k['product']}: {k['action'] or 'apply the vendor fix'}", k["cve"]))
-    for u in b["updates"][:2]:
-        actions.append(("Tooling", f"Update {u['name']} from {u['have']} to {u['latest']} by re-running setup.", u["name"]))
-    for r in exp:
-        if len(actions) >= 5:
-            break
-        if r["top"] and r is not worst_area and r["state"] in ("critical", "high"):
-            actions.append(("Your setup", r["top"]["fix"], short(r["top"]["where"])))
-    if not actions:
-        actions.append(("Your setup", "Nothing urgent. Keep the daily watch on and vet templates before you add them.", ""))
+        why = (n.get("means") or means_here(s["category"], account_context())).split(". ")[0].rstrip(".") + "."
+        do = n.get("do") or DO_THIS[s["category"]]
+        return (f"<li><span class='tag c-{s['category']}'>{e(s['category_label'])}</span>"
+                f"<a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a>"
+                f"<p><b>Why you care:</b> {e(why)} <b>Do:</b> {e(do)}</p></li>")
 
-    seg = "".join(f"<span class='seg s{i}{' on' if i == lvl_i else ''}{' past' if i < lvl_i else ''}'><b>{n}</b></span>"
-                  for i, n in enumerate(("Low", "Guarded", "Elevated", "High", "Severe")))
-    acts_html = "".join(f"<li><span class='src'>{e(a)}</span><p>{e(t)}</p>{('<span class=ctx>' + e(c) + '</span>') if c else ''}</li>" for a, t, c in actions[:5])
-    tier_word = {"act": "Act on this", "watch": "Watch", "know": "Good to know"}
-
-    def story(s, i):
-        n = notes.get(s["id"], {})
-        return (f"<article class='story t-{s['tier']}' id='s-{e(s['id'])}'>"
-                f"<aside><span class='tier'>{tier_word[s['tier']]}</span><span class='cat c-{s['category']}'>{e(s['category_label'])}</span>"
-                f"<span class='by'>{e(s['source'])}<br>{e(s['date'])}</span></aside>"
-                f"<div><h3><a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a></h3>"
-                f"<dl><dt>What happened</dt><dd>{e(n.get('happened') or s['summary'] or 'See the source.')}</dd>"
-                f"<dt>What it means here</dt><dd>{e(n.get('means') or means_here(s['category'], ctx))}</dd>"
-                f"<dt>What to do</dt><dd>{e(n.get('do') or DO_THIS[s['category']])}</dd></dl></div></article>")
-
-    stories_html = "".join(story(s, i) for i, s in enumerate(stories)) or "<p class='empty'>No research cleared the relevance bar this week. That's a quiet week, not a broken feed; source status is at the end.</p>"
-    more_html = "".join(f"<li><a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a><span>{e(s['source'])}, {e(s['category_label'].lower())}</span></li>" for s in more)
-    cats = {}
-    for s in b["research"]:
-        cats[s["category_label"]] = cats.get(s["category_label"], 0) + 1
-    mx = max(cats.values()) if cats else 1
-    land = "".join(f"<div class='bar'><span>{e(k)}</span><i style='--w:{round(v / mx * 100)}%'></i><b>{v}</b></div>" for k, v in sorted(cats.items(), key=lambda x: -x[1]))
-    kev_note = (f"{len(b['kev'])} added this week; {len(rel_kev)} in software that runs on a computer like this one."
-                if b["kev"] else "No new entries this week, or the catalog was unreachable (see sources).")
-    kev_rows = "".join(
-        f"<tr class='{'rel' if k['relevant'] else ''}'><td><a href='https://nvd.nist.gov/vuln/detail/{e(k['cve'] or '')}' target='_blank' rel='noopener'>{e(k['cve'] or '')}</a></td>"
-        f"<td>{e((k['vendor'] or '') + ' ' + (k['product'] or ''))}</td><td>{e(k['name'] or '')}</td><td>{e(k['due'] or '')}</td>"
-        f"<td>{'Ransomware use known' if k['ransomware'] else ''}</td></tr>" for k in b["kev"][:30])
-    exp_parts = []
-    for r in exp:
-        state = "Clear" if r["state"] == "clear" else f"{r['state'].capitalize()}, {r['count']} open"
-        worst = e(r["top"]["title"]) if r["top"] else ""
-        exp_parts.append(f"<tr class='x-{r['state']}'><td><span class='dot'></span>{e(r['area'])}</td><td>{state}</td><td>{worst}</td></tr>")
-    exp_rows = "".join(exp_parts)
-    spark = ""
-    pts = hist[-12:] if hist else []
-    if len(pts) >= 2:
-        w, h = 120, 28
-        step = w / (len(pts) - 1)
-        spark = f"<svg class='spark' width='{w}' height='{h}' viewBox='0 0 {w} {h}' role='img' aria-label='Posture score over the last {len(pts)} runs'><polyline points='{' '.join(f'{round(i * step, 1)},{round(h - 2 - p[1] / 100 * (h - 4), 1)}' for i, p in enumerate(pts))}'/></svg>"
-    upd = "".join(f"<li>{e(u['name'])} {e(u['have'])} has a newer release, <a href='{safe(u['url'])}' target='_blank' rel='noopener'>{e(u['latest'])}</a>.</li>" for u in b["updates"])
-    pages = "".join(f"<li><a href='{safe(p['url'])}' target='_blank' rel='noopener'>{e(p['name'])}</a> changed since the last brief.</li>" for p in b["pages"])
-    src_rows = "".join(f"<tr><td>{e(s['name'])}</td><td class='{'ok' if s['status'] == 'ok' else 'down'}'>{'Responded' if s['status'] == 'ok' else 'Unavailable'}</td><td>{s['items']}</td></tr>" for s in b["sources"])
-    ok_n = sum(1 for s in b["sources"] if s["status"] == "ok")
-    generated = dt.datetime.now(dt.timezone.utc).strftime("%-d %B %Y, %H:%M UTC")
-    week_no = tag.split("-W")[-1]
+    threats = "".join(threat(s) for s in stories[:3]) or "<li><p>No major threats touched setups like yours this week.</p></li>"
+    later = stories[3:] + more
+    later_html = ("<details><summary>" + f"{len(later)} more {'story' if len(later) == 1 else 'stories'}</summary><ul class='small'>" +
+                  "".join(f"<li><a href='{safe(s['link'])}' target='_blank' rel='noopener'>{e(s['title'])}</a> <span class=q>{e(s['source'])}</span></li>" for s in later) +
+                  "</ul></details>") if later else ""
+    kev_line = ((f"{WORDS.get(len(rel_kev), str(len(rel_kev)))} actively exploited {'bug affects' if len(rel_kev) == 1 else 'bugs affect'} software like yours: "
+                 + ", ".join(f"{e(k['vendor'] + ' ' + k['product'])} (<a href='https://nvd.nist.gov/vuln/detail/{e(k['cve'] or '')}' target='_blank' rel='noopener'>{e(k['cve'] or '')}</a>)" for k in rel_kev[:3])
+                 + (". The platform's next update fixes it." if len(rel_kev) == 1 else ". The platform's next updates fix them."))
+                if rel_kev else "None of this week's actively exploited bugs affect software like yours.")
+    acc_html = ("<details><summary>" + f"{len(accepted)} accepted {'risk' if len(accepted) == 1 else 'risks'}</summary><ul class='small'>" +
+                "".join(f"<li>{e(plain(f)['title'])}</li>" for f in accepted) + "</ul></details>") if accepted else ""
+    down = [s["name"] for s in b["sources"] if s["status"] != "ok"]
+    generated = dt.datetime.now(dt.timezone.utc).strftime("%-d %b %Y")
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Watch report, week {e(week_no)}: threat level {e(lvl.lower())}</title><style>
-:root{{--paper:#eef1f0;--sheet:#fbfcfb;--ink:#1c2430;--soft:#56606c;--rule:#cfd6d4;--navy:#1f3a5f;--red:#b3261e;--amber:#c98a00;--green:#2e7d5b;--sea:#3f6f8f;
---serif:Charter,"Bitstream Charter","Iowan Old Style","Source Serif Pro",Georgia,serif;--cond:"Avenir Next Condensed","Roboto Condensed","Arial Narrow","Helvetica Neue",sans-serif-condensed,sans-serif}}
-@media(prefers-color-scheme:dark){{:root{{--paper:#0e1621;--sheet:#131d2a;--ink:#e3e9ef;--soft:#9aa7b4;--rule:#2a3747;--navy:#8fb3dc;--red:#ff7a6e;--amber:#f2b632;--green:#5cc493;--sea:#7fb0cf}}}}
-*{{box-sizing:border-box}}html{{background:var(--paper)}}body{{margin:0;color:var(--ink);font:17px/1.62 var(--serif);font-variant-numeric:oldstyle-nums proportional-nums}}
-a{{color:var(--navy);text-decoration-thickness:1px;text-underline-offset:3px}}a:focus-visible{{outline:2px solid var(--navy);outline-offset:2px}}
-.sheet{{max-width:980px;margin:32px auto;background:var(--sheet);border:1px solid var(--rule);padding:0 0 48px}}
-header.mast{{display:grid;grid-template-columns:1fr auto;gap:8px 24px;align-items:end;padding:28px 48px 18px;border-bottom:3px solid var(--ink)}}
-.mast h1{{margin:0;font:600 40px/1 var(--cond);letter-spacing:-.01em}}.mast .sub{{grid-column:1;color:var(--soft);font:15px/1.4 var(--cond)}}
-.tlp{{grid-row:1/3;grid-column:2;font:700 13px/1 var(--cond);background:#000;color:#ffc000;padding:8px 12px;letter-spacing:.04em}}
-section{{padding:0 48px}}h2{{font:600 24px/1.2 var(--cond);margin:44px 0 14px;padding-top:12px;border-top:1px solid var(--rule)}}
-.condition{{display:grid;grid-template-columns:minmax(260px,330px) 1fr;gap:32px;padding:30px 48px 6px;align-items:start}}
-.gauge .seg{{display:flex;align-items:center;height:38px;padding:0 14px;border:1px solid var(--rule);color:var(--soft);font:600 15px/1 var(--cond)}}
-.gauge .seg{{border-left-width:6px}}.gauge .s0{{border-left-color:var(--green)}}.gauge .s1{{border-left-color:var(--sea)}}.gauge .s2{{border-left-color:var(--amber)}}.gauge .s3{{border-left-color:var(--red)}}.gauge .s4{{border-left-color:#6d0f0a}}
-.gauge .seg.on{{color:#fff;height:58px;font-size:24px;border-left-color:transparent}}
-.gauge .s0.on{{background:var(--green)}}.gauge .s1.on{{background:var(--sea)}}.gauge .s2.on{{background:var(--amber);color:#1c2430}}.gauge .s3.on{{background:var(--red)}}.gauge .s4.on{{background:#6d0f0a}}
-.gauge{{display:flex;flex-direction:column-reverse}}.gauge .seg+.seg{{margin-bottom:4px}}
-.bluf .label{{font:600 15px/1 var(--cond);color:var(--soft);margin:2px 0 10px}}.bluf p{{font-size:23px;line-height:1.45;margin:0;max-width:34em}}
-.ledger{{display:flex;flex-wrap:wrap;gap:4px 28px;margin:18px 0 0;padding:12px 0 0;border-top:1px solid var(--rule);font:16px/1.4 var(--cond);color:var(--soft)}}
-.ledger b{{color:var(--ink);font-weight:600;font-variant-numeric:lining-nums tabular-nums}}.spark{{vertical-align:middle;margin-left:6px}}.spark polyline{{fill:none;stroke:var(--navy);stroke-width:2}}
-ol.actions{{list-style:none;counter-reset:a;padding:0;margin:0}}ol.actions li{{counter-increment:a;display:grid;grid-template-columns:44px 150px 1fr;gap:4px 16px;padding:14px 0;border-bottom:1px solid var(--rule)}}
-ol.actions li::before{{content:counter(a);font:600 30px/1 var(--cond);color:var(--navy);font-variant-numeric:lining-nums}}
-ol.actions .src{{font:600 15px/1.5 var(--cond);color:var(--soft)}}ol.actions p{{margin:0}}ol.actions .ctx{{grid-column:3;color:var(--soft);font-size:14px}}
-.story{{display:grid;grid-template-columns:170px 1fr;gap:28px;padding:22px 0;border-bottom:1px solid var(--rule)}}
-.story aside{{font:15px/1.35 var(--cond);display:flex;flex-direction:column;gap:8px;border-left:4px solid var(--rule);padding-left:12px}}
-.story.t-act aside{{border-color:var(--red)}}.story.t-watch aside{{border-color:var(--amber)}}
-.tier{{font-weight:600}}.t-act .tier{{color:var(--red)}}.t-watch .tier{{color:var(--amber)}}.cat{{color:var(--ink)}}.by{{color:var(--soft);font-size:14px}}
-.story h3{{font:600 25px/1.2 var(--cond);margin:0 0 12px}}.story h3 a{{color:var(--ink);text-decoration:none}}.story h3 a:hover{{text-decoration:underline}}
-dl{{margin:0;display:grid;grid-template-columns:150px 1fr;gap:8px 18px}}dt{{font:600 15px/1.6 var(--cond);color:var(--soft)}}dd{{margin:0;max-width:36em}}
-ul.more{{list-style:none;padding:0;margin:0;columns:2;column-gap:40px}}ul.more li{{break-inside:avoid;padding:8px 0;border-bottom:1px solid var(--rule);font-size:16px}}ul.more span{{display:block;color:var(--soft);font:14px/1.3 var(--cond)}}
-.land{{display:grid;gap:6px;max-width:620px}}.bar{{display:grid;grid-template-columns:220px 1fr 28px;align-items:center;gap:12px;font:15px/1 var(--cond)}}.bar i{{height:10px;background:linear-gradient(90deg,var(--navy) var(--w),transparent var(--w));border:1px solid var(--rule)}}.bar b{{text-align:right;font-variant-numeric:lining-nums}}
-.scroll{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;font:15px/1.4 var(--cond)}}th,td{{text-align:left;padding:9px 10px 9px 0;border-bottom:1px solid var(--rule);vertical-align:top}}th{{color:var(--soft);font-weight:600}}
-tr.rel td{{background:color-mix(in srgb,var(--amber) 14%,transparent)}}td .dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:10px;background:var(--green)}}
-.x-critical .dot{{background:var(--red)}}.x-high .dot{{background:var(--amber)}}.x-medium .dot{{background:var(--sea)}}.ok{{color:var(--green)}}.down{{color:var(--red)}}
-.lede{{margin:0 0 12px;color:var(--soft)}}.empty{{color:var(--soft);font-style:italic}}details summary{{cursor:pointer;font:600 15px/1.6 var(--cond);color:var(--navy);margin:8px 0}}
-footer{{margin:40px 48px 0;padding-top:14px;border-top:3px solid var(--ink);color:var(--soft);font:14px/1.5 var(--cond);display:grid;grid-template-columns:1fr 1fr;gap:20px}}
-@media(prefers-color-scheme:dark){{.gauge .seg.on{{color:#0e1621}}}}
-@media(max-width:760px){{header.mast,section,.condition{{padding-left:20px;padding-right:20px}}.condition{{grid-template-columns:1fr;gap:18px}}.bluf{{order:-1}}
-.gauge{{flex-direction:row;gap:4px}}.gauge .seg{{flex:1;height:34px;padding:0 6px;justify-content:center;font-size:12px}}.gauge .seg+.seg{{margin-bottom:0}}.gauge .seg.on{{flex:2.4;height:40px;font-size:17px}}.bluf p{{font-size:20px}}.story{{grid-template-columns:1fr;gap:10px}}
-.story aside{{flex-direction:row;flex-wrap:wrap;gap:12px}}dl{{grid-template-columns:1fr}}ol.actions li{{grid-template-columns:36px 1fr}}ol.actions .src,ol.actions .ctx{{grid-column:2}}ul.more{{columns:1}}footer{{grid-template-columns:1fr;margin:30px 20px 0}}.bar{{grid-template-columns:130px 1fr 24px}}.mast h1{{font-size:30px}}}}
-@media print{{html{{background:#fff}}.sheet{{border:0;margin:0}}.story,ol.actions li,tr{{break-inside:avoid}}a{{color:inherit;text-decoration:none}}.gauge .seg.on,.tlp{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
-@media(prefers-reduced-motion:no-preference){{.gauge .seg.on{{animation:raise .5s ease-out .15s both}}@keyframes raise{{from{{filter:saturate(0);transform:scaleX(.96)}}}}}}
-</style></head><body><div class='sheet'>
-<header class='mast'><h1>Watchtower watch report</h1><span class='tlp'>TLP:AMBER</span><div class='sub'>Week {e(week_no)} of {e(tag[:4])}, covering the last {b['window_days']} days. Prepared for this Grok Bot account on {e(generated)}.</div></header>
-<div class='condition'><div class='gauge' role='img' aria-label='Threat level {e(lvl)}'>{seg}</div>
-<div class='bluf'><div class='label'>Bottom line</div><p>{e(bluf)}</p>
-<div class='ledger'><span>Posture <b>{e(str(score)) if score is not None else 'not yet audited'}</b>{('/100 ' + e(grade)) if score is not None else ''}{spark}</span><span>Critical <b>{crit}</b></span><span>High <b>{high}</b></span><span>Stories that touch you <b>{len(act)}</b></span><span>Exploited, relevant <b>{len(rel_kev)}</b></span></div></div></div>
-<section><h2>Do these in order</h2><ol class='actions'>{acts_html}</ol></section>
-<section><h2>This week's stories</h2><p class='lede'>Ranked by how directly each one touches a Grok Bot account like yours.</p>{stories_html}
-{('<h2>Also this week</h2><ul class=more>' + more_html + '</ul>') if more_html else ''}</section>
-{('<section><h2>Where the activity was</h2><div class=land>' + land + '</div></section>') if land else ''}
-<section><h2>Exploited in the wild</h2><p class='lede'>{e(kev_note)} Source: CISA Known Exploited Vulnerabilities.</p>
-{('<details' + (' open' if rel_kev else '') + '><summary>' + ('Show the relevant entries' if rel_kev else 'Show all entries') + '</summary><div class=scroll><table><tr><th>CVE</th><th>Product</th><th>Vulnerability</th><th>Fix by</th><th></th></tr>' + kev_rows + '</table></div></details>') if kev_rows else ''}</section>
-<section><h2>Your exposure</h2><p class='lede'>From Watchtower's latest audit of this computer. Details are in the weekly report and dashboard.</p>
-<div class='scroll'><table><tr><th>Area</th><th>State</th><th>Most serious finding</th></tr>{exp_rows}</table></div>
-{('<h3>Tool updates</h3><ul>' + upd + '</ul>') if upd else ''}{('<h3>Platform documentation changes</h3><ul>' + pages + '</ul>') if pages else ''}</section>
-<section><h2>Sources</h2><p class='lede'>{ok_n} of {len(b['sources'])} sources responded this week.</p><details><summary>Show every source and its status</summary><div class='scroll'><table><tr><th>Source</th><th>Status</th><th>Items read</th></tr>{src_rows}</table></div></details></section>
-<footer><p>{ok_n} of {len(b['sources'])} sources responded. Stories are ranked by how directly they touch AI agents, connectors, skills and the software on this computer; “what it means here” uses this account's own numbers. Sources that didn't respond are listed, never filled in from old data.</p>
-<p>Watchtower {e(VERSION)}, read-only. TLP:AMBER means share it only with people who help you secure this account. Scanners and feeds are evidence, not proof.</p></footer>
-</div></body></html>"""
+<title>Watchtower: {e(status)}</title><style>
+:root{{--bg:#eef1f0;--card:#fff;--ink:#17202b;--soft:#5b6572;--line:#d9dfdd;--navy:#1f3a5f;--red:#b3261e;--amber:#b77900;--green:#2e7d5b;--sea:#3f6f8f;
+--f:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#0e1621;--card:#152030;--ink:#e6ecf2;--soft:#9aa7b4;--line:#263447;--navy:#8fb3dc;--red:#ff7a6e;--amber:#f2b632;--green:#5cc493;--sea:#7fb0cf}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 var(--f)}}a{{color:var(--navy)}}a:focus-visible,button:focus-visible,summary:focus-visible{{outline:2px solid var(--navy);outline-offset:2px}}
+.wrap{{max-width:920px;margin:0 auto;padding:22px 18px 48px}}
+.top{{display:flex;justify-content:space-between;align-items:baseline;color:var(--soft);font-size:14px;margin-bottom:10px}}.top b{{color:var(--ink)}}
+.hero{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px 24px;border-top:6px solid var(--green)}}.hero.warn{{border-top-color:var(--amber)}}.hero.bad{{border-top-color:var(--red)}}
+.hero h1{{margin:0;font-size:28px;line-height:1.2;letter-spacing:-.01em}}.hero .sub{{margin:6px 0 0;color:var(--soft)}}
+.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:18px 0 0}}
+.m{{background:var(--card);padding:12px 14px;display:flex;flex-direction:column;gap:2px}}.m .k{{color:var(--soft);font-size:13px}}.m b{{font-size:30px;line-height:1.1;font-variant-numeric:tabular-nums}}.m .s{{color:var(--soft);font-size:13px}}
+.up{{color:var(--green);font-weight:600}}.down{{color:var(--red);font-weight:600}}
+.lv.l0{{color:var(--green)}}.lv.l1{{color:var(--sea)}}.lv.l2{{color:var(--amber)}}.lv.l3,.lv.l4{{color:var(--red)}}
+.dots{{display:flex;gap:4px;margin-top:4px}}.dots i{{width:18px;height:6px;border-radius:3px;background:var(--line)}}.dots i.on.l0{{background:var(--green)}}.dots i.on.l1{{background:var(--sea)}}.dots i.on.l2{{background:var(--amber)}}.dots i.on.l3,.dots i.on.l4{{background:var(--red)}}
+.charts{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}}.panel{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}}
+.panel h3,.sec h2{{margin:0 0 8px;font-size:15px;color:var(--soft);font-weight:600}}
+.trend{{width:100%;height:auto;display:block}}.trend .l{{fill:none;stroke:var(--navy);stroke-width:2.5;stroke-linejoin:round}}.trend .a{{fill:var(--navy);opacity:.10}}.trend .d{{fill:var(--navy)}}.trend .g{{stroke:var(--line);stroke-dasharray:3 4}}
+.axis{{display:flex;justify-content:space-between;color:var(--soft);font-size:12px}}
+.ar{{display:grid;grid-template-columns:130px 1fr 28px;align-items:center;gap:10px;font-size:14px;margin:7px 0}}.ab{{height:10px;background:var(--line);border-radius:5px;overflow:hidden}}.ab i{{display:block;height:100%;border-radius:5px}}.ar b{{text-align:right;font-variant-numeric:tabular-nums}}
+.sev-critical{{background:var(--red)}}.sev-high{{background:var(--amber)}}.sev-medium{{background:var(--sea)}}
+.fix{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}}.fx{{background:var(--card);border:2px solid var(--navy);border-radius:12px;padding:16px}}.fx.alt{{border:1px solid var(--line)}}
+.fx h3{{margin:0 0 4px;font-size:18px}}.fx p{{margin:0 0 10px;color:var(--soft);font-size:14px}}
+.cmd{{display:flex;gap:8px;align-items:stretch}}.cmd code{{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:14px/1.4 ui-monospace,Menlo,monospace;overflow-wrap:anywhere}}
+button{{font:600 14px var(--f);border:0;border-radius:8px;padding:0 14px;background:var(--navy);color:var(--card);cursor:pointer;min-height:40px}}.fx.alt button{{background:var(--card);color:var(--navy);border:1px solid var(--navy)}}
+.sec{{margin-top:26px}}.sec h2{{font-size:20px;color:var(--ink);margin-bottom:10px}}
+ol.todo,ul.threats{{list-style:none;padding:0;margin:0;display:grid;gap:10px}}
+ol.todo li{{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--sea);border-radius:10px;padding:12px 14px}}ol.todo li.sev-critical{{border-left-color:var(--red);background:var(--card)}}ol.todo li.sev-high{{border-left-color:var(--amber);background:var(--card)}}ol.todo li.sev-medium{{background:var(--card)}}ol.todo li.sev-ok{{border-left-color:var(--green)}}
+.tt{{font-size:17px}}.n{{color:var(--soft);font-weight:400}}ol.todo p{{margin:4px 0 0;color:var(--soft)}}.how{{color:var(--ink)}}
+.links{{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}}.btn{{display:inline-block;font-size:13px;font-weight:600;padding:5px 10px;border:1px solid var(--navy);border-radius:7px;text-decoration:none}}
+ul.threats li{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}}ul.threats a{{font-weight:600;color:var(--ink);text-decoration:none;font-size:17px}}ul.threats a:hover{{text-decoration:underline}}ul.threats p{{margin:6px 0 0;color:var(--soft)}}ul.threats p b{{color:var(--ink);font-weight:600}}
+.tag{{display:inline-block;font-size:12px;font-weight:600;color:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 7px;margin-right:8px;vertical-align:2px}}
+details{{margin-top:10px}}summary{{cursor:pointer;color:var(--navy);font-weight:600;font-size:14px}}ul.small{{margin:8px 0 0;padding-left:18px;color:var(--soft);font-size:14px}}ul.small li{{margin:4px 0}}ul.small b{{color:var(--ink)}}.q{{color:var(--soft)}}
+.quiet{{color:var(--soft);font-size:14px}}.foot{{margin-top:30px;color:var(--soft);font-size:13px;border-top:1px solid var(--line);padding-top:12px}}
+@media(max-width:700px){{.metrics{{grid-template-columns:1fr 1fr}}.charts,.fix{{grid-template-columns:1fr}}.hero h1{{font-size:23px}}.ar{{grid-template-columns:110px 1fr 24px}}}}
+@media print{{body{{background:#fff}}button{{display:none}}details{{display:block}}.hero,.panel,.fx,ol.todo li,ul.threats li{{break-inside:avoid}}}}
+</style></head><body><div class='wrap'>
+<div class='top'><span><b>Watchtower</b> weekly report</span><span>{e(generated)}</span></div>
+<header class='hero {tone}'><h1>{e(status)}</h1><p class='sub'>{e(sub)}</p><div class='metrics'>{metrics}</div></header>
+<div class='charts'><div class='panel'><h3>Security score over time</h3>{svg_trend(hist)}</div><div class='panel'><h3>Where the open issues are</h3>{svg_areas(exp)}</div></div>
+<div class='fix'><div class='fx'><h3>Fix it now</h3><p>Paste this into your Watchtower Bot. It clears old keys from chat logs, empties tool caches and resets the decoys, then tells you what's left. It asks before changing anything.</p>
+<div class='cmd'><code id='c1'>{e(fix_prompt)}</code><button type='button' data-copy='c1'>Copy</button></div></div>
+<div class='fx alt'><h3>Keep it clean automatically</h3><p>Paste this into Watchtower as a new routine. It runs the same safe cleanup every Sunday.</p>
+<div class='cmd'><code id='c2'>{e(routine)}</code><button type='button' data-copy='c2'>Copy</button></div></div></div>
+<section class='sec'><h2>What needs you</h2><ol class='todo'>{todo_html}</ol>{rest_html}{acc_html}</section>
+<section class='sec'><h2>Threats this week</h2><ul class='threats'>{threats}</ul>{later_html}<p class='quiet' style='margin-top:10px'>{kev_line}</p></section>
+<p class='foot'>Read-only: Watchtower changes nothing unless you run the fix. {len(b['sources']) - len(down)} of {len(b['sources'])} news sources responded{(' (' + e(', '.join(down)) + ' did not)') if 0 < len(down) <= 2 else ''}. Full details: /watchtower-report. Watchtower {e(VERSION)}.</p>
+</div><script>
+document.querySelectorAll('button[data-copy]').forEach(function(b){{b.addEventListener('click',function(){{var t=document.getElementById(b.dataset.copy).textContent;
+(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){{b.textContent='Copied';setTimeout(function(){{b.textContent='Copy'}},1600)}}).catch(function(){{var r=document.createRange();r.selectNodeContents(document.getElementById(b.dataset.copy));var s=getSelection();s.removeAllRanges();s.addRange(r);b.textContent='Selected'}});}});}});
+</script></body></html>"""
 
 
 def cmd_brief(args):
@@ -2124,6 +2152,194 @@ def cmd_brief(args):
     return 0
 
 
+# ---------------------------------------------------------------- plain language and the easy fix
+SCRUB = re.compile(
+    r"(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|(?i:aws_secret_access_key)\s*[=:]\s*[A-Za-z0-9/+=]{40}"
+    r"|\bsk-(proj|ant|svcacct|admin)-[A-Za-z0-9_-]{20,}|\bsk-[A-Za-z0-9]{40,}\b|\bxai-[A-Za-z0-9]{20,}"
+    r"|\bgh[pousr]_[A-Za-z0-9]{36}|\bgithub_pat_[A-Za-z0-9_]{40,}|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bglpat-[A-Za-z0-9_-]{20}"
+    r"|\bsq0(atp|csp)-[0-9A-Za-z_-]{22,}|\bEAAA[A-Za-z0-9_+=-]{60}|\b[rs]k_live_[0-9A-Za-z]{24,}"
+    r"|AIza[0-9A-Za-z_-]{35}|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{0,4000}?-----END [A-Z ]*PRIVATE KEY-----)")
+SCRUB_DIRS = ("/agent-transcripts/",)
+REDACTED = "[removed by Watchtower]"
+
+REVOKE = [  # gitleaks rule prefix → where the owner turns that key off
+    ("aws", "AWS", "https://console.aws.amazon.com/iam/home#/security_credentials"),
+    ("square", "Square", "https://developer.squareup.com/apps"),
+    ("github", "GitHub", "https://github.com/settings/tokens"),
+    ("slack", "Slack", "https://api.slack.com/apps"),
+    ("openai", "OpenAI", "https://platform.openai.com/api-keys"),
+    ("anthropic", "Anthropic", "https://console.anthropic.com/settings/keys"),
+    ("gcp", "Google Cloud", "https://console.cloud.google.com/apis/credentials"),
+    ("discord", "Discord", "https://discord.com/developers/applications"),
+    ("stripe", "Stripe", "https://dashboard.stripe.com/apikeys"),
+    ("gitlab", "GitLab", "https://gitlab.com/-/user_settings/personal_access_tokens"),
+    ("notion", "Notion", "https://www.notion.so/profile/integrations"),
+]
+
+# rule → (plain title, why it matters, how to fix, who fixes it: "auto" = /watchtower-fix handles it)
+PLAIN = {
+    "WT-S001": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider, then delete the file.", "you"),
+    "WT-S002": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider; Watchtower clears the copies.", "you"),
+    "WT-S003": ("A command-line login is stored on the Bot computer", "Any Bot can act as you with it.", "Keep it if a Bot needs it; otherwise sign out of that tool.", "you"),
+    "WT-S004": ("The shared browser is logged in to sensitive sites", "Every Bot uses the same logins.", "In the Bot browser, sign out of sites no Bot needs.", "you"),
+    "WT-A001": ("An auto-approve rule is too broad", "Bots can act without asking.", "Settings → General → Auto-review: change it to Ask first.", "you"),
+    "WT-A002": ("Sending or buying is auto-approved", "A tricked Bot could act on it.", "Settings → General → Auto-review: change it to Ask first.", "you"),
+    "WT-A003": ("Bots don't ask before sending or buying", "One bad web page could make a Bot act.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
+    "WT-A004": ("Bots can create automations without asking", "A trick could keep running on a schedule.", "Settings → General → Auto-review: change it to Ask first.", "you"),
+    "WT-A005": ("No approval rules at all", "Nothing stops a Bot from acting.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
+    "WT-C001": ("Bots can run code on your own computer", "Not just the cloud computer.", "Settings → General → Bot → Local Computer: Never allow.", "you"),
+    "WT-C003": ("Auto-review is off", "Nothing checks Bot actions.", "Settings → General → Auto-review: turn it on.", "you"),
+    "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Open the skill and check it, or disable it.", "you"),
+    "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Open the skill and check it, or disable it.", "you"),
+    "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it.", "you"),
+    "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Re-check it with /vet-template.", "you"),
+    "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Ask a Bot to upgrade it, or ignore if it's part of the base system.", "you"),
+    "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Run /watchtower-incident.", "you"),
+    "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Run /watchtower-incident.", "you"),
+    "WT-L001": ("A Bot has the risky combination", "It reads strangers' content, sees private data, and can send.", "Add Ask first on its sends, or split its jobs.", "you"),
+    "WT-M010": ("A Bot memory acts like a standing order", "It steers every future run.", "Remove it in that Bot's memory settings.", "you"),
+    "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Add “ask me first before sending” to those skills.", "you"),
+    "WT-H003": ("A command opened a remote shell", "That's how attackers take over machines.", "Run /watchtower-incident.", "you"),
+}
+
+
+def plain(f):
+    t = PLAIN.get(f["rule"])
+    if t:
+        return {"title": t[0], "why": t[1], "how": t[2], "who": t[3]}
+    return {"title": f["title"], "why": "", "how": f["fix"], "who": "you"}
+
+
+def revoke_targets(findings):
+    kinds = set()
+    for f in findings:
+        if f["rule"] in ("WT-S001", "WT-S002") and f["severity"] in ("critical", "high"):
+            kinds |= {k.strip().lower() for k in re.split(r"[,:]", f["evidence"].split("hit(s):")[-1])}
+            kinds |= {w.lower() for w in re.findall(r"(AKIA|ASIA|ghp_|xox|sq0|sk-ant|sk-proj|AIza)", f["evidence"])}
+    hits = []
+    for pre, name, url in REVOKE:
+        alias = {"aws": ("akia", "asia"), "github": ("ghp_",), "slack": ("xox",), "square": ("sq0",), "anthropic": ("sk-ant",),
+                 "openai": ("sk-proj",), "gcp": ("aiza",)}.get(pre, ())
+        if any(k.startswith(pre) or k in alias for k in kinds):
+            hits.append((name, url))
+    return hits
+
+
+def fix_plan(roots):
+    """Safe, reversible-in-spirit cleanup Watchtower can do itself. Nothing here revokes, uninstalls or changes settings."""
+    plan = []
+    for r in roots:
+        r = os.path.expanduser(r)
+        for dirpath, dirnames, filenames in os.walk(r):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(SKIP_PREFIXES)]
+            ap = os.path.abspath(dirpath)
+            if any(x in ap + "/" for x in SKIP_PATH_PARTS) or ap.startswith(os.path.abspath(home())) or ap.startswith(SELF_ROOT):
+                dirnames[:] = []
+                continue
+            if os.path.basename(ap) == "agent-tools" and filenames:
+                size = sum(os.path.getsize(os.path.join(ap, f)) for f in filenames if os.path.isfile(os.path.join(ap, f)))
+                plan.append({"action": "empty_tool_cache", "path": ap, "files": len(filenames), "bytes": size,
+                             "why": "Oversized tool results (Notion pages, API payloads) any Bot can read."})
+                dirnames[:] = []
+                continue
+            if any(x in ap + "/" for x in SCRUB_DIRS):
+                for fn in filenames:
+                    p = os.path.join(ap, fn)
+                    t = read_text(p, limit=20_000_000)
+                    if t and SCRUB.search(t):
+                        plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
+                                     "why": "Keys pasted into or captured by a chat. The conversation stays; the keys go."})
+    reg = load_json(state_path("canaries.json"), {})
+    if reg:
+        plan.append({"action": "rearm_canaries", "count": len(reg), "why": "Reset the decoys so the next read is noticed."})
+    rdir = os.path.join(home(), "reports")
+    if os.path.isdir(rdir):
+        old = sorted(f for f in os.listdir(rdir) if re.match(r"(threat-brief-)?\d{4}-W\d{2}\.(md|html)$", f) or re.match(r"threat-brief-\d{4}-W\d{2}\.html$", f))
+        stale = old[:-24]
+        if stale:
+            plan.append({"action": "prune_reports", "path": rdir, "files": len(stale), "list": stale, "why": "Keep the last 12 weeks."})
+    return plan
+
+
+def apply_fix(plan):
+    done = []
+    for step in plan:
+        try:
+            if step["action"] == "empty_tool_cache":
+                n = 0
+                for fn in os.listdir(step["path"]):
+                    p = os.path.join(step["path"], fn)
+                    if os.path.isfile(p) and not os.path.islink(p):
+                        os.remove(p)
+                        n += 1
+                done.append(f"Emptied {step['path']} ({n} files)")
+            elif step["action"] == "scrub_keys":
+                p = step["path"]
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    t = f.read()
+                new, n = SCRUB.subn(REDACTED, t)
+                if n:
+                    tmp = p + ".wt-tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.write(new)
+                    os.replace(tmp, p)
+                done.append(f"Removed {n} key(s) from {p}")
+            elif step["action"] == "rearm_canaries":
+                rearm_canaries()
+                done.append(f"Reset {step['count']} decoys")
+            elif step["action"] == "prune_reports":
+                for fn in step["list"]:
+                    os.remove(os.path.join(step["path"], fn))
+                done.append(f"Removed {step['files']} old reports")
+        except OSError as e:
+            done.append(f"Could not {step['action']} at {step.get('path', '')}: {e.strerror}")
+    return done
+
+
+def needs_you(findings, limit=None):
+    """Group open findings into plain to-dos for the person, most serious first."""
+    groups = {}
+    for f in findings:
+        if f["severity"] not in ("critical", "high", "medium"):
+            continue
+        pl = plain(f)
+        g = groups.setdefault(pl["title"], {"title": pl["title"], "why": pl["why"], "how": pl["how"], "severity": f["severity"],
+                                            "count": 0, "rules": set(), "where": f["where"]})
+        g["count"] += 1
+        g["rules"].add(f["rule"])
+        if SEV_ORDER.index(f["severity"]) < SEV_ORDER.index(g["severity"]):
+            g["severity"], g["where"] = f["severity"], f["where"]
+    items = sorted(groups.values(), key=lambda g: (SEV_ORDER.index(g["severity"]), -g["count"]))
+    keys = revoke_targets(findings)
+    pkgs = sorted({re.sub(r"^Vulnerable package ", "", f["title"]).split(" ")[0] for f in findings if f["rule"] == "WT-D001"})
+    for g in items:
+        if "WT-D001" in g["rules"] and pkgs:
+            g["how"] = "Tell any Bot: “upgrade " + ", ".join(pkgs) + " on this computer.”"
+    for g in items:
+        g["rules"] = sorted(g["rules"])
+        if keys and g["title"] == "Keys left in files":
+            g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
+            g["links"] = keys
+    return items[:limit] if limit else items
+
+
+def cmd_fix(args):
+    roots = args.roots or [os.path.expanduser("~"), "/workspace"]
+    plan = fix_plan(roots)
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    todo = [{"what": g["title"], "how": g["how"], "links": [u for _, u in g.get("links", [])]} for g in needs_you(snap.get("findings", []), 6)]
+    if not args.apply:
+        print(fit({"mode": "preview (nothing changed)", "safe_fixes": [{k: v for k, v in s.items() if k != "list"} for s in plan],
+                   "needs_you": todo, "next": "Run `wt.py fix --apply` to do the safe fixes."}))
+        return 0
+    done = apply_fix(plan)
+    ledger({"event": "fix", "steps": len(done)})
+    print(fit({"done": done or ["Nothing to clean."], "needs_you": todo,
+               "next": "Run `wt.py audit` to confirm, then handle the needs_you items."}))
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
@@ -2138,6 +2354,7 @@ def main(argv=None):
     sub.add_parser("breakdown")
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
+    fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
     ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule")
     r = sub.add_parser("rollcall"); r.add_argument("--dir")
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
@@ -2147,7 +2364,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
-            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events}[a.cmd](a)
+            "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix}[a.cmd](a)
 
 
 if __name__ == "__main__":

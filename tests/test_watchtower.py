@@ -364,7 +364,10 @@ class Features(unittest.TestCase):
         self.assertEqual(wt.canary_findings(), [])
         target = os.path.expanduser(reg["customers"]["path"])
         content = open(target).read()
-        self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K001"])
+        self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K001"])   # one decoy alone: targeted
+        for v in reg.values():
+            open(os.path.expanduser(v["path"])).read()
+        self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K004"])   # all at once: bulk search
         self.assertEqual(wt.canary_findings(), [])  # re-armed
         self.assertIsNotNone(wt.canary_copies("dump:\n" + content, "/tmp/elsewhere.txt"))
         os.remove(target)
@@ -420,6 +423,36 @@ class Features(unittest.TestCase):
         self.assertIn("Cleared 1", o)
         self.assertEqual(wt.remember_events([]), [])
 
+    def test_fix_preview_then_apply(self):
+        tc = os.path.join(self.tmp, "ws", "agent-tools")
+        tr = os.path.join(self.tmp, "home2", "sand-data", "agent-transcripts", "a")
+        os.makedirs(tc); os.makedirs(tr)
+        open(os.path.join(tc, "1.txt"), "w").write("notion payload")
+        key = "ghp_" + fake_key(36)
+        open(os.path.join(tr, "chat.jsonl"), "w").write(f'{{"user": "use {key} for the repo"}}\n{{"ok": 1}}\n')
+        roots = [os.path.join(self.tmp, "ws"), os.path.join(self.tmp, "home2")]
+        code, o = self.out("fix", "--roots", *roots)
+        r = json.loads(o)
+        self.assertIn("preview", r["mode"])
+        self.assertEqual({x["action"] for x in r["safe_fixes"]}, {"empty_tool_cache", "scrub_keys"})
+        self.assertTrue(os.path.exists(os.path.join(tc, "1.txt")))      # preview changes nothing
+        self.assertNotIn(key, o)
+        code, o = self.out("fix", "--apply", "--roots", *roots)
+        self.assertFalse(os.path.exists(os.path.join(tc, "1.txt")))
+        chat = open(os.path.join(tr, "chat.jsonl")).read()
+        self.assertNotIn(key, chat)
+        self.assertIn("[removed by Watchtower]", chat)
+        self.assertIn('{"ok": 1}', chat)                                 # conversation kept
+
+    def test_plain_needs_you_and_revoke_links(self):
+        F = wt.finding
+        fs = [F("WT-S002", "gitleaks: secrets in 3 files under agent-transcripts", "critical", ["ASI03"], "/t", "9 hit(s): aws-access-token, square-access-token", "f"),
+              F("WT-A003", "Missing Ask-first rules", "medium", ["ASI09"], "/s", "x", "f")]
+        todo = wt.needs_you(fs)
+        self.assertEqual(todo[0]["title"], "Keys left in files")
+        self.assertEqual([n for n, _ in todo[0]["links"]], ["AWS", "Square"])
+        self.assertIn("Auto-review", todo[1]["how"])
+
     def test_prepublish(self):
         d = os.path.join(self.tmp, "tpl")
         os.makedirs(d)
@@ -471,13 +504,14 @@ class Features(unittest.TestCase):
         code, o = self.out("brief", "--offline", path)
         r = json.loads(o)
         page = open(r["brief"]).read()
-        self.assertIn("Watchtower watch report", page)
+        self.assertIn("Watchtower</b> weekly report", page)
         self.assertIn("CVE-2026-0001", page)
         self.assertNotIn("CVE-2020-0002", page)
-        self.assertNotIn("<script>", page)
+        self.assertEqual(page.count("<script>"), 1)                     # only the copy-button script
+        self.assertNotIn("alert(", page)
         self.assertNotIn("javascript:alert", page)
         self.assertNotIn("Gardening", page)
-        self.assertIn("Unavailable", page)                 # feeds missing in offline mode are listed, not invented
+        self.assertIn("2 of 11 news sources responded", page)   # missing feeds are counted, not invented
         self.assertEqual(len(r["top_stories"]), 1)
         self.assertEqual(r["top_stories"][0]["category"], "MCP and connectors")
 

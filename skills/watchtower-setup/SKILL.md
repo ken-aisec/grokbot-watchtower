@@ -10,10 +10,10 @@ Tell the user up front: "Setup only writes inside /workspace/watchtower, plus th
 ## 1. Install the pinned release
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.2/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.3.0/scripts/install.sh
 head -40 install.sh
 ```
-Show the user those 40 lines, then run `bash install.sh v0.2.2`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
+Show the user those 40 lines, then run `bash install.sh v0.3.0`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
 
 ## 2. Scanning engines (recommended)
 Say: "Watchtower checks skills with its own rules. Adding NVIDIA SkillSpector and husk gives two independent engines, so a finding two of them agree on is far more trustworthy. gitleaks finds secrets and pip-audit checks installed packages. All pinned, about a minute, installed in /workspace/watchtower only. Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`.
@@ -33,7 +33,7 @@ Recommend these Auto Review rules (Settings → General → Auto-review → Ask 
 - before changing settings, permissions, routines, or connectors
 
 ## 6. First brief and the routines
-Run `/watchtower-brief` once so the user sees the threat brief. Then propose the three routines from the `routines/` folder (daily watch at 06:00, weekly audit and brief on Sunday at 05:00, monthly roll-call on the 1st at 05:30, in the user's time zone). Run each once as a Test run while the user watches. Create them only after the user says yes.
+Run `/watchtower-brief` once so the user sees the threat brief. Then propose the four routines from the `routines/` folder (daily watch at 06:00, weekly audit and report on Sunday at 05:00, weekly tidy on Sunday at 06:00, monthly roll-call on the 1st at 05:30, in the user's time zone). The weekly tidy runs /watchtower-fix without asking each time, so say plainly what it does before creating it. Run each once as a Test run while the user watches. Create them only after the user says yes.
 
 ## Validate
 Setup is done when `wt.py daily` prints NO_CHANGES twice in a row, `wt.py canary status` prints CANARIES_QUIET, and a report and a threat brief exist in /workspace/watchtower/reports/.

@@ -10,18 +10,20 @@ Watchtower is a read-only security officer for that setup. It vets templates bef
 | --- | --- |
 | `/vet-template` | Install / Install with changes / Do not install for any template, skill or plugin, with a risk score, evidence, its autonomy level (L0 observe → L3 unattended), and the boundary line to paste into its description |
 | `/watchtower-audit` | A 0–100 posture score and the top three fixes across skills, plugins, MCP configs, Auto Review rules, local execution, logged-in browser sessions, CLI credentials, secrets, vulnerable packages, persistence, integrity drift, canaries and shell history |
-| `/watchtower-brief` | A weekly threat brief as a polished HTML page: new AI-agent, MCP and supply-chain research, vulnerabilities CISA says are exploited now, tool updates and Grok Bot doc changes, each tied to how your account works |
+| `/watchtower-brief` | The weekly report, one page you can read in a minute: status, score, threat level, trend charts, a one-click fix, what needs you, and the three threats that matter to your setup |
 | `/watchtower-report` | Weekly Markdown report and a self-contained HTML dashboard |
 | `/watchtower-rollcall` | DMs every Bot for its routines, connectors and stored memories, then flags poisoned memories, unsafe routines and the lethal trifecta (private data + untrusted input + a way out) |
 | `/watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
 | `/watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
 | `/watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
-| `/watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and brief; routines |
+| `/watchtower-fix` | The easy fix button: removes keys from chat logs, empties tool caches, resets decoys and prunes old reports, then lists in plain words what only you can do, with direct links |
+| `/watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
 
 | Routine | When | Cost |
 | --- | --- | --- |
 | Daily watch | 06:00 | Silent unless something changed. Scripts only; the model reads a delta under 4 KB. |
-| Weekly audit and brief | Sunday 05:00 | One audit, one brief, one summary. |
+| Weekly audit and report | Sunday 05:00 | One audit, one report, one summary. |
+| Weekly tidy | Sunday 06:00 | Runs the safe fixes without asking; posts one line. |
 | Monthly roll-call | 1st of the month | One DM per Bot. |
 
 Every finding carries a rule ID, severity, file and line (secrets masked), the fix, and a mapping to the [OWASP Top 10 for Agentic Applications](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/) (ASI), the [OWASP Agentic Skills Top 10](https://owasp.org/www-project-agentic-skills-top-10/) (AST), or the OWASP Top 10 (2021) for code.
@@ -47,8 +49,8 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.2.2/scripts/install.sh
-head -40 install.sh && bash install.sh v0.2.2
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.3.0/scripts/install.sh
+head -40 install.sh && bash install.sh v0.3.0
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
@@ -62,6 +64,8 @@ wt.py report                  weekly report + dashboard.html
 wt.py brief [--summary F]     weekly threat brief (HTML)
 wt.py rollcall                analyze saved roll-call replies
 wt.py prepublish PATH         check a Bot before sharing it as a template
+wt.py fix [--apply]            safe cleanup (preview by default)
+wt.py events list|clear        one-time detections
 wt.py canary plant|status|remove
 wt.py incident --note "..."   evidence pack + containment checklist
 wt.py codescan PATH           OWASP Top 10 code review
@@ -81,7 +85,7 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 
 ## Tests
 
-`make test` runs 40 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs 42 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 

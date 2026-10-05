@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.0 — 2026-10-05 (the easy fix button)
+- Weekly report rebuilt for non-experts: one status line, four metrics (score, threat level, needs you, handled this week), a score trend chart and an open-issues chart, a copyable "Fix it now" command and weekly-tidy routine, plain-language to-dos with direct links to turn off leaked keys, and three threats with one line each on why you care and what to do. Everything else folds away.
+- New `/watchtower-fix` and `wt.py fix [--apply]`: removes keys from chat transcripts (the conversation stays), empties tool-overflow caches, resets decoys, prunes old reports. Preview by default; never revokes, uninstalls or changes settings.
+- New weekly-tidy routine.
+- Decoys: one opened alone is critical (something went looking); all opened within minutes is a bulk search and only noted.
+
 ## v0.2.2 — 2026-10-05 (fairness pass after a real account run)
 - Canaries are re-armed after Watchtower's own scanners run and are excluded from gitleaks, so they only trip on other readers. `wt.py events clear --rule WT-K001` clears false trips from earlier versions.
 - Score counts kinds of risk: a critical type costs 20, a high 6, a medium 2 (with caps), so a real account with a few issues isn't pinned at 0. Grades: A 90, B 80, C 65, D 50.
