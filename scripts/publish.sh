@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
-TAG="v0.6.1"
+TAG="v0.6.2"
 echo "Publishing $REPO ($TAG)"
 if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
   grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
@@ -35,3 +35,14 @@ if [ "$(gh repo view "$REPO" --json visibility -q .visibility)" != "PUBLIC" ]; t
 fi
 git tag -f -a "$TAG" -m "Watchtower $TAG" && git push -f origin "$TAG"
 echo "Done: https://github.com/$REPO (tag $TAG)"
+# The template's memories carry this release's tag and commit ID, so an installed copy can refuse anything else.
+COMMIT="$(git rev-parse HEAD)"
+python3 - "$TAG" "$COMMIT" <<'PYEOF' > template-memories.txt
+import re, sys
+tag, commit = sys.argv[1], sys.argv[2]
+text = open("bot/memories.md").read().replace("{TAG}", tag).replace("{COMMIT}", commit)
+for m in re.findall(r"(?m)^\d+\. (.+)$", text):
+    print(m + "\n")
+PYEOF
+echo "Template memories for $TAG are in $(pwd)/template-memories.txt."
+echo "Tell your Watchtower Bot: replace the template's memories with that text, then click Update template."

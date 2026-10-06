@@ -4,3 +4,4 @@ __pycache__/
 state/
 reports/
 *.tmp
+template-memories.txt

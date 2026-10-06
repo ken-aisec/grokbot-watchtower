@@ -297,6 +297,62 @@ class BuiltInSoftware(Box):
         self.assertFalse(any("accepted automatically" in n for n in r["notes"]))
 
 
+class FactoryBox(Box):
+    """A brand-new Grok Bot computer as it really arrived on 2026-10-06 (from `wt.py doctor` on a fresh account): sand-data is the
+    real folder and agent-data a link to it, two built-in skill packs and one plugin, the platform's own gateway token, a seeded
+    browser login, outdated Python packages that came with the computer, and no Ask-first rules."""
+    def build(self):
+        sd = os.path.join(self.home, "sand-data"); os.makedirs(os.path.join(sd, "workflows"))
+        os.symlink(sd, os.path.join(self.home, "agent-data"))
+        for pack, n in (("errands", 30), ("general", 18)):
+            for i in range(n):
+                d = os.path.join(sd, "managed-skills", pack, f"guide{i}"); os.makedirs(d)
+                open(os.path.join(d, "SKILL.md"), "w").write(f"# Guide {i}\nHelp the user book or buy. Ask before paying.\n")
+        open(os.path.join(sd, "managed-skills", "errands", "guide0", "SKILL.md"), "a").write('apiKey = "ResyAIzaSyD4' + "kq9XvT2mB7" * 3 + '"\n')
+        d = os.path.join(sd, "plugins", "acme-1.0", "skills", "helper"); os.makedirs(d)
+        open(os.path.join(d, "SKILL.md"), "w").write("# Helper\nExplain things.\n")
+        open(os.path.join(sd, "plugins", "acme-1.0", "plugin.json"), "w").write('{"name": "acme"}')
+        open(os.path.join(sd, "gateway.json"), "w").write('{\n "url": "https://gw.internal.example",\n "token": "Ya2u' + "Q7xLp3ZtV9" * 4 + '"\n}\n')
+        json.dump([{"domain": ".google.com", "name": "SID", "value": "x" * 40}], open(os.path.join(sd, "chrome-cookie-seed.json"), "w"))
+        self.scanners(pip_audit='#!/bin/sh\necho \'{"dependencies": [' + ", ".join(
+            '{"name": "%s", "version": "1.0", "vulns": [{"id": "PYSEC-1", "fix_versions": ["9.9"]}]}' % n for n in ("cryptography", "jwcrypto", "pip", "wheel")) + "]}'\n",
+            osv_scanner="#!/bin/sh\necho '{\"results\": []}'\n",
+            gitleaks='#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]\nsrc = a[a.index("--source") + 1]\np = os.path.join(src, "sand-data", "gateway.json")\n'
+                     'json.dump([{"File": p, "StartLine": 7, "RuleID": "generic-api-key"}] if os.path.exists(p) else [], open(a[a.index("--report-path") + 1], "w"))\n')
+        self.real = (wt.installed_python_packages, wt.user_python_packages)
+        wt.installed_python_packages = lambda: {"cryptography": "1.0", "jwcrypto": "1.0", "pip": "1.0", "wheel": "1.0"}
+        wt.user_python_packages = lambda: set()                               # nothing here was installed by the user
+
+    def tearDown(self):
+        if hasattr(self, "real"):
+            wt.installed_python_packages, wt.user_python_packages = self.real
+        super().tearDown()
+
+    def test_a_factory_computer_scores_high_and_lists_only_what_the_user_can_fix(self):
+        self.build()
+        r = self.tour()
+        snap = self.snap()
+        counted = sorted((f["rule"], f["severity"]) for f in snap["findings"] if wt.counts(f) and f["severity"] in ("critical", "high", "medium"))
+        self.assertEqual(counted, [("WT-A003", "medium"), ("WT-S004", "high")])        # no Ask-first rules; one shared browser login (once, not twice)
+        self.assertGreaterEqual(r["score"], 90)
+        self.assertEqual(r["inventory"]["skills"], 49)                                # the linked folder is not counted twice
+        fyi = [f for f in snap["findings"] if not wt.counts(f)]
+        self.assertEqual(sum(1 for f in fyi if f["where"].startswith("system python package ")), 4)
+        self.assertTrue(any("gateway.json" in f["where"] and f["severity"] == "low" for f in fyi), [f["where"] for f in fyi])
+        code, o, _ = self.run_cmd("fix", "--roots", *self.roots)
+        prev = json.loads(o)
+        self.assertEqual(prev["upgrades"]["python"], [])                               # never offers to upgrade the computer's own packages
+        self.assertEqual([x for x in prev["safe_fixes"] if x["action"] == "rearm_canaries"], [])   # nothing to reset
+        self.assertEqual(wt.load_json(wt.state_path("engines.json"), {})["targets"], 49)   # every built-in skill got a second opinion
+
+    def test_a_package_the_user_installed_still_counts(self):
+        self.build()
+        wt.user_python_packages = lambda: {"jwcrypto"}
+        self.audit()
+        counted = [f["title"] for f in self.snap()["findings"] if f["rule"] == "WT-D001" and wt.counts(f) and f["severity"] == "high"]
+        self.assertEqual(counted, ["Vulnerable package jwcrypto 1.0"])
+
+
 class Scale(Box):
     def test_a_very_large_computer(self):
         self.skills(400)

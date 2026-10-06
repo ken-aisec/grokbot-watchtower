@@ -19,7 +19,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -500,10 +500,11 @@ SESSION_FILES = ("chrome-cookie-seed.json", "cookie-seed.json", "cookies.json")
 
 def browser_sessions(roots):
     """Grok Bot seeds the shared browser with login cookies. Report which domains, never values."""
-    out = []
+    out, seen = [], set()
     for r in [os.path.expanduser("~/sand-data"), os.path.expanduser("~/agent-data")] + list(roots):
-        if not os.path.isdir(r):
-            continue
+        if not os.path.isdir(r) or os.path.realpath(r) in seen:
+            continue   # sand-data and agent-data are often the same folder under two names
+        seen.add(os.path.realpath(r))
         for fn in SESSION_FILES:
             p = os.path.join(r, fn)
             data = load_json(p, None)
@@ -681,8 +682,9 @@ def audit(roots, exports, quick=False):
             fs = apply_key_status(fs, old.get("files", {}), ran=bool(old.get("ran")))
         else:
             fs = apply_key_status(fs, ks, ran=bool(tool("trufflehog")))
+        other_dirs = sorted(os.path.dirname(x) for x in inv["skills"] if skill_tier(x) != "user")
         fs += soft("SkillSpector and husk", ("WT-X001", "WT-X002", "WT-X003", "WT-X004"), notes, [], engine_findings,
-                   user_dirs + sorted(changed), fs, notes, user_roots, budget=max(0, min(ENGINE_BUDGET, time_left() - 20)))
+                   user_dirs + sorted(changed) + other_dirs, fs, notes, user_roots, budget=max(0, min(ENGINE_BUDGET, time_left() - 20)))
         set_progress("finishing", 0, 0)
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
@@ -983,7 +985,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         d = os.path.normpath(d)
         if d not in targets and os.path.isdir(d) and os.path.isfile(os.path.join(d, "SKILL.md")):
             targets.append(d)
-    targets = targets[:300]
+    targets = targets[:500]
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     hashes = {d: skill_dir_hash(d) for d in targets}
     retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=STUCK_RETRY_DAYS)).isoformat()
@@ -1231,6 +1233,16 @@ def installed_python_packages():
         return {}
 
 
+def user_python_packages():
+    """Packages the user (or a Bot) installed themselves with pip. Everything else came with the computer."""
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else (shutil.which("python3") or "python3")
+    code, out_s, _ = run([py, "-m", "pip", "list", "--user", "--format", "json", "--disable-pip-version-check"], 60)
+    try:
+        return {p["name"].lower() for p in json.loads(out_s)}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return set()
+
+
 def package_findings(notes):
     exe = tool("pip-audit")
     if not exe:
@@ -1251,12 +1263,19 @@ def package_findings(notes):
     except ValueError:
         notes.append(f"pip-audit FAILED ({(err.strip().splitlines() or ['no answer'])[-1][:120]}): installed Python packages were NOT checked this run.")
         return []
+    mine = user_python_packages()
     for d in (data.get("dependencies", []) if isinstance(data, dict) else []):
         vulns = d.get("vulns", [])
         if not vulns:
             continue
         fixes = sorted({fv for v in vulns for fv in v.get("fix_versions", [])}, key=vtuple)
         ids = list(dict.fromkeys(v.get("id", "") for v in vulns))
+        if str(d.get("name", "")).lower() not in mine:      # came with the computer: the platform's to update, not the user's
+            out.append(finding("WT-D001", f"Built-in Python package {d.get('name')} {d.get('version')} has known holes", "low", ["ASI04", "AST02"],
+                               f"system python package {d.get('name')}", f"{len(ids)} known: {', '.join(ids[:4])}{'…' if len(ids) > 4 else ''}",
+                               "It came with the computer and every Bot shares it. The platform's updates fix it; Watchtower doesn't touch system packages.",
+                               source="pip-audit"))
+            continue
         out.append(finding("WT-D001", f"Vulnerable package {d.get('name')} {d.get('version')}", "high", ["ASI04", "AST02"],
                            f"python package {d.get('name')}", f"{len(ids)} known: {', '.join(ids[:4])}{'…' if len(ids) > 4 else ''}",
                            f"Upgrade to {fixes[-1]} or later." if fixes else "No fixed version yet; remove it if nothing needs it.",
@@ -1329,15 +1348,30 @@ def find_key(obj, keys):
     return None
 
 
+PLATFORM_FILES = ("/sand-data/gateway.json", "/agent-data/gateway.json")   # Grok Bot's own config; the user can't change it
+
+
 def builtin(f):
     """Shipped by the platform or a plugin, not made or installed by hand by the user."""
-    return any(x in f.get("where", "") for x in VENDOR_CODE)
+    w = f.get("where", "")
+    return any(x in w for x in VENDOR_CODE) or any(x in w for x in PLATFORM_FILES) or w.startswith("system python package ")
 
 
 def counts(f):
     """Only what the user owns moves the score. Built-in findings count when they are critical or high (two scanners
     agreeing a plugin is dangerous still matters); the rest are listed for information."""
     return not builtin(f) or f["severity"] in ("critical", "high")
+
+
+def platform_owned(fs):
+    """The platform's own config and the computer's own Python packages can't be fixed by the user and aren't theirs to
+    upgrade: they stay visible as low, for-information findings and never count."""
+    for f in fs:
+        w = f.get("where", "")
+        if any(x in w for x in PLATFORM_FILES) and f["rule"] in ("WT-S001", "WT-S002"):
+            f.update(severity="low", title="The platform's own access token (every Bot can read it)",
+                     fix="This is Grok Bot's own config file. You can't change it; it's listed so you know every Bot on this computer can read it.")
+    return fs
 
 
 def roll_builtin(fs, meta, notes):
@@ -1518,6 +1552,7 @@ def run_audit_locked(args, quick):
         fs = sort_findings(fs)
     if not quick and "SkillSpector and husk" not in STAGE_FAILED:
         fs = roll_builtin(fs, meta, meta["notes"])
+    fs = platform_owned(fs)
     for f in fs:
         if builtin(f):
             f["scope"] = "builtin"
@@ -2955,8 +2990,14 @@ def fix_plan(roots):
             plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
                          "why": "Keys captured in a chat, session or log. The text stays; the keys go."})
     reg = load_json(state_path("canaries.json"), {})
-    if reg:
-        plan.append({"action": "rearm_canaries", "count": len(reg), "why": "Reset the decoys so the next read is noticed."})
+    spent = 0
+    for v in reg.values():
+        try:
+            spent += os.stat(os.path.expanduser(v["path"])).st_atime > v["atime"] + 1
+        except (OSError, KeyError, TypeError):
+            pass
+    if spent:
+        plan.append({"action": "rearm_canaries", "count": spent, "why": "Reset the decoys that were read so the next read is noticed."})
     rdir = os.path.join(home(), "reports")
     if os.path.isdir(rdir):
         old = sorted(f for f in os.listdir(rdir) if re.match(r"(threat-brief-)?\d{4}-W\d{2}\.(md|html)$", f) or re.match(r"threat-brief-\d{4}-W\d{2}\.html$", f))
@@ -3269,7 +3310,7 @@ def accept_match(f):
     return f["where"].split(":")[0]            # one skill, file or login, not the whole folder
 
 
-def accept_current(rules, reason, days=90):
+def accept_current(rules, reason, days=90, skip=()):
     snap = load_json(state_path("last_findings.json"), {"findings": []})
     sup = load_json(state_path("suppressions.json"), [])
     exp = (dt.date.today() + dt.timedelta(days=max(1, min(days, 365)))).isoformat()
@@ -3280,6 +3321,8 @@ def accept_current(rules, reason, days=90):
         if not acceptable(f):
             skipped += 1
             continue
+        if any(x and x.lower() in f"{f['where']} {f['title']}".lower() for x in skip):
+            continue   # the owner said to leave this one open
         m = accept_match(f)
         if any(s_.get("rule") == f["rule"] and s_.get("match") == m for s_ in sup):
             continue
@@ -3591,6 +3634,8 @@ def python_upgrades():
     data = load_json(state_path("package_vulns.json"), {}) or {}
     ups = []
     for f in data.get("findings", []):
+        if f.get("where", "").startswith("system python package "):
+            continue   # never upgrade what came with the computer
         m = re.match(r"Vulnerable package (\S+) (\S+)", f["title"])
         t = re.search(r"Upgrade to (\S+) or later", f.get("fix", ""))
         if m and t:
@@ -3728,7 +3773,7 @@ def cmd_fix(args):
         done.append(msg)
     if args.accept:
         rules = [r.strip() for r in args.accept.split(",") if r.strip()]
-        n, skipped, exp = accept_current(rules, args.reason or "reviewed by owner")
+        n, skipped, exp = accept_current(rules, args.reason or "reviewed by owner", skip=[x.strip() for x in (args.keep_open or "").split(",") if x.strip()])
         done.append(f"Accepted {n} finding(s) as fine on purpose until {exp}" + (f"; {skipped} were not acceptable and stay open" if skipped else ""))
     ledger({"event": "fix", "steps": len(done)})
     print(fit({"done": done or ["Nothing to do."], "only_you": only_you,
@@ -3847,6 +3892,7 @@ def main_inner(argv=None):
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
     fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
     fx.add_argument("--upgrade", action="store_true"); fx.add_argument("--accept"); fx.add_argument("--reason")
+    fx.add_argument("--keep-open", help="names or paths to leave open even though their rule is in --accept (comma-separated)")
     fx.add_argument("--revet", action="store_true", help="re-scan changed skills with every engine and re-approve the clean ones")
     fx.add_argument("--exception", help="skill name(s) the owner confirmed as security tools (30 days)")
     df = sub.add_parser("diff"); df.add_argument("skill"); df.add_argument("--lines", type=int, default=120)

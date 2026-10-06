@@ -880,6 +880,26 @@ class Features(unittest.TestCase):
             self.assertEqual(r["verdict"], "Install", p)
             self.assertNotIn("WT-T010", rules_of(r), p)
 
+    def test_template_memories_fit_the_platform_limit(self):
+        import re
+        text = open(os.path.join(ROOT, "bot", "memories.md")).read().replace("{TAG}", "v10.20.30").replace("{COMMIT}", "a" * 40)
+        mems = re.findall(r"(?m)^\d+\. (.+)$", text)
+        self.assertEqual(len(mems), 8)
+        for m in mems:
+            self.assertLessEqual(len(m), 480, m[:60])           # the platform cuts a memory at about 500 characters
+        self.assertIn("never write your own scan scripts", mems[6])
+        self.assertIn("install.sh v10.20.30 " + "a" * 40, mems[6])
+
+    def test_accept_a_kind_but_keep_named_items_open(self):
+        F = wt.finding
+        fs = [F("WT-S002", wt.KEY_MAYBE, "medium", ["ASI03"], "/home/box/sand-data/notes/resy.md:4", "x", "f"),
+              F("WT-S002", wt.KEY_MAYBE, "medium", ["ASI03"], "/home/box/sand-data/notes/target.md:9", "x", "f"),
+              F("WT-S002", wt.KEY_MAYBE, "medium", ["ASI03"], "/home/box/projects/real-token.json:7", "x", "f")]
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": fs})
+        code, o = self.out("fix", "--accept", "WT-S002", "--keep-open", "real-token.json", "--roots", os.path.join(self.tmp, "none"))
+        self.assertIn("Accepted 2 finding(s)", json.loads(o)["done"][0])
+        self.assertEqual([f["where"] for f in wt.active(fs)[0]], ["/home/box/projects/real-token.json:7"])
+
     def test_watchtower_passes_its_own_prepublish_check(self):
         import glob
         b = os.path.join(self.tmp, "bundle"); os.makedirs(b)
@@ -887,7 +907,8 @@ class Features(unittest.TestCase):
             shutil.copy(p, os.path.join(b, "skill-" + os.path.basename(os.path.dirname(p)) + ".md"))
         for p in glob.glob(os.path.join(ROOT, "routines", "*.md")):
             shutil.copy(p, os.path.join(b, "routine-" + os.path.basename(p)))
-        shutil.copy(os.path.join(ROOT, "bot", "description.md"), os.path.join(b, "description.md"))
+        for fn in ("description.md", "memories.md", "getting-started.md"):
+            shutil.copy(os.path.join(ROOT, "bot", fn), os.path.join(b, fn))
         code, o = self.out("prepublish", b, "--json")
         r = json.loads(o)
         self.assertEqual((r["verdict"], r["blocking"]), ("PASS", 0), [f for f in r["findings"] if f["severity"] in ("critical", "high")])

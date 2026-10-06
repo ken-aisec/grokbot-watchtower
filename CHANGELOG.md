@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.2 — 2026-10-06 (first run on a brand-new account)
+Everything here came from installing the template on a fresh Grok Bot account and watching where it stumbled.
+- The template now sets itself up. Skills don't survive a template import (a known platform bug) and memories are cut at about 500 characters, which left the first test half-installed. Two short memories now carry it: one says "I'm not set up yet", forbids improvised scan scripts, and installs the pinned release; the other says the skills are the files in `/workspace/watchtower/app/skills`. The memories live in `bot/memories.md` and a test fails if one is over 480 characters.
+- The installer puts the part that runs first (the first 30 lines are everything that runs), prints the next steps itself, and no longer prints git's "detached HEAD" notice.
+- Commit check: `bash install.sh <tag> <commit>` refuses to install if the tag doesn't point at that exact commit. The template's memory carries the commit, so a changed tag or repo can't slip through. `publish.sh` writes the ready-to-paste memories to `template-memories.txt`.
+- A factory computer no longer scores a B. What belongs to the platform is listed for information and never counted: Python packages that came with the computer, Grok Bot's own gateway token, and keys inside built-in guides. Watchtower no longer offers to upgrade the computer's own packages. Packages you installed yourself still count.
+- The shared browser login was counted twice when the same folder had two names. Now once.
+- Every skill gets a second opinion from the scanners once, built-in ones included (before, built-in skills were only scanned when they changed). Results are remembered by content.
+- `fix --keep-open NAME` accepts a kind of finding but leaves named items open, so one real key isn't hidden with harmless ones.
+- The fix only offers to reset decoys that were actually read.
+- Setup: about 5 minutes, not 10; the routines that arrive paused are switched on at the end with one yes; the Ask-first step says the user adds the rules and never writes the copy file before they exist; "six tools", not "three engines".
+- Watchtower no longer flags its own "never ... silently" wording.
+- Simulated computers now include the real factory layout from that first run. 102 tests.
+
 ## v0.6.1 — 2026-10-06 (passes its own pre-publish check)
 - Watchtower failed its own `/watchtower-prepublish`: five of its files had no approval line. Each now says in plain words that nothing is sent, posted, published, deleted or changed without your approval. A test now runs the pre-publish check on Watchtower's own description, skills and routines before every release.
 
