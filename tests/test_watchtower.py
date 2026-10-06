@@ -880,6 +880,18 @@ class Features(unittest.TestCase):
             self.assertEqual(r["verdict"], "Install", p)
             self.assertNotIn("WT-T010", rules_of(r), p)
 
+    def test_watchtower_passes_its_own_prepublish_check(self):
+        import glob
+        b = os.path.join(self.tmp, "bundle"); os.makedirs(b)
+        for p in glob.glob(os.path.join(ROOT, "skills", "*", "SKILL.md")):
+            shutil.copy(p, os.path.join(b, "skill-" + os.path.basename(os.path.dirname(p)) + ".md"))
+        for p in glob.glob(os.path.join(ROOT, "routines", "*.md")):
+            shutil.copy(p, os.path.join(b, "routine-" + os.path.basename(p)))
+        shutil.copy(os.path.join(ROOT, "bot", "description.md"), os.path.join(b, "description.md"))
+        code, o = self.out("prepublish", b, "--json")
+        r = json.loads(o)
+        self.assertEqual((r["verdict"], r["blocking"]), ("PASS", 0), [f for f in r["findings"] if f["severity"] in ("critical", "high")])
+
     def test_skills_are_never_remembered_as_scanned_when_no_scanner_ran(self):
         dirs = self._fake_engines(5)
         bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin")

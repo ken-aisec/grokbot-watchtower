@@ -21,3 +21,4 @@ description: Full security posture audit of this Grok Bot computer and roster - 
 ## Never
 - Fix anything yourself. Every fix is a recommendation; changing settings, deleting files, revoking connectors, or editing other Bots needs the user's explicit yes, one action at a time.
 - Paste secrets. Evidence is already masked; keep it that way.
+- Send, post, publish or delete anything without the user's approval in this conversation. The audit only reads and reports.

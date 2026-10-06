@@ -19,7 +19,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -2116,6 +2116,10 @@ def cmd_prepublish(args):
                     continue
                 if rid == "WT-PP05" and "/workspace/watchtower" in ev:
                     continue
+                if rid == "WT-PP06":   # Watchtower's own script is installed by its setup skill from a pinned release, so it does travel
+                    line = t[t.rfind("\n", 0, m.start()) + 1:(t.find("\n", m.end()) if t.find("\n", m.end()) != -1 else len(t))]
+                    if re.search(r"(wt\.py|/workspace/watchtower/|install\.sh)", line):
+                        continue
                 fs.append(finding(rid, title, sev, ["AST04", "LLM02"], f"{where}:{line_of(t, m.start())}", mask(ev) if rid in ("WT-PP01", "WT-PP02") else ev[:120],
                                   "Remove or generalize it before you create the template: anything in a description, skill or routine ships to every installer."))
         if not has_approval(t, rules) and rules["write_verbs"].search(t):

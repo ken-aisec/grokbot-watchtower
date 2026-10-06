@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.6.1 — 2026-10-06 (passes its own pre-publish check)
+- Watchtower failed its own `/watchtower-prepublish`: five of its files had no approval line. Each now says in plain words that nothing is sent, posted, published, deleted or changed without your approval. A test now runs the pre-publish check on Watchtower's own description, skills and routines before every release.
+
 ## v0.6.0 — 2026-10-06 (built to not break)
 One hardening release instead of more patches. Every feature stays. Before release it ran against 21 simulated computers (`tests/test_boxes.py`).
 - Hard time limit on the whole audit (9 minutes; 2.5 for the daily check). Every scanner gets only the time that is left. The quick scanners now run first and the slow skill scanners last.
