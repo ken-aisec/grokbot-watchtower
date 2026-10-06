@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.4 — 2026-10-06 (honest partial scans, first-run tuning)
+- Fixed: when SkillSpector and husk were missing, skills were remembered as scanned and clean, and would have been skipped once the scanners came back. Now nothing is remembered unless a scanner really ran, each result records which scanners produced it, and results left by older versions are re-checked automatically.
+- When scanners that ran last time are gone (a reset computer, a lost install), the audit says so first, marks the score as not comparable, and the audit and fix skills reinstall the pinned scanners and run again before reporting.
+- Setup now ends with a two-minute tuning step: one question, one yes, to keep what's yours on purpose. Kept items are accepted for 90 days and listed; anything new still shows.
+
 ## v0.5.3 — 2026-10-05 (no more stuck audits)
 - Fixed: one skill that a scanner can't get through no longer eats the whole time budget on every run. Measured cause: SkillSpector doesn't finish on skills with very large files (about 1.5 MB of minified code or text). An engine launch now has its own short limit (30 seconds plus 2 per skill). Big skills are scanned on their own, after the quick ones. When a batch jams, the biggest skill is tried alone, then the rest.
 - A skill a scanner can't finish is remembered and reported as a low finding ("A scanner couldn't get through a skill") instead of being retried every run. Watchtower tries it again after a week, or as soon as the skill changes. It is never counted as clean, and `/watchtower-fix` never re-approves it automatically.

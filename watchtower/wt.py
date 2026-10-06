@@ -18,7 +18,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -638,12 +638,19 @@ def audit(roots, exports, quick=False):
     if quick:
         ks = load_json(state_path("key_status.json"), {}) or {}
         fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
+    prev_used = load_json(state_path("engines_used.json"), {}) or {}
+    before = prev_used.get("expected") or prev_used.get("engines", [])
     save_json(state_path("engines_used.json"), {"at": now(), "engines": ["Watchtower rules"] + [n for n, t in (
         ("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"), ("TruffleHog", "trufflehog"),
         ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner")) if tool(t)]})
 
+    gone = [n for n in before if n not in load_json(state_path("engines_used.json"), {})["engines"]]
+    if gone:
+        notes.insert(0, f"SCANNERS MISSING: {', '.join(gone)} ran last time and are not installed now, so this is a partial scan and the score "
+                        "is not comparable with the last one. Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, then audit again.")
+        save_json(state_path("engines_used.json"), {"at": now(), "engines": load_json(state_path("engines_used.json"), {})["engines"], "expected": before})
     fs = sort_findings(dedupe(fs))
-    meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap,
+    meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap, "scanners_missing": gone,
             "skill_dirs": [os.path.dirname(x) for x in inv["skills"]]}
     return fs, meta
 
@@ -779,6 +786,18 @@ def skill_files(d):
     return out
 
 
+def entry_engines(e_):
+    """Which engines produced a remembered result. Older entries didn't record it: they were scanned if SkillSpector left a summary."""
+    if "engines" in e_:
+        return set(e_["engines"])
+    return {"SkillSpector", "husk"} if e_.get("ss") is not None else set()
+
+
+def entry_current(e_, h, installed):
+    """A remembered result is good when the skill hasn't changed and every scanner installed now has looked at it."""
+    return bool(e_) and e_.get("hash") == h and (bool(e_.get("stuck")) or set(installed) <= entry_engines(e_))
+
+
 def skill_weight(d):
     sizes = [os.path.getsize(p) for p in skill_files(d)]
     return sum(sizes), len(sizes)
@@ -888,7 +907,9 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     hashes = {d: skill_dir_hash(d) for d in targets}
     retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=STUCK_RETRY_DAYS)).isoformat()
-    todo = [d for d in targets if cache.get(d, {}).get("hash") != hashes[d] or (cache[d].get("stuck") and cache[d].get("at", "") < retry_before)]
+    installed = [n for n, x in (("SkillSpector", ss_exe), ("husk", hk_exe)) if x]
+    todo = [d for d in targets if not entry_current(cache.get(d) or {}, hashes[d], installed)
+            or (cache[d].get("stuck") and cache[d].get("at", "") < retry_before)] if installed else []
     scanned, stuck_now = 0, []
     tune = load_json(state_path("engine_tune.json"), {}) or {}
     size = max(1, min(ENGINE_CHUNK, int(tune.get("chunk", ENGINE_CHUNK))))
@@ -936,7 +957,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         if ss_err or hk_err:
             continue   # don't remember a batch that didn't finish
         for d in chunk:
-            cache[d] = {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "at": now()}
+            cache[d] = {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "engines": installed, "at": now()}
         scanned += len(chunk)
         save_json(state_path("engine_cache.json"), cache)   # progress survives an interrupted run
         if size < ENGINE_CHUNK and len(chunk) == size:      # a smaller batch fit: go back to the normal size next run
@@ -954,7 +975,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
             wt_hits.setdefault(os.path.dirname(f["where"].split(":")[0]), []).append(f["rule"])
     for d in targets:
         e_ = cache.get(d) or {}
-        if e_.get("hash") != hashes[d]:
+        if e_.get("hash") != hashes[d] or not (e_.get("stuck") or entry_engines(e_)):
             continue
         if e_.get("stuck"):
             out.append(finding("WT-X004", "A scanner couldn't finish this skill", "low", ["AST08"], d,
@@ -1268,6 +1289,7 @@ def run_audit(args, quick):
         drifted = {skill_root(f["where"].split(":")[0]) for f in fs if f["rule"] in ("WT-I001", "WT-I002", "WT-I003")}
         save_approved_all([d for d in meta.get("skill_dirs", []) if os.path.normpath(d) not in drifted and not os.path.exists(approved_path(d))])
     snapshot = {"at": now(), "version": VERSION, "score": s, "grade": g, "findings": live, "suppressed": suppressed,
+                "scanners_missing": meta.get("scanners_missing", []),
                 "inventory": meta["inventory"], "notes": meta["notes"]}
     save_json(state_path("last_findings.json"), snapshot)
     with open(state_path("score_history.csv"), "a") as f:
@@ -1327,6 +1349,8 @@ def cmd_audit(args):
     exc = exceptions_active(snap)
     if exc:
         out["security_tool_exceptions"] = exc
+    if snap.get("scanners_missing"):
+        out["scanners_missing"] = snap["scanners_missing"]
     print(fit(out))
     return 0
 
@@ -3156,7 +3180,7 @@ def revet(dirs, approve=False):
         r = {"name": skill_name(d), "path": d, "changed": diff["summary"], "checked_by": ["Watchtower rules"] + installed}
         if installed and (cache.get(d) or {}).get("stuck") and cache[d].get("hash") == h:
             r.update(result="not finished", why=f"{cache[d]['stuck']} can't get through this skill, so it can't be re-approved automatically; read the change with wt.py diff")
-        elif installed and (cache.get(d) or {}).get("hash") != h:
+        elif installed and not entry_current(cache.get(d) or {}, h, installed):
             r.update(result="not finished", why="the scanners didn't finish in time; it stays open and is retried next run")
         else:
             fs = dedupe(per[d] + [f for f in eng if os.path.normpath(f["where"]) == d])

@@ -10,10 +10,10 @@ Tell the user up front: "Setup only writes inside /workspace/watchtower, plus th
 ## 1. Install the pinned release
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.3/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.4/scripts/install.sh
 head -40 install.sh
 ```
-Show the user those 40 lines, then run `bash install.sh v0.5.3`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
+Show the user those 40 lines, then run `bash install.sh v0.5.4`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
 
 ## 2. Scanning engines (recommended)
 Say: "Watchtower checks skills with its own rules. These add independent checks, all pinned and installed in /workspace/watchtower only, in about two minutes:
@@ -27,6 +27,9 @@ Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners
 1. `python3 /workspace/watchtower/app/watchtower/wt.py baseline`
 2. Ask: "Plant three decoy files (a fake customer export, fake cloud keys, a fake payments .env)? Nothing legitimate reads them, so if anything does, you'll know." On yes: `wt.py canary plant`. Tell the user the three paths it prints.
 3. `wt.py audit`. Summarize in five lines: score, counts by severity, the top three fixes with the click path or command.
+
+## 3b. Tune it to this setup (2 minutes, once)
+Every setup is different, and a first audit always includes things the user installed on purpose. Say: "First scores run low because I don't know yet what's yours on purpose. One question and I'll tune it." Then run `/watchtower-fix` and follow it exactly: one message, one yes. Whatever the user keeps is accepted for 90 days and listed under accepted risks; anything new still shows up. After the yes, give the tuned score and say that this is the starting line the weekly report compares against.
 
 ## 4. Things the disk doesn't show
 Watchtower reads Auto Review rules and the local-execution setting from Grok Bot's settings file automatically. Routine text and what each Bot remembers come from the roll-call: offer `/watchtower-rollcall` now (it DMs each Bot once).

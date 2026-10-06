@@ -5,7 +5,7 @@ description: The one-yes fix. Cleans up, upgrades outdated software (undoing any
 
 # Fix everything with one yes
 
-1. Run `python3 /workspace/watchtower/app/watchtower/wt.py audit`, then `wt.py fix`. The second command is a preview and changes nothing. Its JSON has `safe_fixes`, `upgrades`, `changed_skills`, `changed_other_files`, `security_tool_exceptions_possible`, `decisions`, `ask_first_rules_missing` and `only_you`. The preview already re-scanned every changed skill with every engine, so `changed_skills` says which are clean.
+1. Run `python3 /workspace/watchtower/app/watchtower/wt.py audit`. If its JSON has `scanners_missing`, run `bash /workspace/watchtower/app/scripts/install.sh --scanners` and audit again first. Then run `wt.py fix`. The second command is a preview and changes nothing. Its JSON has `safe_fixes`, `upgrades`, `changed_skills`, `changed_other_files`, `security_tool_exceptions_possible`, `decisions`, `ask_first_rules_missing` and `only_you`. The preview already re-scanned every changed skill with every engine, so `changed_skills` says which are clean.
 
 2. Post ONE message, at most 14 lines, in this order. Leave out any part that is empty. Plain words, no rule IDs:
    - **Doing now:** the safe cleanup in one line (for example "remove 3 old keys from 2 chats, empty 2 tool caches, reset the decoys").

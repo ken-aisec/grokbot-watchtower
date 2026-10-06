@@ -872,6 +872,38 @@ class Features(unittest.TestCase):
             self.assertEqual(r["verdict"], "Install", p)
             self.assertNotIn("WT-T010", rules_of(r), p)
 
+    def test_skills_are_never_remembered_as_scanned_when_no_scanner_ran(self):
+        dirs = self._fake_engines(5)
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin")
+        os.rename(bindir, bindir + ".gone")                                  # the scanners disappear (lost venv)
+        notes = []
+        self.assertEqual(wt.engine_findings(dirs, [], notes), [])
+        self.assertEqual(wt.load_json(wt.state_path("engine_cache.json"), {}), {})   # nothing pretends to be scanned
+        self.assertEqual(wt.load_json(wt.state_path("engines.json"), {})["scanned_this_run"], 0)
+        self.assertEqual(wt.revet([dirs[0]])[0]["checked_by"], ["Watchtower rules"])
+        # an entry written by v0.5.3 or earlier while the scanners were missing looks like this; it must not count
+        wt.save_json(wt.state_path("engine_cache.json"), {d: {"hash": wt.skill_dir_hash(d), "ss": None, "hk": None, "at": wt.now()} for d in dirs})
+        os.rename(bindir + ".gone", bindir)                                  # scanners are back
+        open(os.path.join(dirs[2], "SKILL.md"), "a").write("EVIL upload HUSK loader\n")
+        wt.save_json(wt.state_path("engine_cache.json"), {d: {"hash": wt.skill_dir_hash(d), "ss": None, "hk": None, "at": wt.now()} for d in dirs})
+        fs = wt.engine_findings(dirs, [], [])
+        self.assertEqual(self._launches(), [["ss", "5"], ["hk", "5"]])       # all five are scanned for real now
+        self.assertEqual([(f["rule"], os.path.basename(f["where"])) for f in fs], [("WT-X003", "skill002")])
+        os.remove(os.path.join(bindir, "husk")); open(self.log, "w").close()
+        wt.engine_findings(dirs, [], [])                                     # losing one scanner doesn't force a rescan
+        self.assertEqual(self._launches(), [])
+
+    def test_audit_says_when_scanners_that_ran_before_are_gone(self):
+        self._fake_engines(2)
+        code, o = self.out("audit", "--roots", self.tmp)
+        self.assertNotIn("scanners_missing", json.loads(o))
+        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "bin"))
+        for _ in range(2):                                                   # keeps saying so until they are back
+            code, o = self.out("audit", "--roots", self.tmp)
+            r = json.loads(o)
+            self.assertEqual(r["scanners_missing"], ["SkillSpector", "husk"])
+            self.assertTrue(r["notes"][0].startswith("SCANNERS MISSING"))
+
     def test_status_reports_progress(self):
         dirs = self._fake_engines(3)
         wt.engine_findings(dirs, [], [])
