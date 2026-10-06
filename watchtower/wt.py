@@ -18,7 +18,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -518,10 +518,16 @@ def audit(roots, exports, quick=False):
     # 2. integrity drift (AST07)
     base = load_json(state_path("baseline.json"), {})
     if base:
+        base_hashes, now_hashes = set(base.values()), set(manifest.values())
         for p, h in manifest.items():
             if own_release_file(p, h):
                 continue   # Watchtower's own skill, identical to the checksummed release it was installed from
-            if p in base and base[p] != h:
+            if p not in base and h in base_hashes and is_vendor(p):
+                continue   # a built-in file that only moved (plugins are reinstalled under new folders after a restart)
+            if p in base and base[p] != h and is_vendor(p):
+                fs.append(finding("WT-I001", "Built-in skill or plugin updated", "low", ["AST07"], p, f"sha256 {base[p][:12]}→{h[:12]}",
+                                  "Usually the platform or a plugin update. The scanners re-check the new version; /watchtower-fix re-approves it if clean."))
+            elif p in base and base[p] != h:
                 fs.append(finding("WT-I001", "Reviewed skill or plugin changed", "high", ["AST07"], p,
                                   f"sha256 {base[p][:12]}→{h[:12]}",
                                   "Run /watchtower-fix: it re-scans the skill with every engine and re-approves it if clean. `wt.py diff <skill>` shows what changed."))
@@ -531,6 +537,8 @@ def audit(roots, exports, quick=False):
         for p in base:
             if any(x in p for x in SKIP_PATH_PARTS):
                 continue
+            if p not in manifest and base[p] in now_hashes and is_vendor(p):
+                continue   # moved, not removed
             if p not in manifest and not p.startswith("persist:"):
                 fs.append(finding("WT-I003", "Skill or plugin file removed", "info", ["AST09"], p, "missing", "Confirm you removed it."))
     else:
@@ -737,17 +745,17 @@ def lint_settings(s, where):
 
 def tool(name):
     """Find a scanner on PATH or in Watchtower's own venv/bin (where install.sh --scanners puts them)."""
-    for cand in (shutil.which(name), os.path.join(home(), ".venv", "bin", name), os.path.join(home(), "bin", name)):
+    for cand in (shutil.which(name), os.path.join(home(), "scanners", "bin", name), os.path.join(home(), ".venv", "bin", name), os.path.join(home(), "bin", name)):
         if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     return None
 
 
 ENGINE_BUDGET = int(os.environ.get("WT_ENGINE_BUDGET", "420"))   # seconds of engine time per run; the rest resumes next run
-ENGINE_CHUNK = 40                                                # skills per SkillSpector launch (each launch costs ~5s to start)
+ENGINE_CHUNK = 20                                                # skills per launch: small enough that a slow computer still saves progress every batch
 ENGINE_MAX_FILES, ENGINE_MAX_BYTES = 400, 2_000_000
-ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "30"))   # seconds one engine launch may take, plus a little per skill;
-ENGINE_LAUNCH_PER_SKILL = 2                                               # normal is ~5s to start and well under 1s per skill
+ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "60"))   # seconds one engine launch may take, plus time per skill.
+ENGINE_LAUNCH_PER_SKILL = 12                                              # measured: 0.2s per skill on a fast computer, 3.3s on a busy one
 ENGINE_HEAVY_BYTES, ENGINE_HEAVY_FILES = 400_000, 120                     # bigger skills are scanned on their own so they can't jam a batch
 STUCK_RETRY_DAYS = 7
 TIMED_OUT = "ran out of time"
@@ -908,6 +916,17 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     hashes = {d: skill_dir_hash(d) for d in targets}
     retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=STUCK_RETRY_DAYS)).isoformat()
     installed = [n for n, x in (("SkillSpector", ss_exe), ("husk", hk_exe)) if x]
+    by_hash = {}
+    for k, v in cache.items():
+        if isinstance(v, dict) and v.get("hash") and (v.get("stuck") or entry_engines(v)):
+            by_hash.setdefault(v["hash"], v)
+    for d in targets:
+        if not entry_current(cache.get(d) or {}, hashes[d], installed) and entry_current(by_hash.get(hashes[d]) or {}, hashes[d], installed):
+            cache[d] = dict(by_hash[hashes[d]])
+    alive = set(targets)
+    for k in [k for k, v in cache.items() if k not in alive and not os.path.isdir(k)]:   # folders that no longer exist
+        if sum(1 for v in cache.values() if v.get("hash") == cache[k].get("hash")) > 1:
+            del cache[k]
     todo = [d for d in targets if not entry_current(cache.get(d) or {}, hashes[d], installed)
             or (cache[d].get("stuck") and cache[d].get("at", "") < retry_before)] if installed else []
     scanned, stuck_now = 0, []
@@ -941,9 +960,8 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
                     save_json(state_path("engine_tune.json"), {"chunk": max(1, len(chunk) // 2), "at": now()})
                 break
             who = "SkillSpector" if ss_err == TIMED_OUT else "husk"
-            if len(chunk) > 1:                 # one skill in here is jamming the scanner: try the biggest alone, then the rest
-                big = max(chunk, key=lambda d: weight[d])
-                queue[:0] = [[big], [d for d in chunk if d != big]]
+            if len(chunk) > 1:                 # one skill in here is jamming the scanner: run them one at a time, biggest first
+                queue[:0] = [[d] for d in sorted(chunk, key=lambda d: weight[d], reverse=True)]
                 continue
             d = chunk[0]                       # found it: remember, report it, and stop spending every run on it
             cache[d] = {"hash": hashes[d], "stuck": who, "at": now()}
@@ -994,7 +1012,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
                                ["AST01", "AST08"], d, (" + ".join(engines) + (f"; {detail}" if detail else ""))[:150],
                                "Two independent engines agree. Disable this skill until you've read the flagged lines.", source="engines"))
         elif ss_flag:
-            out.append(finding("WT-X001", "SkillSpector: do not install", "high" if tier == "user" else "medium", ["AST01", "AST08"], d,
+            out.append(finding("WT-X001", "SkillSpector: do not install", "high" if tier == "user" else "low", ["AST01", "AST08"], d,
                                f"risk {s_.get('score')}; {detail}"[:150],
                                "Run `skillspector scan <folder>` for the exact lines; one engine alone can be wrong.", source="skillspector"))
         elif hk_flag:
@@ -1026,7 +1044,7 @@ paths = [
   '''(^|/)\.archive/(customers-export-2025\.csv|payments\.env)$''',
   '''(^|/)\.config/backup/aws-credentials\.bak$''',
   '''(^|/)(\.codex/auth\.json|\.claude/\.credentials\.json|\.config/gh/hosts\.yml|\.aws/credentials|\.git-credentials|\.netrc|\.docker/config\.json|\.npmrc)$''',
-  '''(^|/)watchtower/(state|reports|app|\.venv|bin)/''',
+  '''(^|/)watchtower/(state|reports|app|\.venv|scanners|bin)/''',
   '''chrome-cookie-seed\.json$''',
   '''\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|py)$''',
   '''(^|/)(tests?|__tests__|fixtures?|testdata)/''',
@@ -1255,7 +1273,59 @@ def ledger(event):
         f.write(json.dumps(event) + "\n")
 
 
+LOCK_STALE = 45 * 60
+
+
+class Busy(Exception):
+    pass
+
+
+def take_lock(wait=0):
+    """One Watchtower run at a time: two at once fight over the same files and slow each other's scanners."""
+    path, t0 = state_path("run.lock"), time.monotonic()
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(), "at": time.time()}).encode())
+            os.close(fd)
+            return path
+        except FileExistsError:
+            cur = load_json(path, {}) or {}
+            dead = False
+            try:
+                os.kill(int(cur.get("pid", 0)), 0)
+            except (OSError, ValueError, TypeError):
+                dead = True
+            if dead or time.time() - cur.get("at", 0) > LOCK_STALE:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() - t0 >= wait:
+                raise Busy()
+            time.sleep(2)
+
+
+def note_run_window(t_start):
+    runs = [r for r in load_json(state_path("run_windows.json"), []) if r[1] > time.time() - 3 * 86400][-60:]
+    runs.append([t_start, time.time()])
+    save_json(state_path("run_windows.json"), runs)
+
+
 def run_audit(args, quick):
+    lock, t_start = take_lock(wait=0 if quick else 900), time.time()
+    try:
+        return run_audit_locked(args, quick)
+    finally:
+        note_run_window(t_start)
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def run_audit_locked(args, quick):
     global ENGINE_BUDGET
     roots = args.roots or [os.path.expanduser("~"), "/workspace"]
     exports = args.exports or os.path.join(home(), "exports")
@@ -1342,7 +1412,11 @@ def compact(f):
 
 
 def cmd_audit(args):
-    snap, new, fixed = run_audit(args, quick=False)
+    try:
+        snap, new, fixed = run_audit(args, quick=False)
+    except Busy:
+        print("ERROR another Watchtower run has been going for 15 minutes; try again when it finishes (`wt.py status`)", file=sys.stderr)
+        return 2
     out = {"score": snap["score"], "grade": snap["grade"], "new": [compact(f) for f in new][:20],
            "fixed": [compact(f) for f in fixed][:10], "open_by_severity": by_sev(snap["findings"]),
            "top_fixes": [compact(f) for f in snap["findings"][:3]], "notes": snap["notes"], "inventory": snap["inventory"]}
@@ -1370,7 +1444,14 @@ def fit(obj, limit=4096):
 
 
 def cmd_daily(args):
-    snap, new, fixed = run_audit(args, quick=True)
+    try:
+        snap, new, fixed = run_audit(args, quick=True)
+    except Busy:
+        print("BUSY another Watchtower run is in progress; this daily check was skipped")
+        return 0
+    if snap.get("scanners_missing"):
+        print("SCANNERS_MISSING " + ", ".join(snap["scanners_missing"]) + ": run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, then `wt.py daily` again")
+        return 0
     if not new and not fixed:
         print("NO_CHANGES")
         return 0
@@ -1689,7 +1770,13 @@ def canary_findings():
         save_json(state_path("canaries.json"), reg)
         when = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="minutes")
         times = [t for _, _, t in reads]
-        if len(reads) >= 2 and len(reads) == len(reg) and max(times) - min(times) <= 180:
+        runs = load_json(state_path("run_windows.json"), [])
+        own = lambda t: any(a - 2 <= t <= b + 5 for a, b in runs)
+        if all(own(t) for t in times):
+            out.append(finding("WT-K005", "Decoys read while Watchtower was scanning", "low", ["ASI03"], os.path.dirname(reads[0][1]),
+                               f"{len(reads)} decoys at {when(min(times))}, during a Watchtower run",
+                               "Watchtower's own scanners read every file. If you didn't expect a Watchtower run then, run /watchtower-incident."))
+        elif len(reads) >= 2 and len(reads) == len(reg) and max(times) - min(times) <= 180:
             out.append(finding("WT-K004", "A bulk file search opened every decoy", "low", ["ASI03"], os.path.dirname(reads[0][1]),
                                f"{len(reads)} decoys within {int(max(times) - min(times))}s at {when(min(times))}",
                                "Usually a Bot searching all files (grep, a scan, a cleanup). If nobody was doing that then, run /watchtower-incident."))
@@ -2595,6 +2682,7 @@ PLAIN = {
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Run /watchtower-fix: it re-scans it with every engine and re-approves it if clean.", "you"),
     "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it updates each project's lockfile and keeps a backup.", "fix"),
     "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it upgrades them and puts any upgrade back that breaks something.", "fix"),
+    "WT-K005": ("Watchtower's own scan touched the decoys", "Expected when a scan overlaps another run.", "Nothing to do.", "auto"),
     "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Run /watchtower-incident.", "you"),
     "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Run /watchtower-incident.", "you"),
     "WT-L001": ("A Bot has the risky combination", "It reads strangers' content, sees private data, and can send.", "Add Ask first on its sends, or split its jobs.", "you"),

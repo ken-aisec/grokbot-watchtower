@@ -369,6 +369,14 @@ class Features(unittest.TestCase):
             open(os.path.expanduser(v["path"])).read()
         self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K004"])   # all at once: bulk search
         self.assertEqual(wt.canary_findings(), [])  # re-armed
+        import time
+        for v in list(reg.values())[:2]:                                            # two of three, e.g. a scan of /workspace only
+            open(os.path.expanduser(v["path"])).read()
+        wt.save_json(wt.state_path("run_windows.json"), [[time.time() - 30, time.time()]])   # ...while Watchtower itself was scanning
+        self.assertEqual([(f["rule"], f["severity"]) for f in wt.canary_findings()], [("WT-K005", "low")])
+        open(target).read()
+        wt.save_json(wt.state_path("run_windows.json"), [[time.time() - 900, time.time() - 600]])   # no Watchtower run at that time
+        self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K001"])
         self.assertIsNotNone(wt.canary_copies("dump:\n" + content, "/tmp/elsewhere.txt"))
         os.remove(target)
         self.assertEqual([f["rule"] for f in wt.canary_findings()], ["WT-K002"])
@@ -676,7 +684,7 @@ class Features(unittest.TestCase):
         dirs = self._fake_engines(95)
         notes = []
         wt.engine_findings(dirs, [], notes)
-        self.assertEqual(self._launches(), [["ss", "40"], ["hk", "40"], ["ss", "40"], ["hk", "40"], ["ss", "15"], ["hk", "15"]])
+        self.assertEqual(self._launches(), [["ss", "20"], ["hk", "20"]] * 4 + [["ss", "15"], ["hk", "15"]])
         open(self.log, "w").close()
         wt.engine_findings(dirs, [], [])                                  # nothing changed: nothing launched
         self.assertEqual(self._launches(), [])
@@ -702,7 +710,7 @@ class Features(unittest.TestCase):
         self.assertEqual(self._launches(), [])
         self.assertTrue(any("95 finish on the next run" in n or "the other 95 finish" in n for n in notes), notes)
         wt.engine_findings(dirs, [], [])                                  # next run does the work
-        self.assertEqual(len(self._launches()), 6)
+        self.assertEqual(len(self._launches()), 10)
 
     def test_budget_is_checked_inside_a_batch(self):
         import time
@@ -903,6 +911,48 @@ class Features(unittest.TestCase):
             r = json.loads(o)
             self.assertEqual(r["scanners_missing"], ["SkillSpector", "husk"])
             self.assertTrue(r["notes"][0].startswith("SCANNERS MISSING"))
+
+    def test_only_one_run_at_a_time(self):
+        self._fake_engines(1)
+        wt.save_json(wt.state_path("run.lock"), {"pid": os.getpid(), "at": __import__("time").time()})   # a run is in progress
+        code, o = self.out("daily", "--roots", self.tmp)
+        self.assertTrue(o.startswith("BUSY"))
+        self.assertFalse(os.path.exists(wt.state_path("last_findings.json")))            # the skipped run wrote nothing
+        wt.save_json(wt.state_path("run.lock"), {"pid": 2 ** 22 + 12345, "at": __import__("time").time()})   # left behind by a dead run
+        code, o = self.out("daily", "--roots", self.tmp)
+        self.assertFalse(o.startswith("BUSY"))
+        self.assertFalse(os.path.exists(wt.state_path("run.lock")))
+        self.assertEqual(len(wt.load_json(wt.state_path("run_windows.json"), [])), 1)
+
+    def test_daily_says_when_scanners_are_gone(self):
+        self._fake_engines(2)
+        self.out("audit", "--roots", self.tmp)
+        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "bin"))
+        code, o = self.out("daily", "--roots", self.tmp)
+        self.assertTrue(o.startswith("SCANNERS_MISSING SkillSpector, husk"), o)
+
+    def test_builtin_plugins_that_move_or_update_are_not_noise(self):
+        self._fake_engines(2)
+        old = os.path.join(self.tmp, "sand-data", "plugins", "stripe-1.0", "skills")
+        for n in ("pay", "refund"):
+            os.makedirs(os.path.join(old, n)); open(os.path.join(old, n, "SKILL.md"), "w").write(f"# {n}\nExplain how {n} works.\n")
+        self.out("audit", "--roots", self.tmp)
+        open(self.log, "w").close()
+        os.rename(os.path.dirname(old), os.path.join(self.tmp, "sand-data", "plugins", "stripe-1.0-b7f3"))   # reinstalled under a new folder
+        self.out("audit", "--roots", self.tmp)
+        snap = wt.load_json(wt.state_path("last_findings.json"), {})
+        self.assertEqual([f["rule"] for f in snap["findings"] if f["rule"].startswith("WT-I")], [])       # moved: not new, not removed
+        self.assertEqual(self._launches(), [])                                                           # and not scanned again
+        new = os.path.join(self.tmp, "sand-data", "plugins", "stripe-1.0-b7f3", "skills")
+        open(os.path.join(new, "pay", "SKILL.md"), "a").write("Now with tips.\n")                         # the platform updates one
+        open(os.path.join(self.tmp, "sand-data", "workflows", "skill000", "SKILL.md"), "a").write("Edited by someone.\n")
+        wt.cmd_baseline(type("A", (), {"roots": [self.tmp]})())
+        open(os.path.join(new, "pay", "SKILL.md"), "a").write("And receipts.\n")
+        open(os.path.join(self.tmp, "sand-data", "workflows", "skill000", "SKILL.md"), "a").write("Edited again.\n")
+        self.out("audit", "--roots", self.tmp)
+        snap = wt.load_json(wt.state_path("last_findings.json"), {})
+        got = sorted((f["severity"], f["title"]) for f in snap["findings"] if f["rule"] == "WT-I001")
+        self.assertEqual(got, [("high", "Reviewed skill or plugin changed"), ("low", "Built-in skill or plugin updated")])
 
     def test_status_reports_progress(self):
         dirs = self._fake_engines(3)

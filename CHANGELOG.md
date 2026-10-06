@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.5 — 2026-10-06 (works on a computer that restarts)
+Found on a real computer the morning after a restart; none of it is specific to that computer.
+- One Watchtower run at a time. The daily check used to start on top of a running audit: both slowed down, both wrote the same files, and the score on disk came from whichever finished last. The daily check now prints BUSY and skips; a second audit waits.
+- Scanner batches are 20 skills (was 40) with a generous time limit, so a slow or busy computer saves progress after every batch instead of timing out with nothing. My v0.5.3 limit was too tight: at 3.3 seconds per skill a batch of 40 could never finish. A batch that does jam is re-run one skill at a time.
+- Built-in plugins are reinstalled under new folders after a restart. A built-in file that only moved is no longer listed as new and removed (that was about 1,000 lines of noise), and a skill already scanned is not scanned again just because its folder name changed.
+- A built-in skill the platform updated is a low finding ("Built-in skill or plugin updated"), not high. A change to one of your own skills is still high. One scanner disliking a built-in plugin is low, and still critical or high when two agree.
+- Decoys read while Watchtower's own scan was running are a low finding, not a critical alarm. A decoy read at any other time is still critical.
+- The scanners now install to `/workspace/watchtower/scanners` instead of `.venv`, which did not survive the restart. An existing `.venv` still works. If they do go missing, the daily check says SCANNERS_MISSING and the routine reinstalls the pinned set.
+
 ## v0.5.4 — 2026-10-06 (honest partial scans, first-run tuning)
 - Fixed: when SkillSpector and husk were missing, skills were remembered as scanned and clean, and would have been skipped once the scanners came back. Now nothing is remembered unless a scanner really ran, each result records which scanners produced it, and results left by older versions are re-checked automatically.
 - When scanners that ran last time are gone (a reset computer, a lost install), the audit says so first, marks the score as not comparable, and the audit and fix skills reinstall the pinned scanners and run again before reporting.

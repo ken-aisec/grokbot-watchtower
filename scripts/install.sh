@@ -10,10 +10,10 @@ TRUFFLEHOG_VERSION="3.97.9"
 OSV_VERSION="2.6.0"
 
 if [[ "${1:-}" == "--scanners" ]]; then
-  python3 -m venv "$WT_HOME/.venv"
-  "$WT_HOME/.venv/bin/pip" install --quiet --upgrade pip
+  python3 -m venv "$WT_HOME/scanners"
+  "$WT_HOME/scanners/bin/pip" install --quiet --upgrade pip
   # Pinned: a security tool that installs unpinned scanners is its own supply-chain risk.
-  "$WT_HOME/.venv/bin/pip" install --quiet \
+  "$WT_HOME/scanners/bin/pip" install --quiet \
     "skillspector @ git+https://github.com/NVIDIA/SkillSpector@a50b9c93835c94f7d36329f11c6599abbb9c74ee" \
     "husk-scanner==1.3.5" "pip-audit==2.10.1"
   mkdir -p "$WT_HOME/bin"
@@ -39,7 +39,7 @@ if [[ "${1:-}" == "--scanners" ]]; then
     (cd "$WT_HOME/bin" && grep " $ob\$" /tmp/osv_sums.txt | sed "s/$ob/osv-scanner/" | sha256sum -c -)
     chmod +x "$WT_HOME/bin/osv-scanner"
   fi
-  "$WT_HOME/.venv/bin/skillspector" --version && "$WT_HOME/bin/gitleaks" version || true
+  "$WT_HOME/scanners/bin/skillspector" --version && "$WT_HOME/bin/gitleaks" version || true
   echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."
   exit 0
 fi
