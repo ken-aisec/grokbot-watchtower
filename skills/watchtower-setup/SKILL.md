@@ -10,10 +10,10 @@ Tell the user up front: "Setup only writes inside /workspace/watchtower, plus th
 ## 1. Install the pinned release
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.5/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.0/scripts/install.sh
 head -40 install.sh
 ```
-Show the user those 40 lines, then run `bash install.sh v0.5.5`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
+Show the user those 40 lines, then run `bash install.sh v0.6.0`. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED, stop and report it.
 
 ## 2. Scanning engines (recommended)
 Say: "Watchtower checks skills with its own rules. These add independent checks, all pinned and installed in /workspace/watchtower only, in about two minutes:
@@ -21,7 +21,7 @@ Say: "Watchtower checks skills with its own rules. These add independent checks,
 - gitleaks: finds keys and passwords left in files.
 - TruffleHog: tells you which of those keys still work. To check a key it sends it to that key's own provider (an AWS key to AWS, a GitHub token to GitHub) and nowhere else.
 - pip-audit and OSV-Scanner: known security holes in installed software and project dependencies.
-Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`.
+Add them?" On yes: `bash /workspace/watchtower/app/scripts/install.sh --scanners`. Each tool installs on its own from a checksum lock; if one says it did not install, carry on. Watchtower works without it and the audit says which is missing.
 
 ## 3. Baseline, canaries, first audit
 1. `python3 /workspace/watchtower/app/watchtower/wt.py baseline`
@@ -42,6 +42,9 @@ Recommend these Auto Review rules (Settings → General → Auto-review → Ask 
 
 ## 6. First brief and the routines
 Run `/watchtower-brief` once so the user sees the threat brief. Then propose the four routines from the `routines/` folder (daily watch at 06:00, weekly audit and report on Sunday at 05:00, weekly tidy on Sunday at 06:00, monthly roll-call on the 1st at 05:30, in the user's time zone). The weekly tidy runs /watchtower-fix without asking each time, so say plainly what it does before creating it. Run each once as a Test run while the user watches. Create them only after the user says yes.
+
+## If anything goes wrong
+Watchtower prints one plain line starting with ERROR, never a stack trace. Run `wt.py doctor --save` and tell the user where the file is: it has no file contents, keys or skill names, and they can send it to the template's author.
 
 ## Validate
 Setup is done when `wt.py daily` prints NO_CHANGES twice in a row, `wt.py canary status` prints CANARIES_QUIET, and a report and a threat brief exist in /workspace/watchtower/reports/.

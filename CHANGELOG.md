@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.0 — 2026-10-06 (built to not break)
+One hardening release instead of more patches. Every feature stays. Before release it ran against 21 simulated computers (`tests/test_boxes.py`).
+- Hard time limit on the whole audit (9 minutes; 2.5 for the daily check). Every scanner gets only the time that is left. The quick scanners now run first and the slow skill scanners last.
+- Fail-soft: a stage that hangs, crashes or prints garbage is skipped with one line saying so, and its last results are kept. A failure never moves the score and never reports old findings as fixed. Before this, a pip-audit or OSV-Scanner timeout was read as "no problems".
+- Only what you own counts toward the score. Findings on built-in plugins and skills are listed for information. They still count when critical or high, for example two scanners agreeing a plugin is dangerous.
+- Built-in files the platform adds, updates or removes are accepted automatically when nothing flags them. A flagged update is kept open.
+- A file reached under a new folder name is recognised as the same file, for your own skills too (the skills folder changed name overnight on the test computer). The same folder reached by two names counts once.
+- Watchtower never opens pipes, sockets or devices, and unreadable, vanished or damaged files are skipped, not fatal. Damaged or half-written state files are ignored and rebuilt.
+- No stack traces. Any unexpected problem prints one plain line and saves the detail. New `wt.py doctor [--save]` writes a support snapshot with no file contents, keys or skill names.
+- Watchtower's own tools: the scanners install from `scripts/scanners.lock`, 85 packages each with exact version and checksum; pip refuses anything that doesn't match. If the lock doesn't fit the computer's Python, the pinned versions install without it and the audit says so. The audit checks the scanners' own packages for known holes and says when a newer Watchtower is out.
+- Installer: each scanner installs on its own, so one failed download no longer stops the rest. Nothing is unpacked unless its checksum passes (tested by corrupting the checksum files).
+- Packages the fix tried and couldn't upgrade become a keep-or-not question, named one by one, so build tools can be kept without keeping packages that run in a deployed app.
+- The dependency scanner no longer reads Watchtower's own backup copies of lockfiles.
+- Wording: "read-only until you say yes", since the fix does change things after approval.
+
 ## v0.5.5 — 2026-10-06 (works on a computer that restarts)
 Found on a real computer the morning after a restart; none of it is specific to that computer.
 - One Watchtower run at a time. The daily check used to start on top of a running audit: both slowed down, both wrote the same files, and the score on disk came from whichever finished last. The daily check now prints BUSY and skips; a second audit waits.

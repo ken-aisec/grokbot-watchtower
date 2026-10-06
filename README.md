@@ -2,7 +2,7 @@
 
 Every Grok Bot on your account shares one cloud computer: the same browser logins, files and command-line credentials. xAI's own docs say not to treat separate Bots as a security boundary. When you add a template, its skills and routines run with everything your other Bots are signed into, and audit logs, network allowlists and the MCP allowlist are Enterprise-only.
 
-Watchtower is a read-only security officer for that setup. It vets templates before you install them, audits your computer and every Bot on it, sets tripwires, sends a weekly threat brief, and tells you the few fixes that matter.
+Watchtower is a security officer for that setup. It is read-only until you say yes: it looks, reports and recommends, and changes something only after you approve it in the conversation. It vets templates before you install them, audits your computer and every Bot on it, sets tripwires, sends a weekly threat brief, and tells you the few fixes that matter.
 
 ## What it does
 
@@ -49,11 +49,21 @@ Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.5.5/scripts/install.sh
-head -40 install.sh && bash install.sh v0.5.5
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.0/scripts/install.sh
+head -40 install.sh && bash install.sh v0.6.0
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```
+
+## Built to not break
+
+Every computer is different, so Watchtower assumes things will go wrong and is tested against simulated computers before each release (`tests/test_boxes.py`): empty, very large, odd folder layouts, files that hang naive scanners, a restart mid-run, damaged state files, and scanners that hang, crash, print garbage or disappear.
+
+- The audit has a hard time limit. Every scanner gets only the time that is left.
+- A stage that fails is skipped with one line saying so, and its last results are kept. A failure never moves the score and never reports old findings as fixed.
+- Only what you own counts toward the score. Built-in plugins and platform updates are listed for information; they count only when two scanners agree one is dangerous.
+- One run at a time. No stack traces: one plain line, and `wt.py doctor --save` writes a snapshot you can send to the author.
+- Watchtower holds its own tools to the same standard: scanners install from a lock file with a checksum for every package (`scripts/scanners.lock`), nothing is unpacked unless its checksum passes, and the audit checks Watchtower's own scanner packages for known holes.
 
 ## CLI
 
@@ -77,6 +87,7 @@ wt.py codescan PATH           OWASP Top 10 code review
 wt.py status                  what a running audit is doing and how long each stage took
 wt.py breakdown | show RULE   findings by rule; evidence with context
 wt.py baseline                accept current skills as reviewed
+wt.py doctor [--save]         a support snapshot of this computer, safe to share (no file contents, keys or skill names)
 ```
 
 State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledger.jsonl` is an append-only record of every run: the audit trail non-Enterprise accounts don't get.

@@ -952,7 +952,8 @@ class Features(unittest.TestCase):
         self.out("audit", "--roots", self.tmp)
         snap = wt.load_json(wt.state_path("last_findings.json"), {})
         got = sorted((f["severity"], f["title"]) for f in snap["findings"] if f["rule"] == "WT-I001")
-        self.assertEqual(got, [("high", "Reviewed skill or plugin changed"), ("low", "Built-in skill or plugin updated")])
+        self.assertEqual(got, [("high", "Reviewed skill or plugin changed")])                              # yours: still high
+        self.assertTrue(any("accepted automatically" in n for n in snap["notes"]), snap["notes"])        # the built-in update: scanned, accepted
 
     def test_status_reports_progress(self):
         dirs = self._fake_engines(3)

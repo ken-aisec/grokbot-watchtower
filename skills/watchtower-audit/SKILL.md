@@ -12,6 +12,8 @@ description: Full security posture audit of this Grok Bot computer and roster - 
    - Score and grade, and the change since last run.
    - New since last run (severity, title, where).
    - The three fixes worth doing, each with the exact click path or command from `fix`.
+   - If `stages_skipped` is there, say which checks didn't finish and that their last results were kept. Don't call the score a drop or a gain because of it.
+   - `not_counted_builtin` is the number of notes about built-in plugins; mention it in half a line at most. They don't need the user.
    - Coverage gaps from `notes` in one line (for example, "SkillSpector not installed" or "no roll-call in 35 days").
    - For any finding, `wt.py show <RULE>` prints the evidence with surrounding lines (never for secrets).
 5. If the user says a finding is fine on purpose, run `wt.py accept <RULE> "<name or path>" --reason "<their words>"` (90 days by default, `--days N` to change). It stops counting against the score and appears under accepted risks until it expires, then comes back for a re-check. Only do this with the user's yes, one finding at a time. `wt.py accept --list` shows what's accepted.

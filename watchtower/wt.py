@@ -13,12 +13,13 @@ Commands
   fix                   preview, then one-yes cleanup, upgrades, re-vet of changed skills
   diff SKILL            what changed in a skill since it was approved
   exception add SKILL   owner-confirmed 30-day exception for one security-tool skill
+  doctor [--save]       a support snapshot of this computer that is safe to share
 
 State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
-import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.5.5"
+VERSION = "0.6.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -50,11 +51,15 @@ def state_path(*p):
 
 
 def load_json(path, default):
+    """Read a state file. A missing, half-written or wrong-shaped file (a restart mid-save) counts as not there."""
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return default
+    if default is not None and data is not None and isinstance(default, (dict, list)) and not isinstance(data, type(default)):
+        return default
+    return data
 
 
 def save_json(path, obj):
@@ -75,20 +80,27 @@ def load_rules():
 
 
 def sha256_file(path):
+    """Fingerprint of a file. A file that can't be read (no permission, vanished, a broken link) gets a marker instead of an error."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return "unreadable:not-a-regular-file"
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError as e:
+        return "unreadable:" + (e.strerror or "error").replace(" ", "-")[:30]
     return h.hexdigest()
 
 
 def read_text(path, limit=1_000_000):
     try:
-        if os.path.getsize(path) > limit:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:   # never open a pipe, socket or device: it would block
             return None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -363,7 +375,12 @@ def walk(roots, max_depth=8):
                 dirnames[:] = []
                 continue
             for fn in filenames:
-                yield os.path.join(dirpath, fn)
+                p = os.path.join(dirpath, fn)
+                try:
+                    if stat.S_ISREG(os.stat(p).st_mode):
+                        yield p
+                except OSError:
+                    continue   # vanished, a broken link, or no permission
 
 
 def is_skill_file(path):
@@ -386,7 +403,16 @@ def collect_inventory(roots):
         elif fn in ("plugin.json", "marketplace.json") or "/.grok-plugin/" in p or "/.cursor-plugin/" in p:
             inv["plugin_files"].append(p)
     for k in inv:
-        inv[k] = sorted(set(inv[k]))
+        seen, out = set(), []
+        for p in sorted(set(inv[k])):
+            try:
+                real = os.path.realpath(p)
+            except OSError:
+                real = p
+            if real not in seen:      # the same file reached through a linked folder counts once
+                seen.add(real)
+                out.append(p)
+        inv[k] = out
     return inv
 
 
@@ -400,7 +426,17 @@ def skill_dir_files(skill_md):
     return sorted(files)[:200]
 
 
+RUN_LIMIT = int(os.environ.get("WT_RUN_LIMIT", "540"))     # seconds a full audit may take, whatever is installed or broken
+DAILY_LIMIT = int(os.environ.get("WT_DAILY_LIMIT", "150"))
+DEADLINE = None                                             # set for the length of one audit
+
+
+def time_left(default=10 ** 6):
+    return default if DEADLINE is None else DEADLINE - time.monotonic()
+
+
 def run(cmd, timeout=120, cwd=None):
+    timeout = max(1, min(timeout, time_left()))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         return r.returncode, r.stdout, r.stderr
@@ -522,8 +558,8 @@ def audit(roots, exports, quick=False):
         for p, h in manifest.items():
             if own_release_file(p, h):
                 continue   # Watchtower's own skill, identical to the checksummed release it was installed from
-            if p not in base and h in base_hashes and is_vendor(p):
-                continue   # a built-in file that only moved (plugins are reinstalled under new folders after a restart)
+            if p not in base and h in base_hashes and not h.startswith("unreadable"):
+                continue   # the same file under a new folder name (plugins are reinstalled under new folders after a restart)
             if p in base and base[p] != h and is_vendor(p):
                 fs.append(finding("WT-I001", "Built-in skill or plugin updated", "low", ["AST07"], p, f"sha256 {base[p][:12]}→{h[:12]}",
                                   "Usually the platform or a plugin update. The scanners re-check the new version; /watchtower-fix re-approves it if clean."))
@@ -537,7 +573,7 @@ def audit(roots, exports, quick=False):
         for p in base:
             if any(x in p for x in SKIP_PATH_PARTS):
                 continue
-            if p not in manifest and base[p] in now_hashes and is_vendor(p):
+            if p not in manifest and base[p] in now_hashes:
                 continue   # moved, not removed
             if p not in manifest and not p.startswith("persist:"):
                 fs.append(finding("WT-I003", "Skill or plugin file removed", "info", ["AST09"], p, "missing", "Confirm you removed it."))
@@ -633,16 +669,24 @@ def audit(roots, exports, quick=False):
     user_dirs = [os.path.dirname(x) for x in inv["skills"] if skill_tier(x) == "user"]
     user_roots = sorted({x.split("/workflows/")[0] + "/workflows" for x in user_dirs if "/workflows/" in x})
     if not quick:
-        fs += timed("SkillSpector and husk", engine_findings, user_dirs + sorted(changed), fs, notes, user_roots)
-        fs += timed("gitleaks (keys in files)", gitleaks_findings, roots, notes)
-        fs += timed("pip-audit (installed Python packages)", package_findings, notes)
-        fs += timed("OSV-Scanner (project dependencies)", osv_findings, roots, notes)
+        # The quick scanners go first and the slow skill scanners last, each with only the time that is left.
+        fs += soft("gitleaks (keys in files)", ("WT-S002",), notes, [], gitleaks_findings, roots, notes)
+        fs += soft("pip-audit (installed Python packages)", ("WT-D001",), notes, [], package_findings, notes)
+        fs += soft("OSV-Scanner (project dependencies)", ("WT-D002",), notes, [], osv_findings, roots, notes)
+        fs += soft("Watchtower's own tools", ("WT-W001",), notes, [], self_findings, notes)
         secret_paths = [f["where"].split(":")[0] for f in fs if f["rule"] in ("WT-S001", "WT-S002")]
-        fs = apply_key_status(fs, timed("TruffleHog (which keys still work)", trufflehog_status, secret_paths, notes), ran=bool(tool("trufflehog")))
+        ks = soft("TruffleHog (which keys still work)", (), notes, None, trufflehog_status, secret_paths, notes)
+        if ks is None or "TruffleHog (which keys still work)" in STAGE_FAILED:
+            old = load_json(state_path("key_status.json"), {}) or {}
+            fs = apply_key_status(fs, old.get("files", {}), ran=bool(old.get("ran")))
+        else:
+            fs = apply_key_status(fs, ks, ran=bool(tool("trufflehog")))
+        fs += soft("SkillSpector and husk", ("WT-X001", "WT-X002", "WT-X003", "WT-X004"), notes, [], engine_findings,
+                   user_dirs + sorted(changed), fs, notes, user_roots, budget=max(0, min(ENGINE_BUDGET, time_left() - 20)))
         set_progress("finishing", 0, 0)
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
     elif changed:
-        fs += engine_findings(sorted(changed), fs, notes, budget=min(ENGINE_BUDGET, 120))
+        fs += soft("SkillSpector and husk", (), notes, [], engine_findings, sorted(changed), fs, notes, budget=max(0, min(ENGINE_BUDGET, 120, time_left() - 10)))
     if quick:
         ks = load_json(state_path("key_status.json"), {}) or {}
         fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
@@ -759,6 +803,34 @@ ENGINE_LAUNCH_PER_SKILL = 12                                              # meas
 ENGINE_HEAVY_BYTES, ENGINE_HEAVY_FILES = 400_000, 120                     # bigger skills are scanned on their own so they can't jam a batch
 STUCK_RETRY_DAYS = 7
 TIMED_OUT = "ran out of time"
+
+
+STAGE_FAILED = []        # stages that did not finish in the current run
+
+
+def carry(rules):
+    """Last run's findings for rules whose stage didn't finish this time: unknown is not the same as fixed."""
+    prev = load_json(state_path("last_findings.json"), {}) or {}
+    return [f for f in (prev.get("findings") or []) + (prev.get("suppressed") or []) if f.get("rule") in rules]
+
+
+def soft(stage, rules, notes, default, fn, *a, **k):
+    """Fail-soft: a stage either finishes, or it is skipped with one line saying so and its previous results are kept.
+    It can never stop the audit or change the score by failing."""
+    before = len(notes)
+    try:
+        if time_left() <= 3:
+            raise TimeoutError("the run's time limit was reached before this stage started")
+        res = timed(stage, fn, *a, **k)
+        failed = any("FAILED" in n for n in notes[before:])
+    except Exception as e:   # noqa: BLE001 - nothing a scanner or a strange file does may break the audit
+        res, failed = default, True
+        notes.append(f"{stage} FAILED ({type(e).__name__}: {str(e)[:100]}): skipped, NOT checked this run; the last results are kept.")
+    if failed:
+        STAGE_FAILED.append(stage)
+        if isinstance(res, list):
+            res = res + carry(rules)
+    return res
 
 
 def timed(stage, fn, *a, **k):
@@ -1112,7 +1184,7 @@ def gitleaks_findings(roots, notes):
         except OSError:
             pass
         code, _, err = run([exe, "detect", "--source", r, "--no-git", "--redact", "--config", cfg, "--report-format", "json",
-                            "--report-path", tmp, "--exit-code", "0", "--max-target-megabytes", "5"], 600)
+                            "--report-path", tmp, "--exit-code", "0", "--max-target-megabytes", "5"], 180)
         if code != 0 or not os.path.exists(tmp):
             reason = next((l for l in re.sub(r"\x1b\[[0-9;]*m", "", err).splitlines() if "FTL" in l or "error" in l.lower()), err.strip()[:160] or "no report written")
             notes.append(f"gitleaks FAILED on {r} ({reason.strip()[-160:]}): secrets there were NOT checked by gitleaks.")
@@ -1170,12 +1242,15 @@ def package_findings(notes):
     req = state_path("installed-requirements.txt")
     with open(req, "w") as f:
         f.write("\n".join(f"{n}=={v}" for n, v in sorted(pkgs.items())))
-    code, out_s, _ = run([exe, "-r", req, "--no-deps", "--disable-pip", "-f", "json", "--progress-spinner", "off"], 600)
+    code, out_s, err = run([exe, "-r", req, "--no-deps", "--disable-pip", "-f", "json", "--progress-spinner", "off"], 120)
     out = []
     try:
-        data = json.loads(out_s) if out_s.strip() else {}
+        data = json.loads(out_s)
+        if not isinstance(data, dict):
+            raise ValueError
     except ValueError:
-        data = {}
+        notes.append(f"pip-audit FAILED ({(err.strip().splitlines() or ['no answer'])[-1][:120]}): installed Python packages were NOT checked this run.")
+        return []
     for d in (data.get("dependencies", []) if isinstance(data, dict) else []):
         vulns = d.get("vulns", [])
         if not vulns:
@@ -1187,6 +1262,53 @@ def package_findings(notes):
                            f"Upgrade to {fixes[-1]} or later." if fixes else "No fixed version yet; remove it if nothing needs it.",
                            source="pip-audit"))
     save_json(state_path("package_vulns.json"), {"at": now(), "packages": len(pkgs), "findings": out})
+    return out
+
+
+def scanners_python():
+    for d in ("scanners", ".venv"):
+        py = os.path.join(home(), d, "bin", "python")
+        if os.path.isfile(py):
+            return py
+    return None
+
+
+def self_findings(notes):
+    """Watchtower holds its own tools to the same standard: known holes in the scanners' packages, and whether they were
+    installed from the checksum lock."""
+    py, exe, out = scanners_python(), tool("pip-audit"), []
+    if not py:
+        return out
+    if not os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(py)), "LOCKED")):
+        out.append(finding("WT-W002", "Watchtower's scanners were installed without the checksum lock", "low", ["ASI04", "AST02"], "watchtower scanners",
+                           "no LOCKED marker", "Run `bash /workspace/watchtower/app/scripts/install.sh --scanners` again; it uses the lock when this computer's Python matches it."))
+    if not exe:
+        return out
+    code, out_s, _ = run([py, "-m", "pip", "list", "--format", "json", "--disable-pip-version-check"], 60)
+    try:
+        pkgs = {p_["name"]: p_["version"] for p_ in json.loads(out_s)}
+    except (ValueError, KeyError, TypeError):
+        notes.append("Watchtower's own tools FAILED to list their packages: they were NOT checked this run.")
+        return out
+    req = state_path("scanner-requirements.txt")
+    with open(req, "w") as f:
+        f.write("\n".join(f"{n}=={v}" for n, v in sorted(pkgs.items()) if n.lower() != "skillspector"))
+    code, out_s, err = run([exe, "-r", req, "--no-deps", "--disable-pip", "-f", "json", "--progress-spinner", "off"], 90)
+    try:
+        data = json.loads(out_s)
+        deps = data.get("dependencies", [])
+    except (ValueError, AttributeError):
+        notes.append(f"Watchtower's own tools FAILED their package check ({(err.strip().splitlines() or ['no answer'])[-1][:100]}): NOT checked this run.")
+        return out
+    for d in deps:
+        if d.get("vulns"):
+            ids = list(dict.fromkeys(v.get("id", "") for v in d["vulns"]))
+            out.append(finding("WT-W001", f"Watchtower's own tool needs an update: {d.get('name')} {d.get('version')}", "low", ["ASI04", "AST02"],
+                               "watchtower scanners", f"{len(ids)} known: {', '.join(ids[:3])}",
+                               "Update Watchtower: each release carries newer pinned scanners. This package lives only in Watchtower's own folder.", source="pip-audit"))
+    upd = [u for u in (load_json(state_path("last_brief.json"), {}) or {}).get("updates", []) if "watchtower" in u.get("name", "").lower()]
+    if upd:
+        notes.append(f"A newer Watchtower is out ({upd[0].get('have')} → {upd[0].get('latest')}). Run /watchtower-setup to update.")
     return out
 
 
@@ -1205,6 +1327,52 @@ def find_key(obj, keys):
             if r is not None:
                 return r
     return None
+
+
+def builtin(f):
+    """Shipped by the platform or a plugin, not made or installed by hand by the user."""
+    return any(x in f.get("where", "") for x in VENDOR_CODE)
+
+
+def counts(f):
+    """Only what the user owns moves the score. Built-in findings count when they are critical or high (two scanners
+    agreeing a plugin is dangerous still matters); the rest are listed for information."""
+    return not builtin(f) or f["severity"] in ("critical", "high")
+
+
+def roll_builtin(fs, meta, notes):
+    """Built-in files the platform added, updated or removed are accepted on their own when nothing flags them, so they
+    don't pile up as hundreds of lines for the user to approve."""
+    base = load_json(state_path("baseline.json"), {})
+    if not base:
+        return fs
+    cache = load_json(state_path("engine_cache.json"), {}) or {}
+    installed = [n for n, t in (("SkillSpector", "skillspector"), ("husk", "husk")) if tool(t)]
+    flagged = set()
+    for f in fs:
+        if f["rule"].startswith("WT-I") or f["severity"] not in ("critical", "high", "medium"):
+            continue
+        w = f["where"].split(":")[0]
+        flagged.update({w, skill_root(w) or w})
+    keep, rolled = [], 0
+    for f in fs:
+        w = f["where"].split(":")[0]
+        if f["rule"] in ("WT-I001", "WT-I002", "WT-I003") and builtin(f):
+            root = skill_root(w)
+            checked = (not root) or (not installed) or entry_current(cache.get(root) or {}, skill_dir_hash(root), installed)
+            if w not in flagged and (root or w) not in flagged and checked:
+                if f["rule"] == "WT-I003":
+                    base.pop(w, None)
+                elif w in meta["manifest"]:
+                    base[w] = meta["manifest"][w]
+                rolled += 1
+                continue
+        keep.append(f)
+    if rolled:
+        save_json(state_path("baseline.json"), base)
+        notes.append(f"{rolled} built-in plugin or skill files were added, updated or removed by the platform. Nothing flagged them, so they were accepted automatically.")
+        ledger({"event": "builtin-roll", "files": rolled})
+    return keep
 
 
 def is_accepted(f, sup, today):
@@ -1330,13 +1498,16 @@ def run_audit_locked(args, quick):
     roots = args.roots or [os.path.expanduser("~"), "/workspace"]
     exports = args.exports or os.path.join(home(), "exports")
     start = dt.datetime.now()
+    global DEADLINE
     saved = ENGINE_BUDGET
+    del STAGE_FAILED[:]
     try:
+        DEADLINE = time.monotonic() + (DAILY_LIMIT if quick else RUN_LIMIT)
         if getattr(args, "budget", None) is not None:
             ENGINE_BUDGET = max(0, args.budget)
         fs, meta = audit(roots, exports, quick=quick)
     finally:
-        ENGINE_BUDGET = saved
+        ENGINE_BUDGET, DEADLINE = saved, None
     if quick:  # the daily run skips the slow engines; keep their last results instead of calling them fixed
         prev_snap = load_json(state_path("last_findings.json"), {"findings": []})
         have = {f["key"] for f in fs}
@@ -1345,13 +1516,18 @@ def run_audit_locked(args, quick):
             if f["rule"] in SLOW_RULES and f["key"] not in have and f["where"] not in rescanned:
                 fs.append(f)
         fs = sort_findings(fs)
+    if not quick and "SkillSpector and husk" not in STAGE_FAILED:
+        fs = roll_builtin(fs, meta, meta["notes"])
+    for f in fs:
+        if builtin(f):
+            f["scope"] = "builtin"
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys = {f["key"] for f in prev.get("findings", [])}
     cur_keys = {f["key"] for f in live}
     new = [f for f in live if f["key"] not in prev_keys and f["severity"] != "info"]
     fixed = [f for f in prev.get("findings", []) if f["key"] not in cur_keys]
-    s, g = score(live)
+    s, g = score([f for f in live if counts(f)])
     if not load_json(state_path("baseline.json"), {}):
         save_json(state_path("baseline.json"), meta["manifest"])
         save_approved_all(meta.get("skill_dirs", []))
@@ -1359,7 +1535,7 @@ def run_audit_locked(args, quick):
         drifted = {skill_root(f["where"].split(":")[0]) for f in fs if f["rule"] in ("WT-I001", "WT-I002", "WT-I003")}
         save_approved_all([d for d in meta.get("skill_dirs", []) if os.path.normpath(d) not in drifted and not os.path.exists(approved_path(d))])
     snapshot = {"at": now(), "version": VERSION, "score": s, "grade": g, "findings": live, "suppressed": suppressed,
-                "scanners_missing": meta.get("scanners_missing", []),
+                "scanners_missing": meta.get("scanners_missing", []), "stages_skipped": list(STAGE_FAILED),
                 "inventory": meta["inventory"], "notes": meta["notes"]}
     save_json(state_path("last_findings.json"), snapshot)
     with open(state_path("score_history.csv"), "a") as f:
@@ -1425,6 +1601,9 @@ def cmd_audit(args):
         out["security_tool_exceptions"] = exc
     if snap.get("scanners_missing"):
         out["scanners_missing"] = snap["scanners_missing"]
+    if snap.get("stages_skipped"):
+        out["stages_skipped"] = snap["stages_skipped"]
+    out["not_counted_builtin"] = sum(1 for f in snap["findings"] if not counts(f))
     print(fit(out))
     return 0
 
@@ -1573,6 +1752,12 @@ def render_md(snap, hist, tag):
         lines += ["", "Hygiene notes (low): " + "; ".join(f"{t} ×{n}" for (r, t), n in sorted(by_rule.items(), key=lambda x: -x[1]))]
     inv = snap.get("inventory", {})
     lines += ["", "## Inventory", "", f"Skills on disk: {inv.get('skills', 0)} · plugin files: {inv.get('plugin_files', 0)} · MCP configs: {inv.get('mcp_configs', 0)}"]
+    fyi = [f for f in snap["findings"] if not counts(f)]
+    if fyi:
+        lines += ["", "## Built-in plugins and skills (for your information, not counted in the score)", "",
+                  f"{len(fyi)} notes about software the platform or a plugin shipped. Nothing here needs you. `wt.py breakdown` lists them."]
+    if snap.get("stages_skipped"):
+        lines += ["", "## Skipped this run", ""] + [f"- {x}: did not finish, so its last results were kept." for x in snap["stages_skipped"]]
     exc = exceptions_active(snap)
     if exc:
         lines += ["", "## Security-tool exceptions", ""] + [
@@ -2518,7 +2703,11 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
                 if rel_kev else "None of this week's actively exploited bugs affect software like yours.")
     exc = exceptions_active(snap or {})
     accepted = [f for f in accepted if not f.get("exception")]
-    acc_html = "".join(f"<p class='small'><b>⚠ Security-tool exception:</b> {e(x['skill'])} is flagged by two scanners. You confirmed it is a security tool. "
+    fyi_n = sum(1 for f in (snap or {}).get("findings", []) if not counts(f))
+    skipped = (snap or {}).get("stages_skipped", [])
+    acc_html = (f"<p class='small'><b>Skipped this run:</b> {e(', '.join(skipped))}. Their last results were kept, so the score didn't move because of it.</p>" if skipped else "")
+    acc_html += (f"<p class='small'>{fyi_n} notes about built-in plugins and skills are listed for information and not counted in the score.</p>" if fyi_n else "")
+    acc_html += "".join(f"<p class='small'><b>⚠ Security-tool exception:</b> {e(x['skill'])} is flagged by two scanners. You confirmed it is a security tool. "
                        f"Ends {e(x['until'])} ({x['days_left']} days) or when the skill changes.</p>" for x in exc)
     acc_html += ("<details><summary>" + f"{len(accepted)} accepted {'risk' if len(accepted) == 1 else 'risks'}</summary><ul class='small'>" +
                  "".join(f"<li>{e(plain(f)['title'])}</li>" for f in accepted) + "</ul></details>") if accepted else ""
@@ -2678,6 +2867,7 @@ PLAIN = {
     "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
     "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it. If it is a security tool of yours, /watchtower-fix can keep it for 30 days.", "you"),
+    "WT-W001": ("Watchtower's own tools need an update", "They live only in Watchtower's folder.", "Update Watchtower with /watchtower-setup.", "auto"),
     "WT-X004": ("A scanner couldn't get through a skill", "Watchtower's own rules still checked it.", "Nothing to do; Watchtower retries it in a week.", "auto"),
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Run /watchtower-fix: it re-scans it with every engine and re-approves it if clean.", "you"),
     "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it updates each project's lockfile and keeps a backup.", "fix"),
@@ -2811,7 +3001,7 @@ def needs_you(findings, limit=None):
     """Group open findings into plain to-dos for the person, most serious first."""
     groups = {}
     for f in findings:
-        if f["severity"] not in ("critical", "high", "medium"):
+        if f["severity"] not in ("critical", "high", "medium") or not counts(f):
             continue
         pl = plain(f)
         g = groups.setdefault(pl["title"], {"title": pl["title"], "why": pl["why"], "how": pl["how"], "severity": f["severity"],
@@ -2854,7 +3044,7 @@ def trufflehog_status(paths, notes):
     if not targets:
         save_json(state_path("key_status.json"), {"at": now(), "ran": True, "files": {}})
         return {}
-    code, out_s, err = run([exe, "filesystem", *targets, "--json", "--no-update", "--results=verified,unverified,unknown"], 600)
+    code, out_s, err = run([exe, "filesystem", *targets, "--json", "--no-update", "--results=verified,unverified,unknown"], 150)
     if code not in (0, 183) and not out_s.strip():
         notes.append(f"TruffleHog FAILED ({err.strip()[-140:] or 'no output'}): live/dead key status is unavailable this run.")
         return {}
@@ -2916,7 +3106,7 @@ def apply_key_status(findings, status, ran=None):
     return out
 
 
-OSV_SKIP = ("/.cursor/", "/skill-hunt", "/skill-review", "/candidates/", "/spike/", "/node_modules/", "/vendor/")
+OSV_SKIP = ("/watchtower/backups/", "/watchtower/state/", "/watchtower/app/", "/watchtower/scanners/", "/.cursor/", "/skill-hunt", "/skill-review", "/candidates/", "/spike/", "/node_modules/", "/vendor/")
 
 
 def osv_findings(roots, notes):
@@ -2932,9 +3122,13 @@ def osv_findings(roots, notes):
         r = os.path.expanduser(r)
         if not os.path.isdir(r) or r.rstrip("/") == os.path.expanduser("~"):
             continue  # projects live in /workspace; home is mostly caches
-        code, out_s, err = run([exe, "scan", "source", "-r", r, "--format", "json"], 600)
+        code, out_s, err = run([exe, "scan", "source", "-r", r, "--format", "json"], 150)
         try:
+            if code in (124, 127) or (not out_s.strip() and code not in (0, 1, 128)):
+                raise ValueError
             data = json.loads(out_s) if out_s.strip() else {}
+            if not isinstance(data, dict):
+                raise ValueError
         except ValueError:
             notes.append(f"OSV-Scanner FAILED on {r} ({err.strip()[-120:] or 'unreadable output'}): project dependencies there were NOT checked.")
             continue
@@ -3042,8 +3236,19 @@ def acceptable(f):
     return f["rule"] in ACCEPTABLE_RULES or (f["rule"] in ("WT-S001", "WT-S002") and f["title"] in (KEY_MAYBE, KEY_UNSURE))
 
 
+def upgrade_tried():
+    """Package findings the fix already tried and couldn't upgrade (within 30 days): those become a keep-or-not decision."""
+    st = load_json(state_path("upgrade_left.json"), {}) or {}
+    if st.get("at", "") < (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat():
+        return {"npm": False, "pip": []}
+    return {"npm": bool(st.get("npm")), "pip": st.get("pip", [])}
+
+
 def fix_class(f):
     if f["rule"] in ("WT-D001", "WT-D002"):
+        t = upgrade_tried()
+        if (f["rule"] == "WT-D002" and t["npm"]) or (f["rule"] == "WT-D001" and any(f["title"].startswith(f"Vulnerable package {n} ") for n in t["pip"])):
+            return "decision"
         return "upgrade"
     if f["rule"] in ("WT-A003", "WT-A005"):
         return "ask_first"
@@ -3500,6 +3705,12 @@ def cmd_fix(args):
                            "[--exception <skill they named>] --reason \"reviewed by owner\""}, limit=6000))
         return 0
     done = apply_fix(plan) if args.apply else []
+    if args.upgrade:
+        py_done = upgrade_python(ups) if ups else []
+        npm_done = upgrade_npm(projs) if projs else []
+        done += py_done + npm_done
+        save_json(state_path("upgrade_left.json"), {"at": now(), "npm": any("left" in x or "put it back" in x or not re.search(r"→ 0\.", x) for x in npm_done),
+                                                    "pip": [u["name"] for u in ups if not any(x.startswith(f"Upgraded {u['name']} ") and "put" not in x for x in py_done)]})
     if args.revet:
         for r in revet(sorted(ch_skills), approve=True):
             if r["result"] == "re-approved":
@@ -3511,9 +3722,6 @@ def cmd_fix(args):
     for name in [x.strip() for x in (args.exception or "").split(",") if x.strip()]:
         ok, msg = add_exception(name, args.reason or "confirmed by owner as a security tool")
         done.append(msg)
-    if args.upgrade:
-        done += upgrade_python(ups) if ups else []
-        done += upgrade_npm(projs) if projs else []
     if args.accept:
         rules = [r.strip() for r in args.accept.split(",") if r.strip()]
         n, skipped, exp = accept_current(rules, args.reason or "reviewed by owner")
@@ -3524,8 +3732,101 @@ def cmd_fix(args):
     return 0
 
 
+# ---------------------------------------------------------------- doctor: what this computer looks like, safe to share
+STATE_FILES = ("baseline.json", "last_findings.json", "engine_cache.json", "suppressions.json", "canaries.json", "events.json",
+               "engines_used.json", "stage_times.json", "progress.json", "key_status.json", "run_windows.json")
+
+
+def cmd_doctor(args):
+    """A support snapshot with no file contents, no keys and no skill names: versions, which folders exist, which scanners
+    are installed, whether the state files are healthy, and how the last run went."""
+    h = os.path.expanduser("~")
+    def state_of(fn):
+        p = state_path(fn)
+        if not os.path.exists(p):
+            return "missing"
+        try:
+            with open(p) as f:
+                json.load(f)
+            return "ok"
+        except (OSError, ValueError):
+            return "damaged (ignored and rebuilt on the next run)"
+    snap = load_json(state_path("last_findings.json"), {}) or {}
+    folders = {}
+    for d in ("sand-data", "agent-data", ".agents", ".grok", ".cursor"):
+        p = os.path.join(h, d)
+        if os.path.lexists(p):
+            folders["~/" + d] = "link" if os.path.islink(p) else "folder"
+            for sub in ("workflows", "plugins", "managed-skills", "skills", "agent-transcripts"):
+                q = os.path.join(p, sub)
+                if os.path.isdir(q):
+                    try:
+                        folders[f"~/{d}/{sub}"] = f"{len(os.listdir(q))} entries"
+                    except OSError:
+                        folders[f"~/{d}/{sub}"] = "no permission"
+    try:
+        probe = state_path(".write-test")
+        open(probe, "w").close(); os.remove(probe)
+        writable = True
+    except OSError:
+        writable = False
+    lock = load_json(state_path("run.lock"), None)
+    out = {"watchtower": VERSION, "python": platform.python_version(), "system": f"{platform.system()} {platform.machine()}",
+           "home_is": h.replace(os.path.basename(h), "<user>") if h.count("/") > 1 else h, "watchtower_home": home(), "can_write_state": writable,
+           "workspace_exists": os.path.isdir("/workspace"), "folders": folders,
+           "scanners": {n: bool(tool(t)) for n, t in (("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"),
+                                                       ("TruffleHog", "trufflehog"), ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner"))},
+           "scanners_from_checksum_lock": bool(scanners_python()) and os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(scanners_python())), "LOCKED")),
+           "tools": {t: bool(shutil.which(t)) for t in ("git", "curl", "npm", "pip3")},
+           "state_files": {fn: state_of(fn) for fn in STATE_FILES},
+           "run_in_progress": bool(lock),
+           "last_run": {"at": snap.get("at"), "version": snap.get("version"), "score": snap.get("score"), "open_by_severity": by_sev(snap.get("findings", [])) if snap else None,
+                        "inventory": snap.get("inventory"), "scanners_missing": snap.get("scanners_missing"), "stages_skipped": snap.get("stages_skipped"),
+                        "notes": [re.sub(r"(/[\w.@~-]+){2,}", "<path>", n)[:160] for n in snap.get("notes", [])][:12]},
+           "seconds_per_stage": load_json(state_path("stage_times.json"), None), "last_engine_run": load_json(state_path("engines.json"), None),
+           "last_error": (read_text(state_path("last_error.txt")) or "")[-1200:] or None}
+    text = json.dumps(out, indent=1)
+    if args.save:
+        os.makedirs(os.path.join(home(), "reports"), exist_ok=True)
+        p = os.path.join(home(), "reports", f"support-{dt.date.today().isoformat()}.json")
+        with open(p, "w") as f:
+            f.write(text)
+        print(f"Saved {p}. It has no file contents, keys or skill names; read it before you share it.")
+    else:
+        print(text)
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
+    """Never show a stack trace to the Bot or the user: one plain line, the detail saved for `wt.py doctor`."""
+    try:
+        return main_inner(argv)
+    except SystemExit:
+        raise
+    except BrokenPipeError:
+        return 0
+    except Exception as e:   # noqa: BLE001
+        detail = traceback.format_exc()
+        try:
+            with open(state_path("last_error.txt"), "w") as f:
+                f.write(f"{now()} wt.py {' '.join((argv or sys.argv[1:])[:3])} (v{VERSION})\n{detail}")
+            where = " The detail is saved; `wt.py doctor --save` makes a file you can send to the author."
+        except OSError:
+            where = ""
+        kind = "Watchtower can't write to its folder " + home() if isinstance(e, OSError) and not where else f"Watchtower hit a problem it didn't expect ({type(e).__name__})"
+        print(f"ERROR {kind}. Nothing was changed.{where}", file=sys.stderr)
+        return 3
+    finally:
+        try:
+            cur = load_json(state_path("run.lock"), None)
+            if cur and cur.get("pid") == os.getpid():
+                os.remove(state_path("run.lock"))
+        except OSError:
+            pass
+
+
+def main_inner(argv=None):
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3545,6 +3846,7 @@ def main(argv=None):
     fx.add_argument("--revet", action="store_true", help="re-scan changed skills with every engine and re-approve the clean ones")
     fx.add_argument("--exception", help="skill name(s) the owner confirmed as security tools (30 days)")
     df = sub.add_parser("diff"); df.add_argument("skill"); df.add_argument("--lines", type=int, default=120)
+    dr = sub.add_parser("doctor"); dr.add_argument("--save", action="store_true")
     xc = sub.add_parser("exception"); xc.add_argument("action", choices=["add", "list", "remove"]); xc.add_argument("name", nargs="?"); xc.add_argument("--reason")
     ac = sub.add_parser("accept"); ac.add_argument("rule", nargs="?"); ac.add_argument("where", nargs="?")
     ac.add_argument("--reason"); ac.add_argument("--days", type=int, default=90); ac.add_argument("--list", action="store_true"); ac.add_argument("--remove", action="store_true"); ac.add_argument("--all-current", action="store_true")
@@ -3558,7 +3860,7 @@ def main(argv=None):
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
             "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status,
-            "diff": cmd_diff, "exception": cmd_exception}[a.cmd](a)
+            "diff": cmd_diff, "exception": cmd_exception, "doctor": cmd_doctor}[a.cmd](a)
 
 
 if __name__ == "__main__":
