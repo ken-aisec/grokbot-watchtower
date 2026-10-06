@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
-TAG="v0.5.2"
+TAG="v0.5.3"
 echo "Publishing $REPO ($TAG)"
 if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
   grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"

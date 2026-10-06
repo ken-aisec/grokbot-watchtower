@@ -18,7 +18,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, re, shutil, subprocess, sys, tempfile, time
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -519,6 +519,8 @@ def audit(roots, exports, quick=False):
     base = load_json(state_path("baseline.json"), {})
     if base:
         for p, h in manifest.items():
+            if own_release_file(p, h):
+                continue   # Watchtower's own skill, identical to the checksummed release it was installed from
             if p in base and base[p] != h:
                 fs.append(finding("WT-I001", "Reviewed skill or plugin changed", "high", ["AST07"], p,
                                   f"sha256 {base[p][:12]}→{h[:12]}",
@@ -737,7 +739,10 @@ def tool(name):
 ENGINE_BUDGET = int(os.environ.get("WT_ENGINE_BUDGET", "420"))   # seconds of engine time per run; the rest resumes next run
 ENGINE_CHUNK = 40                                                # skills per SkillSpector launch (each launch costs ~5s to start)
 ENGINE_MAX_FILES, ENGINE_MAX_BYTES = 400, 2_000_000
-ENGINE_HARD_LIMIT = 600                                          # one engine launch never runs longer than this, whatever the budget
+ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "30"))   # seconds one engine launch may take, plus a little per skill;
+ENGINE_LAUNCH_PER_SKILL = 2                                               # normal is ~5s to start and well under 1s per skill
+ENGINE_HEAVY_BYTES, ENGINE_HEAVY_FILES = 400_000, 120                     # bigger skills are scanned on their own so they can't jam a batch
+STUCK_RETRY_DAYS = 7
 TIMED_OUT = "ran out of time"
 
 
@@ -772,6 +777,11 @@ def skill_files(d):
             if len(out) >= ENGINE_MAX_FILES:
                 return out
     return out
+
+
+def skill_weight(d):
+    sizes = [os.path.getsize(p) for p in skill_files(d)]
+    return sum(sizes), len(sizes)
 
 
 def skill_dir_hash(d):
@@ -877,15 +887,21 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     targets = targets[:300]
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     hashes = {d: skill_dir_hash(d) for d in targets}
-    todo = [d for d in targets if cache.get(d, {}).get("hash") != hashes[d]]
-    scanned, i = 0, 0
+    retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=STUCK_RETRY_DAYS)).isoformat()
+    todo = [d for d in targets if cache.get(d, {}).get("hash") != hashes[d] or (cache[d].get("stuck") and cache[d].get("at", "") < retry_before)]
+    scanned, stuck_now = 0, []
     tune = load_json(state_path("engine_tune.json"), {}) or {}
     size = max(1, min(ENGINE_CHUNK, int(tune.get("chunk", ENGINE_CHUNK))))
     left_s = lambda: budget - (time.monotonic() - started)
-    while i < len(todo):
+    weight = {d: skill_weight(d) for d in todo}
+    heavy = [d for d in todo if weight[d][0] > ENGINE_HEAVY_BYTES or weight[d][1] > ENGINE_HEAVY_FILES]
+    light = [d for d in todo if d not in heavy]
+    queue = [light[i:i + size] for i in range(0, len(light), size)] + [[d] for d in heavy]   # big skills alone, after the quick ones
+    while queue:
         if left_s() <= 0:
             break
-        chunk = todo[i:i + size]
+        chunk = queue.pop(0)
+        cap = ENGINE_LAUNCH_BASE + ENGINE_LAUNCH_PER_SKILL * len(chunk)   # a launch that takes longer than this is stuck, not busy
         stage = tempfile.mkdtemp(prefix="stage-", dir=state_path())
         ss, hk, ss_err, hk_err = {}, {}, None, None
         try:
@@ -893,30 +909,38 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
             set_progress("SkillSpector and husk", scanned, len(todo), started)
             # the budget is checked inside the batch too: each engine only gets the time that is left
             if ss_exe:
-                ss, ss_err = (skillspector_batch(ss_exe, stage, mapping, min(ENGINE_HARD_LIMIT, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
+                ss, ss_err = (skillspector_batch(ss_exe, stage, mapping, min(cap, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
             if hk_exe and not ss_err:
-                hk, hk_err = (husk_batch(hk_exe, stage, mapping, min(ENGINE_HARD_LIMIT, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
+                hk, hk_err = (husk_batch(hk_exe, stage, mapping, min(cap, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
         finally:
             shutil.rmtree(stage, ignore_errors=True)
         if TIMED_OUT in (ss_err, hk_err):
             if left_s() <= 0:                  # the budget ran out mid-batch: stop, keep what's done, try a smaller batch next time
                 if len(chunk) > 1:
-                    size = max(1, len(chunk) // 2)
-                    save_json(state_path("engine_tune.json"), {"chunk": size, "at": now()})
+                    save_json(state_path("engine_tune.json"), {"chunk": max(1, len(chunk) // 2), "at": now()})
                 break
-            ss_err, hk_err = (f"no answer in {ENGINE_HARD_LIMIT}s" if x == TIMED_OUT else x for x in (ss_err, hk_err))
+            who = "SkillSpector" if ss_err == TIMED_OUT else "husk"
+            if len(chunk) > 1:                 # one skill in here is jamming the scanner: try the biggest alone, then the rest
+                big = max(chunk, key=lambda d: weight[d])
+                queue[:0] = [[big], [d for d in chunk if d != big]]
+                continue
+            d = chunk[0]                       # found it: remember, report it, and stop spending every run on it
+            cache[d] = {"hash": hashes[d], "stuck": who, "at": now()}
+            stuck_now.append(d)
+            scanned += 1
+            save_json(state_path("engine_cache.json"), cache)
+            continue
         for err_, who in ((ss_err, "SkillSpector"), (hk_err, "husk")):
             if err_:
                 notes.append(f"{who} failed on a batch of {len(chunk)} skills ({err_}); they'll be retried next run.")
-        i += len(chunk)
         if ss_err or hk_err:
             continue   # don't remember a batch that didn't finish
         for d in chunk:
             cache[d] = {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "at": now()}
         scanned += len(chunk)
         save_json(state_path("engine_cache.json"), cache)   # progress survives an interrupted run
-        if size < ENGINE_CHUNK:                # a smaller batch fit: grow back toward the normal size
-            size = min(ENGINE_CHUNK, size * 2)
+        if size < ENGINE_CHUNK and len(chunk) == size:      # a smaller batch fit: go back to the normal size next run
+            size = ENGINE_CHUNK
             save_json(state_path("engine_tune.json"), {"chunk": size, "at": now()})
     left = len(todo) - scanned
     if left > 0 and not any("failed on a batch" in n for n in notes):
@@ -931,6 +955,11 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     for d in targets:
         e_ = cache.get(d) or {}
         if e_.get("hash") != hashes[d]:
+            continue
+        if e_.get("stuck"):
+            out.append(finding("WT-X004", "A scanner couldn't finish this skill", "low", ["AST08"], d,
+                               f"{e_['stuck']} gave no answer in time", "Watchtower's own rules still checked it. Watchtower tries the scanner again in a week, or sooner if the skill changes. "
+                               "Big or unusual files are the usual cause.", source="engines"))
             continue
         s_, hk = e_.get("ss") or {}, e_.get("hk")
         ss_flag = s_.get("recommendation") == "DO_NOT_INSTALL"
@@ -2538,6 +2567,7 @@ PLAIN = {
     "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
     "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it. If it is a security tool of yours, /watchtower-fix can keep it for 30 days.", "you"),
+    "WT-X004": ("A scanner couldn't get through a skill", "Watchtower's own rules still checked it.", "Nothing to do; Watchtower retries it in a week.", "auto"),
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Run /watchtower-fix: it re-scans it with every engine and re-approves it if clean.", "you"),
     "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it updates each project's lockfile and keeps a backup.", "fix"),
     "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it upgrades them and puts any upgrade back that breaks something.", "fix"),
@@ -2960,6 +2990,17 @@ EXC_KIND, EXC_DAYS = "security-tool", 30
 SECURITY_TOOL = re.compile(r"(?i)\b(secur\w*|scann?\w*|audit\w*|vet(s|ting|ted)?|detect\w*|malware|injection|threat\w*|vulnerab\w*|pen[- ]?test\w*|red[- ]?team\w*|guard\w*|forensic\w*|antivirus)\b")
 
 
+def own_release_file(p, h):
+    """True when a file in an installed copy of one of Watchtower's own skills is byte-for-byte the file in the verified
+    release under app/skills. Updating Watchtower then doesn't raise 'a skill you approved has changed' about itself."""
+    parts = p.split("/")
+    for i in range(len(parts) - 2, 0, -1):
+        src = os.path.join(SELF_ROOT, "skills", *parts[i:])
+        if parts[i - 1] in ("workflows", "skills") and not p.startswith(SELF_ROOT + "/") and os.path.isfile(src):
+            return sha256_file(src) == h
+    return False
+
+
 def skill_root(path):
     """The skill folder a file belongs to: the nearest folder at or above it that holds a SKILL.md."""
     d = path if os.path.isdir(path) else os.path.dirname(path)
@@ -3113,7 +3154,9 @@ def revet(dirs, approve=False):
         h = skill_dir_hash(d)
         diff = skill_diff(d)
         r = {"name": skill_name(d), "path": d, "changed": diff["summary"], "checked_by": ["Watchtower rules"] + installed}
-        if installed and (cache.get(d) or {}).get("hash") != h:
+        if installed and (cache.get(d) or {}).get("stuck") and cache[d].get("hash") == h:
+            r.update(result="not finished", why=f"{cache[d]['stuck']} can't get through this skill, so it can't be re-approved automatically; read the change with wt.py diff")
+        elif installed and (cache.get(d) or {}).get("hash") != h:
             r.update(result="not finished", why="the scanners didn't finish in time; it stays open and is retried next run")
         else:
             fs = dedupe(per[d] + [f for f in eng if os.path.normpath(f["where"]) == d])

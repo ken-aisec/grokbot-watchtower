@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.3 — 2026-10-05 (no more stuck audits)
+- Fixed: one skill that a scanner can't get through no longer eats the whole time budget on every run. Measured cause: SkillSpector doesn't finish on skills with very large files (about 1.5 MB of minified code or text). An engine launch now has its own short limit (30 seconds plus 2 per skill). Big skills are scanned on their own, after the quick ones. When a batch jams, the biggest skill is tried alone, then the rest.
+- A skill a scanner can't finish is remembered and reported as a low finding ("A scanner couldn't get through a skill") instead of being retried every run. Watchtower tries it again after a week, or as soon as the skill changes. It is never counted as clean, and `/watchtower-fix` never re-approves it automatically.
+- Updating Watchtower no longer raises "a skill you approved has changed" about Watchtower's own skills. A file that is byte-for-byte the one in the checksummed release is trusted; a tampered copy still shows.
+- Watchtower's own skills now vet clean: the roll-call skill says it never sends without approval and reports a Bot that doesn't answer. "Reaches into other Bots" no longer fires on a line that says never to do it.
+- Verified against real SkillSpector 2.12.0 and husk 1.3.5: 85 skills including two that really jam SkillSpector took 84 seconds on the first run and 0 on the second.
+
 ## v0.5.2 — 2026-10-05 (changed skills, handled)
 - `/watchtower-fix` now deals with skills that changed after you approved them. It re-scans each one with every engine (Watchtower rules, SkillSpector, husk) and, as part of the one yes, re-approves the ones that come back clean. A flagged skill, or one the scanners didn't finish, stays open.
 - Watchtower keeps a compressed copy of every approved skill in its own state folder, so a change shows as a diff: "+1 −0 lines in SKILL.md" in the fix preview, and the exact lines with `wt.py diff SKILL`. Skills approved before this version get a copy on the next full audit, as long as they still match what was approved.
