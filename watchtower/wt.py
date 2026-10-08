@@ -2226,6 +2226,17 @@ def tend_canaries(notes):
         return
     old = {os.path.expanduser(p) for p in OLD_CANARY_PATHS}
     moved = [n for n, v in reg.items() if os.path.expanduser(v["path"]) in old and n in {s_[0] for s_ in CANARY_SPECS}]
+    pending = []
+    for n in moved:                                       # a read that no run has recorded yet goes in the log before the file does
+        try:
+            t = os.stat(os.path.expanduser(reg[n]["path"])).st_atime
+            if t > reg[n].get("atime", 0) + 1:
+                pending.append({"name": n, "path": reg[n]["path"], "read_at": dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")})
+        except OSError:
+            pass
+    if pending:
+        ledger({"event": "canary-read", "decoys": pending, "note": "read in the old place, recorded as the decoys were moved"})
+        notes.append(f"Before the move, {len(pending)} of the old decoys had been read at {pending[0]['read_at'][11:16]} UTC (most likely the backup). It is in the log.")
     for n in moved:
         p = os.path.expanduser(reg[n]["path"])
         try:

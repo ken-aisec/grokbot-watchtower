@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased (next batch)
+- **The decoy move keeps its evidence.** v0.6.6 moved the decoys before recording a read that no run had logged yet, so that read was lost. It is now written to the log and named in a note before the old file is removed.
+
 ## v0.6.6 — 2026-10-08 (one batch from a day on two real computers)
 - **Decoys that can tell a snoop from the backup.** The decoys sat in /workspace and the home folder. The platform backs those up after a Bot's turn and reads every file, so all three were read within minutes of every reset and a trip meant nothing. A test on a real computer showed /var/tmp and /tmp are not read by the backup and do record reads, so the decoys live there now. An update moves existing decoys once and says so; a decoy cleared by a restart is put back quietly, and one removed with no restart is still reported.
 - **Re-approve one skill.** `fix --revet` re-approved every changed skill that scanned clean, so approving one change meant approving all of them. `--only <names>` limits it; the rest stay open and are named.

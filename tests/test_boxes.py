@@ -793,6 +793,8 @@ class MainBoxLessons(Box):
         r = self.audit()
         after = wt.load_json(wt.state_path("canaries.json"), {})
         self.assertTrue(any("Moved 3 decoys" in n for n in r["notes"]), r["notes"])
+        self.assertTrue(any("Before the move, 3 of the old decoys had been read" in n for n in r["notes"]), r["notes"])   # v0.6.6 dropped it
+        self.assertIn("recorded as the decoys were moved", open(wt.state_path("ledger.jsonl")).read())
         self.assertFalse(any(os.path.exists(p) for p in old))
         self.assertFalse(os.path.exists(os.path.join(self.ws, ".archive")))        # an emptied decoy folder goes
         self.assertTrue(os.path.exists(keep))                                      # a folder with someone else's file stays
