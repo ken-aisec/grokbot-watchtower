@@ -859,7 +859,7 @@ class Features(unittest.TestCase):
         ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
         body = open(ss).read()
         open(ss, "w").write(body.replace("skills = []", 'import time\nif any("JAM" in open(os.path.join(stage, n, "SKILL.md")).read() for n in os.listdir(stage)): time.sleep(30)\nskills = []'))
-        old = (wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL); wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL = 1, 0
+        old = (wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT); wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = 1, 0, 1
         try:
             notes, t0 = [], time.monotonic()
             fs = wt.engine_findings(dirs, [], notes, budget=60)
@@ -877,7 +877,7 @@ class Features(unittest.TestCase):
             open(os.path.join(dirs[4], "SKILL.md"), "w").write("# fixed\n")  # the skill changed: it gets scanned again
             self.assertEqual(wt.engine_findings(dirs, [], [], budget=60), [])
         finally:
-            wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL = old
+            wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = old
 
     def test_updating_watchtower_does_not_flag_its_own_skills(self):
         w = os.path.join(self.tmp, "sand-data", "workflows")

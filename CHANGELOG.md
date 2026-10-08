@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased (next batch)
+- **A lone skill gets two minutes, not 34 seconds.** v0.6.4 cut the time a scanner gets on one skill to stop a hang using up the run. It was too tight: on a real box, healthy skills carrying Office files took 37 to 61 seconds and 11 were marked stuck, with a week's wait before a retry that would fail the same way. A skill scanned alone now gets 120 seconds, and anything marked stuck under the shorter limit is retried on the next run.
+- **Hooks that run a script from a temp folder.** New check. A hook is a command the app runs by itself around tool calls; one that runs a script from /tmp runs whatever is there, and every Bot can write there. The platform's own hook of this kind is listed low, because the owner can't change it. Any other is high.
+- **Posting to a team room is not an outside action.** "Post to Outreach room" and "post Ops room kickoff" are the Bots' own rooms.
 - **Sharing Watchtower itself.** The prepublish skill now says to re-save the first-run skill from the release before staging: an update doesn't refresh the saved copy, so the template would ship old instructions.
 - **The decoy move keeps its evidence.** v0.6.6 moved the decoys before recording a read that no run had logged yet, so that read was lost. It is now written to the log and named in a note before the old file is removed.
 

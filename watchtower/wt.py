@@ -278,6 +278,7 @@ OBJECT_NEXT = re.compile(r"(?i)^\s+(the|a|an|it|them|this|that|these|those|to|yo
                          r"emails?|messages?|mail|dms?|repl(y|ies)|reports?|summar(y|ies)|digests?|invoices?|payments?|money|data|files?)\b|^\s+(?-i:[A-Z@#])\w*")
 VERB_LEAD = re.compile(r"(?i)(^|\b(to|and|then|will|should|must|can|may|also|or|always|never|not|please|now|just|you|i|we|they|it|he|she|bot|"
                        r"agent|auto|do|does|\w+ly)|,)\s*$")
+TEAM_ROOM = re.compile(r"(?i)^\s+(to\s+|in\s+|into\s+)?(the\s+|our\s+)?(?-i:[A-Z])\w+\s+room\b")   # "post to Outreach room", "post Ops room kickoff"
 SCOPE_BREAK = re.compile(r"(?i)\b(and|but|then|instead|except|unless|so|just)\b")
 NEGATOR = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor|no)\b")
 
@@ -323,6 +324,8 @@ def first_action(text, rx):
             continue
         if OWNER_AFTER.search(re.split(r"[.;:!?\n]", after[:40])[0]):
             continue
+        if m.group(0).lower() in ("post", "posts") and TEAM_ROOM.match(after):
+            continue                                                                                        # the Bots' own room, not the outside world
         return m
     return None
 
@@ -774,6 +777,7 @@ def audit(roots, exports, quick=False):
                           "/workspace/watchtower/exports/auto-review.txt."))
 
     # 5b. tripwires and shell history (zero tokens)
+    fs += soft("hooks", ("WT-C004",), notes, [], hook_findings, roots, inv)
     soft("decoys", (), notes, None, tend_canaries, notes)
     fs += remember_events(canary_findings() + history_findings(rules))
     if not load_json(state_path("canaries.json"), {}):
@@ -829,6 +833,50 @@ def audit(roots, exports, quick=False):
     meta = {"inventory": {k: len(v) for k, v in inv.items()}, "notes": notes, "manifest": manifest, "persistence": snap, "scanners_missing": gone,
             "skill_dirs": [os.path.dirname(x) for x in inv["skills"]]}
     return fs, meta
+
+
+SHARED_TEMP = re.compile(r"(?<![\w.-])(/tmp|/var/tmp|/dev/shm)/[^\s'\";|&<>]+")
+PLATFORM_HOOKS = ("python3 /tmp/hooks/expand_mcp_file_args.py",)   # ships in ~/.cursor/hooks.json on Grok Bot computers (seen Oct 2026)
+
+
+def hook_findings(roots, inv):
+    """A hook is a command the app runs by itself before or after a tool call. One that runs a script from a temp folder
+    runs whatever is at that path, and every Bot on the computer can write there."""
+    files = []
+    for r in list(roots) + [os.path.expanduser("~")]:
+        for sub in (".cursor", ".grok", ".claude"):
+            files.append(os.path.join(os.path.expanduser(r), sub, "hooks.json"))
+    files += [p for p in inv.get("plugin_files", []) if os.path.basename(p) == "hooks.json"]
+    out, seen = [], set()
+    for p in files:
+        rp = os.path.realpath(p)
+        if rp in seen or not os.path.isfile(p):
+            continue
+        seen.add(rp)
+        data = load_json(p, None)
+        cmds, stack = [], [data]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, dict):
+                if isinstance(x.get("command"), str):
+                    cmds.append(x["command"])
+                stack += list(x.values())
+            elif isinstance(x, list):
+                stack += x
+        for c in sorted(set(cmds)):
+            m = SHARED_TEMP.search(c)
+            if not m:
+                continue
+            there = "is there now" if os.path.exists(m.group(0)) else "is not there now, so whatever is put there runs"
+            if c.strip() in PLATFORM_HOOKS and "/plugins/" not in p:
+                out.append(finding("WT-C004", "The platform's own hook runs a script from a shared temp folder", "low", ["ASI05", "ASI10"], p,
+                                   f"{c[:90]} ({there})", "This hook came with the computer and you can't change it. Every Bot can write to that folder, so a "
+                                   "Bot that was tricked could plant the script. It's listed so you know; it is worth reporting to the platform.", ident=c))
+            else:
+                out.append(finding("WT-C004", "A hook runs a script from a folder every Bot can write to", "high", ["ASI05", "ASI10"], p,
+                                   f"{c[:90]} ({there})", "Find out what added this hook. If it isn't yours, remove it from that file; if it is, move the "
+                                   "script somewhere only you write to.", ident=c))
+    return out
 
 
 NATIVE_SETTINGS = ["~/agent-data/settings.json", "/home/box/agent-data/settings.json"]
@@ -925,6 +973,8 @@ ENGINE_MAX_FILES, ENGINE_MAX_BYTES = 400, 2_000_000
 ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "30"))   # seconds one engine launch may take, plus time per skill.
 ENGINE_LAUNCH_PER_SKILL = 4                                               # measured on a real box: 3s to launch on one small skill, up to 3.3s per skill when busy.
 #                                                                           v0.6.3 allowed 300s per batch, so one skill that hung a scanner used the whole run.
+ENGINE_SOLO_LIMIT = int(os.environ.get("WT_ENGINE_SOLO_LIMIT", "120"))    # seconds for one skill scanned on its own. v0.6.4 to v0.6.6 gave 34, and on
+#                                                                           a real box healthy skills with Office files took 37 to 61 and were marked stuck.
 ENGINE_MAX_TARGETS = 5000
 ENGINE_CURRENT = set()                                                    # skills whose scanner answer is up to date after this run
 ENGINE_HEAVY_BYTES, ENGINE_HEAVY_FILES = 400_000, 120                     # bigger skills are scanned on their own so they can't jam a batch
@@ -1135,7 +1185,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         if sum(1 for v in cache.values() if v.get("hash") == cache[k].get("hash")) > 1:
             del cache[k]
     todo = [d for d in targets if not entry_current(cache.get(d) or {}, hashes[d], installed)
-            or (cache[d].get("stuck") and cache[d].get("at", "") < retry_before)] if installed else []
+            or (cache[d].get("stuck") and (cache[d].get("at", "") < retry_before or cache[d].get("limit", 0) < ENGINE_SOLO_LIMIT))] if installed else []
     scanned, stuck_now = 0, []
     tune = load_json(state_path("engine_tune.json"), {}) or {}
     size = max(1, min(ENGINE_CHUNK, int(tune.get("chunk", ENGINE_CHUNK))))
@@ -1151,6 +1201,8 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
             break
         chunk = queue.pop(0)
         cap = ENGINE_LAUNCH_BASE + ENGINE_LAUNCH_PER_SKILL * len(chunk)   # a launch that takes longer than this is stuck, not busy
+        if len(chunk) == 1:
+            cap = max(cap, ENGINE_SOLO_LIMIT)                            # alone, a slow skill only costs its own time
         stage = tempfile.mkdtemp(prefix="stage-", dir=state_path())
         ss, hk, ss_err, hk_err = {}, {}, None, None
         try:
@@ -1173,7 +1225,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
                 queue[:0] = [[d] for d in sorted(chunk, key=lambda d: weight[d], reverse=True)]
                 continue
             d = chunk[0]                       # found it: remember, report it, and stop spending every run on it
-            cache[d] = {"hash": hashes[d], "stuck": who, "at": now()}
+            cache[d] = {"hash": hashes[d], "stuck": who, "at": now(), "limit": cap}
             stuck_now.append(d)
             scanned += 1
             save_json(state_path("engine_cache.json"), cache)
@@ -2940,7 +2992,7 @@ EXPOSURE_AREAS = [
     ("Secrets on the shared computer", ("WT-S001", "WT-S002", "WT-S003", "WT-T011")),
     ("Logged-in browser sessions", ("WT-S004",)),
     ("Skills and templates", ("WT-X001", "WT-X002", "WT-X003", "WT-T001", "WT-T002", "WT-T003", "WT-T004", "WT-T005", "WT-T006", "WT-T007", "WT-T008", "WT-I001")),
-    ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003")),
+    ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003", "WT-C004")),
     ("Bots, memories and routines", ("WT-M010", "WT-L001", "WT-R002", "WT-T013")),
     ("Packages", ("WT-D001",)),
     ("Tripwires and history", ("WT-K001", "WT-K002", "WT-K003", "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H009")),
@@ -3263,6 +3315,7 @@ PLAIN = {
     "WT-A005": ("No approval rules at all", "Nothing stops a Bot from acting.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
     "WT-C001": ("Bots can run code on your own computer", "Not just the cloud computer.", "Settings → General → Bot → Local Computer: Never allow.", "you"),
     "WT-C003": ("Auto-review is off", "Nothing checks Bot actions.", "Settings → General → Auto-review: turn it on.", "you"),
+    "WT-C004": ("A hook runs a script from a shared temp folder", "Any Bot could plant that script.", "Check what added the hook; report the platform's own to the platform.", "you"),
     "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
     "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Tell Watchtower \"fix it\": one yes moves it out of use, and nothing is deleted. If it is a security tool of yours, the fix can keep it for 30 days.", "you"),
