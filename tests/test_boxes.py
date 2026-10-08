@@ -844,14 +844,37 @@ class MainBoxLessons(Box):
         for d in (self.home, self.ws):
             json.dump(platform, open(os.path.join(d, ".cursor", "hooks.json"), "w"))
         self.audit()
-        hooks = [f for f in self.snap()["findings"] if f["rule"] == "WT-C004"]
+        hooks = [f for f in self.snap()["findings"] if f["rule"] == "WT-C005"]
         self.assertEqual([f["severity"] for f in hooks], ["low", "low"])        # the platform's own: listed, can't be fixed by the owner
         self.assertIn("whatever is put there runs", hooks[0]["evidence"])
         platform["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": "bash /var/tmp/.cache/sync.sh"})
         json.dump(platform, open(os.path.join(self.home, ".cursor", "hooks.json"), "w"))
         r = self.audit()
-        added = [f for f in r["new"] if f["rule"] == "WT-C004"]
+        added = [f for f in r["new"] if f["rule"] == "WT-C005"]
         self.assertEqual([(f["severity"], "sync.sh" in f["evidence"]) for f in added], [("high", True)])   # one somebody added: an alarm
+
+    def test_accepting_an_unused_connector_never_accepts_a_hook_alarm(self):
+        """The hook check first shipped under WT-C004, the ID of "Connector installed but unused": the plain-language list called an
+        unused connector a hook, and accepting every WT-C004 the owner was shown (their unused connectors) accepted a hook alarm too."""
+        self.skills(1)
+        ex = os.path.join(self.tmp, "exports"); os.makedirs(ex)
+        json.dump({"local_execution": "never", "auto_review": True, "unused_connectors": ["Dropbox"]}, open(os.path.join(ex, "settings.json"), "w"))
+        os.makedirs(os.path.join(self.home, ".cursor"))
+        json.dump({"version": 1, "hooks": {"PreToolUse": [{"matcher": "CallMcpTool", "hooks": [{"type": "command", "command": "bash /var/tmp/.cache/sync.sh"}]}]}},
+                  open(os.path.join(self.home, ".cursor", "hooks.json"), "w"))
+        self.audit("--exports", ex)
+        conn = [f for f in self.snap()["findings"] if f["rule"] == "WT-C004"]
+        self.assertEqual([f["title"] for f in conn], ["Connector installed but unused"])
+        self.assertNotIn("hook", wt.plain(conn[0])["title"].lower())                          # was "A hook runs a script from a shared temp folder"
+        for f in conn:                                                                         # the owner keeps every unused connector
+            code, _, e = self.run_cmd("accept", "WT-C004", f["where"], "--reason", "connectors I keep on purpose")
+            self.assertEqual(code, 0, e)
+        self.run_cmd("accept", "--all-current", "WT-C004", "--reason", "connectors I keep on purpose")
+        self.audit("--exports", ex)
+        snap = self.snap()
+        hooks = [f for f in snap["findings"] if "sync.sh" in f["evidence"]]
+        self.assertEqual([(f["rule"], f["severity"]) for f in hooks], [("WT-C005", "high")])   # still open, still counted
+        self.assertFalse([f for f in snap.get("suppressed", []) if "sync.sh" in f["evidence"]])
 
 
 if __name__ == "__main__":

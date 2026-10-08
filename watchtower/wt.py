@@ -777,7 +777,7 @@ def audit(roots, exports, quick=False):
                           "/workspace/watchtower/exports/auto-review.txt."))
 
     # 5b. tripwires and shell history (zero tokens)
-    fs += soft("hooks", ("WT-C004",), notes, [], hook_findings, roots, inv)
+    fs += soft("hooks", ("WT-C005",), notes, [], hook_findings, roots, inv)
     soft("decoys", (), notes, None, tend_canaries, notes)
     fs += remember_events(canary_findings() + history_findings(rules))
     if not load_json(state_path("canaries.json"), {}):
@@ -869,11 +869,11 @@ def hook_findings(roots, inv):
                 continue
             there = "is there now" if os.path.exists(m.group(0)) else "is not there now, so whatever is put there runs"
             if c.strip() in PLATFORM_HOOKS and "/plugins/" not in p:
-                out.append(finding("WT-C004", "The platform's own hook runs a script from a shared temp folder", "low", ["ASI05", "ASI10"], p,
+                out.append(finding("WT-C005", "The platform's own hook runs a script from a shared temp folder", "low", ["ASI05", "ASI10"], p,
                                    f"{c[:90]} ({there})", "This hook came with the computer and you can't change it. Every Bot can write to that folder, so a "
                                    "Bot that was tricked could plant the script. It's listed so you know; it is worth reporting to the platform.", ident=c))
             else:
-                out.append(finding("WT-C004", "A hook runs a script from a folder every Bot can write to", "high", ["ASI05", "ASI10"], p,
+                out.append(finding("WT-C005", "A hook runs a script from a folder every Bot can write to", "high", ["ASI05", "ASI10"], p,
                                    f"{c[:90]} ({there})", "Find out what added this hook. If it isn't yours, remove it from that file; if it is, move the "
                                    "script somewhere only you write to.", ident=c))
     return out
@@ -2992,7 +2992,7 @@ EXPOSURE_AREAS = [
     ("Secrets on the shared computer", ("WT-S001", "WT-S002", "WT-S003", "WT-T011")),
     ("Logged-in browser sessions", ("WT-S004",)),
     ("Skills and templates", ("WT-X001", "WT-X002", "WT-X003", "WT-T001", "WT-T002", "WT-T003", "WT-T004", "WT-T005", "WT-T006", "WT-T007", "WT-T008", "WT-I001")),
-    ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003", "WT-C004")),
+    ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003", "WT-C005")),
     ("Bots, memories and routines", ("WT-M010", "WT-L001", "WT-R002", "WT-T013")),
     ("Packages", ("WT-D001",)),
     ("Tripwires and history", ("WT-K001", "WT-K002", "WT-K003", "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H009")),
@@ -3315,7 +3315,9 @@ PLAIN = {
     "WT-A005": ("No approval rules at all", "Nothing stops a Bot from acting.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
     "WT-C001": ("Bots can run code on your own computer", "Not just the cloud computer.", "Settings → General → Bot → Local Computer: Never allow.", "you"),
     "WT-C003": ("Auto-review is off", "Nothing checks Bot actions.", "Settings → General → Auto-review: turn it on.", "you"),
-    "WT-C004": ("A hook runs a script from a shared temp folder", "Any Bot could plant that script.", "Check what added the hook; report the platform's own to the platform.", "you"),
+    # Hooks have their own ID. They first shared WT-C004 with "Connector installed but unused", so a connector finding was described
+    # as a hook and accepting one accepted the other. WT-C004 has no entry here, as in v0.6.6: it shows its own title and fix.
+    "WT-C005": ("A hook runs a script from a shared temp folder", "Any Bot could plant that script.", "Check what added the hook; report the platform's own to the platform.", "you"),
     "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
     "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Tell Watchtower \"fix it\": one yes moves it out of use, and nothing is deleted. If it is a security tool of yours, the fix can keep it for 30 days.", "you"),
