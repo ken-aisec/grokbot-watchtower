@@ -267,7 +267,7 @@ NEGATED_LIST = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor)\s+\w+(\s*,\
 # "X posts", "the top posts", "3 invites": the thing, not the act.
 NOUN_BEFORE = re.compile(r"(?i)\b(x|twitter|linkedin|blog|social|forum|reddit|outreach|draft|drafts|drafted|of|the|a|an|each|every|this|that|"
                          r"these|those|their|your|my|new|top|recent|latest|all|any|\d+)\s+$")
-# "drafts Ken sends himself", "for Ken to send", "for the user to review and publish": the owner acts, not the Bot.
+# "drafts Sam sends himself", "for Sam to send", "for the user to review and publish": the owner acts, not the Bot.
 OWNER_AFTER = re.compile(r"(?i)^\s+(\w+\s+){0,2}(himself|herself|myself|themselves|themself)\b")
 OWNER_BEFORE = re.compile(r"(?i)\bfor\s+(?!(?:the\s+)?(?:bot|agent|it|grok|assistant)\b)(the\s+)?\w+\s+to\s+(\w+\s+and\s+)?$")
 
@@ -278,13 +278,13 @@ OBJECT_NEXT = re.compile(r"(?i)^\s+(the|a|an|it|them|this|that|these|those|to|yo
                          r"emails?|messages?|mail|dms?|repl(y|ies)|reports?|summar(y|ies)|digests?|invoices?|payments?|money|data|files?)\b|^\s+(?-i:[A-Z@#])\w*")
 VERB_LEAD = re.compile(r"(?i)(^|\b(to|and|then|will|should|must|can|may|also|or|always|never|not|please|now|just|you|i|we|they|it|he|she|bot|"
                        r"agent|auto|do|does|\w+ly)|,)\s*$")
-TEAM_ROOM = re.compile(r"(?i)^\s+(to\s+|in\s+|into\s+)?(the\s+|our\s+)?(?-i:[A-Z])\w+\s+room\b")   # "post to Outreach room", "post Ops room kickoff"
+TEAM_ROOM = re.compile(r"(?i)^\s+(to\s+|in\s+|into\s+)?(the\s+|our\s+)?(?-i:[A-Z])\w+\s+room\b")   # "post to Growth room", "post Crew room kickoff"
 SCOPE_BREAK = re.compile(r"(?i)\b(and|but|then|instead|except|unless|so|just)\b")
 NEGATOR = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor|no)\b")
 
 
 def in_negated_list(before, after):
-    """"never edit post text or publish", "no sends/posts as Ken", "does not draft, edit Notion, post, or quote": the verb is one more
+    """"never edit post text or publish", "no sends/posts as Sam", "does not draft, edit Notion, post, or quote": the verb is one more
     item in a list that began with a negation. "Don't ask me, just send it" and "no sends and publish now" are not."""
     neg = list(NEGATOR.finditer(before))
     if not neg or SCOPE_BREAK.search(before[neg[-1].end():]):
