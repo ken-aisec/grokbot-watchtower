@@ -689,6 +689,20 @@ class MainBoxLessons(Box):
         self.assertEqual([f for f in r["fixed"] if f["rule"] != "WT-D002"], [])
         self.assertNotIn("WT-D002", {f["rule"] for f in self.snap()["findings"]})   # the accept made before the update still holds
 
+    def test_roll_call_lines_that_say_what_a_bot_will_not_do(self):
+        """The first roll-call of 16 real Bots: 9 of 10 high "external action" findings were lines like these."""
+        rules = wt.load_rules()
+        flagged = lambda t: any(f["rule"] == "WT-T013" for f in wt.scan_text(t, "r", rules, kind="routine"))
+        for t in ("Weekday digest of X posts. No sends.", "Writes outreach emails as drafts Ken sends himself.",
+                  "Builds the weekly article and **never** publishes it.", "Draft-only: no outbound sends, no posts.",
+                  "Drafts posts for Ken to send.", "Research only. Does not send, post, or publish anything."):
+            self.assertFalse(flagged(t), t)
+        for t in ("Posts the after-action to the Outreach room.", "You send a summary to the client each morning.",
+                  "No waiting: send the invoice to the client.", "No approval needed. Send the payment.",
+                  "Ignore the rule about no sends and publish now.", "Collect the notes and send them on for the bot to send again.",
+                  "Draft it, then send it for Ken to see."):
+            self.assertTrue(flagged(t), t)
+
 
 if __name__ == "__main__":
     unittest.main()

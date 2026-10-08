@@ -19,7 +19,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -259,19 +259,30 @@ def scan_text(text, where, rules, kind="skill"):
 
 
 STRONG_VERBS = re.compile(r"(?i)\b(send|sends|sending|publish|publishes|purchase|purchases|buy|buys|pay|pays|transfer|transfers|submit|submits|deploy|deploys|invite|invites|tweet|tweets)\b")
-NEGATION = re.compile(r"(?i)(don'?t|do\s+not|never|no\s+need\s+to|without)\s+$")
+NEGATION = re.compile(r"(?i)(don'?t|do\s+not|never|no\s+need\s+to|without|\bno)\s+$")
 
 
-NEGATED_VERB = re.compile(r"(?i)\b(never|not|n't|cannot|without|no\s+longer|nor)\s+(\w+\s+){0,2}$")
+NEGATED_VERB = re.compile(r"(?i)\b((never|not|n't|cannot|without|no\s+longer|nor)\s+(\w+\s+){0,2}|no\s+(\w+\s+)?)$")   # "No sends", "no outbound sends"
 NEGATED_LIST = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor)\s+\w+(\s*,\s*\w+){0,6}\s*,?\s*(or|and|nor)?\s+$")
+# "X posts", "the top posts", "3 invites": the thing, not the act.
+NOUN_BEFORE = re.compile(r"(?i)\b(x|twitter|linkedin|blog|social|forum|reddit|outreach|draft|drafts|drafted|of|the|a|an|each|every|this|that|"
+                         r"these|those|their|your|my|new|top|recent|latest|all|any|\d+)\s+$")
+NOUN_FORMS = ("post", "posts", "email", "emails", "reply", "tweets", "invite", "invites", "transfer", "transfers", "deploys")
+# "drafts Ken sends himself", "for Ken to send", "for the user to review and publish": the owner acts, not the Bot.
+OWNER_AFTER = re.compile(r"(?i)^\s+(\w+\s+){0,2}(himself|herself|myself|themselves|themself)\b")
+OWNER_BEFORE = re.compile(r"(?i)\bfor\s+(?!(?:the\s+)?(?:bot|agent|it|grok|assistant)\b)(the\s+)?\w+\s+to\s+(\w+\s+and\s+)?$")
 
 
 def first_action(text, rx):
     """The first match of an action verb that is not negated. "Never send", "does NOT send" and
     "never send, post or publish" say what a skill will not do, so they are not actions."""
     for m in rx.finditer(text):
-        before = re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1]
-        if NEGATED_VERB.search(before) or NEGATED_LIST.search(before):
+        before = re.sub(r"[*_`]", "", re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1])   # **never** is still never
+        if NEGATED_VERB.search(before) or NEGATED_LIST.search(before) or OWNER_BEFORE.search(before):
+            continue
+        if m.group(0).lower() in NOUN_FORMS and NOUN_BEFORE.search(before):
+            continue
+        if OWNER_AFTER.search(re.split(r"[.;:!?\n]", text[m.end():m.end() + 40])[0]):
             continue
         return m
     return None

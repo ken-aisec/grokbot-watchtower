@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.5 — 2026-10-08 (the first roll-call of 16 real Bots)
+- **"No sends" is not sending, again.** The roll-call flagged 10 Bots at high for acting without approval; 9 were lines saying the opposite. v0.6.3 handled "never send" and "does not send" but not "No sends", "no outbound sends", "**never** publishes" in bold, "drafts Ken sends himself", "for Ken to send", or words like "X posts" and "outreach emails" that name a thing. All are handled now.
+- **"No approval needed" no longer counts as an approval line.** It did, which hid a real finding.
+- 1 new test with the real phrases, and the ones that must still be flagged.
+
 ## v0.6.4 — 2026-10-08 (the main computer: 591 skills and six releases of history)
 v0.6.3 was the first release to send every skill on the computer to the outside scanners, not just the owner's. On a computer with 591 skills that showed four things the small simulated computers never did.
 - **One skill that hangs a scanner no longer uses up the run.** A plugin skill with a slide deck in it hung SkillSpector. A batch was allowed 300 seconds before Watchtower gave up on it, so a 7-minute run got through 2 of 275 skills. A batch now gets about 110 seconds and a single skill about 35 (a real launch measured 3 seconds). Skills that carry files that aren't text are scanned on their own, after the quick ones, so a hang costs one short launch.
