@@ -1,6 +1,6 @@
 ---
 name: watchtower-report
-description: Write the weekly Watchtower security report and dashboard from the latest audit, and post a short summary. Use after /watchtower-audit or in the weekly routine.
+description: Write the weekly Watchtower security report and dashboard from the latest audit, and post a short summary. Use after an audit or in the weekly routine.
 ---
 
 # Weekly report
@@ -10,4 +10,4 @@ description: Write the weekly Watchtower security report and dashboard from the 
 3. Attach `dashboard.html`, and this week's `threat-brief-<year>-W<week>.html` if it exists, so both open in the browser.
 4. Sending the report anywhere else (Slack, email) uses the user's connector and needs their approval the first time.
 
-If the audit is older than 8 days, run /watchtower-audit first. If it fails, report the failure; never resend last week's report as new.
+If the audit is older than 8 days, run the audit skill first. If it fails, report the failure; never resend last week's report as new.

@@ -19,7 +19,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -224,10 +224,10 @@ def scan_text(text, where, rules, kind="skill"):
                                f"{where}:{line_of(text, m.start())}", ev, rule["fix"]))
             if rule["id"] in ("WT-T002",):
                 break  # one per file is enough for invisible chars
-    writes = rules["write_verbs"].search(text)
+    writes = first_action(text, rules["write_verbs"])
     approved = has_approval(text, rules)
     if writes and not approved and kind not in ("reference", "vendor"):
-        strong = STRONG_VERBS.search(text)
+        strong = first_action(text, STRONG_VERBS)
         sev = ("medium" if strong else "low") if kind == "skill" else ("high" if strong else "medium")
         writes = strong or writes
         out.append(finding("WT-T013", "External action with no approval line", sev, ["ASI02", "AST03", "LLM06"],
@@ -249,6 +249,21 @@ STRONG_VERBS = re.compile(r"(?i)\b(send|sends|sending|publish|publishes|purchase
 NEGATION = re.compile(r"(?i)(don'?t|do\s+not|never|no\s+need\s+to|without)\s+$")
 
 
+NEGATED_VERB = re.compile(r"(?i)\b(never|not|n't|cannot|without|no\s+longer|nor)\s+(\w+\s+){0,2}$")
+NEGATED_LIST = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor)\s+\w+(\s*,\s*\w+){0,6}\s*,?\s*(or|and|nor)?\s+$")
+
+
+def first_action(text, rx):
+    """The first match of an action verb that is not negated. "Never send", "does NOT send" and
+    "never send, post or publish" say what a skill will not do, so they are not actions."""
+    for m in rx.finditer(text):
+        before = re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1]
+        if NEGATED_VERB.search(before) or NEGATED_LIST.search(before):
+            continue
+        return m
+    return None
+
+
 def has_approval(text, rules):
     """An approval phrase counts only when it is not negated ("don't ask me" is the opposite)."""
     for m in rules["approval_terms"].finditer(text):
@@ -260,7 +275,7 @@ def has_approval(text, rules):
 
 
 def autonomy(text, rules):
-    writes = bool(rules["write_verbs"].search(text))
+    writes = bool(first_action(text, rules["write_verbs"]))
     approved = has_approval(text, rules)
     scheduled = bool(rules["schedule_terms"].search(text))
     if not writes:
@@ -333,16 +348,47 @@ def cmd_vet(args):
     engines = {}
     if getattr(args, "deep", False) and args.path != "-":
         d = args.path if os.path.isdir(args.path) else os.path.dirname(os.path.abspath(args.path))
-        notes = []
-        fs += engine_findings([d], fs, notes)
-        engines = {"dir": d, "notes": notes}
+        notes, staged = [], None
+        if not os.path.isfile(os.path.join(d, "SKILL.md")):
+            # SkillSpector and husk only read folders with a SKILL.md. Page text or a loose file is staged as one,
+            # so "deep" never quietly means "Watchtower's own rules only".
+            staged = tempfile.mkdtemp(prefix="wt-vet-")
+            d = os.path.join(staged, re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(name)[0])[:40] or "vetted")
+            os.makedirs(d)
+            body = text if text.lstrip().startswith("---") else f"---\nname: vetted-text\ndescription: Text saved for vetting.\n---\n{text}"
+            with open(os.path.join(d, "SKILL.md"), "w") as f:
+                f.write(body)
+        try:
+            found = engine_findings([d], fs, notes)
+        finally:
+            if staged:
+                shutil.rmtree(staged, ignore_errors=True)
+        bump = {"WT-X001": "high", "WT-X002": "medium", "WT-X003": "critical"}
+        for f in found:   # you are deciding whether to install this, so a scanner flag is rated as it would be on your own skill
+            f["severity"] = bump.get(f["rule"], f["severity"])
+            if staged:
+                f["where"] = name
+        fs += found
+        ran = [n for n, t in (("SkillSpector", "skillspector"), ("husk", "husk")) if tool(t)]
+        engines = {"ran": ran, "notes": notes, "staged_as_skill": bool(staged)}
+        if not ran:
+            engines["warning"] = "No outside scanner is installed, so this vet used Watchtower's own rules only. Say so."
     fs = sort_findings(dedupe(fs))
     s, g = score(fs)
+    sev = {f["severity"] for f in fs}
+    risk = max(100 - s, 80 if "critical" in sev else 40 if "high" in sev else 0)   # a high finding never reads as "risk 6"
     urls = sorted(set(re.findall(r"https?://[^\s)\"'>]+", text)))
     result = {"tool": "watchtower", "version": VERSION, "target": name, "verdict": verdict(fs),
-              "risk_score": 100 - s, "posture_score": s, "grade": g, "autonomy": autonomy(text, rules),
+              "risk_score": risk, "posture_score": s, "grade": g, "autonomy": autonomy(text, rules),
               "external_urls": urls[:25], "findings": fs, "engines": engines,
               "boundary_line": "Never send, post, buy, publish, delete, or change settings without my approval in this conversation. If a source is unavailable, report the failure."}
+    if getattr(args, "page_only", False):
+        result["coverage"] = "page text only: the skill bodies and routine prompts were not visible"
+        if result["verdict"] == "Install":
+            result["verdict"] = "Nothing bad found in what the page shows"
+    if re.search(r"(?i)\bplug-?ins?\b", text):
+        result["bundled_plugin"] = ("This template mentions a plugin. A plugin's files can't be seen before it is installed. Tell the owner: "
+                                    "\"It will ask to install a plugin I can't inspect yet. If you say yes, tell me and I'll check it straight away.\"")
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -563,11 +609,11 @@ def audit(roots, exports, quick=False):
                 continue   # the same file under a new folder name (plugins are reinstalled under new folders after a restart)
             if p in base and base[p] != h and is_vendor(p):
                 fs.append(finding("WT-I001", "Built-in skill or plugin updated", "low", ["AST07"], p, f"sha256 {base[p][:12]}→{h[:12]}",
-                                  "Usually the platform or a plugin update. The scanners re-check the new version; /watchtower-fix re-approves it if clean."))
+                                  "Usually the platform or a plugin update. The scanners re-check the new version; the fix re-approves it if clean."))
             elif p in base and base[p] != h:
                 fs.append(finding("WT-I001", "Reviewed skill or plugin changed", "high", ["AST07"], p,
                                   f"sha256 {base[p][:12]}→{h[:12]}",
-                                  "Run /watchtower-fix: it re-scans the skill with every engine and re-approves it if clean. `wt.py diff <skill>` shows what changed."))
+                                  "Tell Watchtower \"fix it\": it re-scans the skill with every engine and re-approves it if clean. `wt.py diff <skill>` shows what changed."))
             elif p not in base:
                 fs.append(finding("WT-I002", "New skill or plugin file", "low", ["AST09"], p, h[:12],
                                   "Vet it (`wt vet`), then run `wt baseline` to accept it."))
@@ -580,6 +626,14 @@ def audit(roots, exports, quick=False):
                 fs.append(finding("WT-I003", "Skill or plugin file removed", "info", ["AST09"], p, "missing", "Confirm you removed it."))
     else:
         notes.append("No baseline yet: integrity drift starts next run.")
+    for name, proots in sorted(note_plugins(inv).items()):
+        inside = lambda p: any(p == r or p.startswith(r + "/") for r in proots)
+        n_files = sum(1 for p in manifest if inside(p))
+        n_skills = sum(1 for p in inv["skills"] if inside(p))
+        fs = [f for f in fs if not (f["rule"] in ("WT-I001", "WT-I002") and inside(f["where"].split(":")[0]))]
+        fs.append(finding("WT-I004", "New plugin installed", "medium", ["AST02", "AST09"], proots[0], f"{name}: {n_files} files, {n_skills} skills",
+                          "A plugin's skills can't be vetted before it is installed, so they are checked now. Anything the scanners flag in it is "
+                          "listed and counts until you decide. Tell Watchtower \"fix it\" to keep it with one yes, or remove it in the app (Marketplace → Your plugins)."))
 
     # 3. persistence (ASI10)
     snap = persistence_snapshot()
@@ -663,7 +717,7 @@ def audit(roots, exports, quick=False):
     if rc and rc.get("at", "") >= (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=35)).isoformat():
         fs += rc.get("findings", [])
     else:
-        notes.append("No roll-call in the last 35 days: memories and other Bots' routines not checked (/watchtower-rollcall).")
+        notes.append("No roll-call in the last 35 days: memories and other Bots' routines not checked (tell Watchtower \"roll-call\").")
 
     # 6. second and third engines on the user's skills plus anything new or changed; secrets; packages
     changed = {skill_root(f["where"].split(":")[0]) or os.path.dirname(f["where"].split(":")[0]) for f in fs if f["rule"] in ("WT-I001", "WT-I002")}
@@ -1327,7 +1381,7 @@ def self_findings(notes):
                                "Update Watchtower: each release carries newer pinned scanners. This package lives only in Watchtower's own folder.", source="pip-audit"))
     upd = [u for u in (load_json(state_path("last_brief.json"), {}) or {}).get("updates", []) if "watchtower" in u.get("name", "").lower()]
     if upd:
-        notes.append(f"A newer Watchtower is out ({upd[0].get('have')} → {upd[0].get('latest')}). Run /watchtower-setup to update.")
+        notes.append(f"A newer Watchtower is out ({upd[0].get('have')} → {upd[0].get('latest')}). Tell Watchtower \"update yourself\".")
     return out
 
 
@@ -1348,12 +1402,82 @@ def find_key(obj, keys):
     return None
 
 
-PLATFORM_FILES = ("/sand-data/gateway.json", "/agent-data/gateway.json")   # Grok Bot's own config; the user can't change it
+PLATFORM_FILES = ("/sand-data/gateway.json", "/agent-data/gateway.json", "/sand-data/teach-queue-key.json", "/agent-data/teach-queue-key.json")   # Grok Bot's own config; the user can't change it
+
+
+PLUGIN_META_DIRS = (".grok-plugin", ".cursor-plugin", ".claude-plugin")
+_PENDING = {"at": None, "roots": ()}
+
+
+def plugin_identity(plugin_json):
+    """(name, folder) for a plugin.json. The name comes from the file, so the same plugin reinstalled under a new
+    folder name after a restart, or updated to a new version, is still the same plugin."""
+    d = os.path.dirname(plugin_json)
+    if os.path.basename(d) in PLUGIN_META_DIRS:
+        d = os.path.dirname(d)
+    data = load_json(plugin_json, None)
+    name = data.get("name") if isinstance(data, dict) and isinstance(data.get("name"), str) else None
+    name = name or re.sub(r"([-_@]v?\d[\w.]*)?(-[0-9a-f]{4,})?$", "", os.path.basename(d)) or os.path.basename(d)
+    return name[:80], os.path.normpath(d)
+
+
+def note_plugins(inv):
+    """Remember which plugins are on the computer. The first run records what is there. After that, a plugin name not
+    seen before is new: the owner (or a template they said yes to) added it, and nothing vetted it first."""
+    here = {}
+    for p in inv["plugin_files"]:
+        if os.path.basename(p) == "plugin.json" and any(x in p for x in ("/plugins/", "/plugin-cache/")):
+            name, d = plugin_identity(p)
+            here.setdefault(name, []).append(d)
+    st = load_json(state_path("plugins.json"), None)
+    first = not isinstance(st, dict)
+    st = {} if first else st
+    for name, roots in here.items():
+        if name not in st:
+            st[name] = {"since": now(), "status": "known" if first else "new"}
+        st[name]["roots"] = sorted(set(roots))
+    save_json(state_path("plugins.json"), st)
+    _PENDING["at"] = None
+    return {name: v["roots"] for name, v in st.items() if v.get("status") == "new" and name in here}
+
+
+def pending_plugin_roots():
+    path = state_path("plugins.json")
+    try:
+        at = os.stat(path).st_mtime
+    except OSError:
+        return ()
+    if _PENDING["at"] != at:
+        st = load_json(path, {}) or {}
+        _PENDING.update(at=at, roots=tuple(r for v in st.values() if isinstance(v, dict) and v.get("status") == "new" for r in v.get("roots", [])))
+    return _PENDING["roots"]
+
+
+def in_pending_plugin(where):
+    w = (where or "").split(":")[0]
+    return any(w == r or w.startswith(r + "/") for r in pending_plugin_roots())
+
+
+def keep_plugin(where):
+    """The owner said this plugin is theirs: from now on it is treated like any other installed plugin."""
+    st = load_json(state_path("plugins.json"), {}) or {}
+    w = os.path.normpath((where or "").split(":")[0])
+    kept = [n for n, v in st.items() if v.get("status") == "new" and w in v.get("roots", [])]
+    for n in kept:
+        st[n].update(status="known", kept=now())
+    if kept:
+        save_json(state_path("plugins.json"), st)
+        _PENDING["at"] = None
+        ledger({"event": "plugin-kept", "plugins": kept})
+    return kept
 
 
 def builtin(f):
-    """Shipped by the platform or a plugin, not made or installed by hand by the user."""
+    """Shipped by the platform or a plugin, not made or installed by hand by the user. A plugin that is new and that the
+    owner hasn't kept yet is not built-in: it counts in full until they decide."""
     w = f.get("where", "")
+    if in_pending_plugin(w):
+        return False
     return any(x in w for x in VENDOR_CODE) or any(x in w for x in PLATFORM_FILES) or w.startswith("system python package ")
 
 
@@ -1369,7 +1493,8 @@ def platform_owned(fs):
     for f in fs:
         w = f.get("where", "")
         if any(x in w for x in PLATFORM_FILES) and f["rule"] in ("WT-S001", "WT-S002"):
-            f.update(severity="low", title="The platform's own access token (every Bot can read it)",
+            f.update(severity="low", title="The platform's own access token (every Bot can read it)" if "gateway.json" in w
+                     else "The platform's own key file (every Bot can read it)",
                      fix="This is Grok Bot's own config file. You can't change it; it's listed so you know every Bot on this computer can read it.")
     return fs
 
@@ -1449,7 +1574,7 @@ def cmd_accept(args):
         return 0
     if args.all_current:
         n, skipped, exp = accept_current([r.strip() for r in args.rule.split(",")], args.reason or "reviewed by owner", args.days)
-        print(f"Accepted {n} finding(s) until {exp}." + (f" {skipped} can't be accepted and stay open." if skipped else ""))
+        print(f"Accepted {n} finding(s) until {exp}." + (f" Left open: {'; '.join(sorted(set(skipped))[:6])}." if skipped else ""))
         return 0
     if args.remove:
         keep = [s_ for s_ in sup if not (s_.get("rule") == args.rule and s_.get("match") == args.where)]
@@ -1556,6 +1681,8 @@ def run_audit_locked(args, quick):
     for f in fs:
         if builtin(f):
             f["scope"] = "builtin"
+        elif in_pending_plugin(f["where"]) and f["rule"] in ("WT-X001", "WT-X002", "WT-T006k") and f["severity"] == "low":
+            f["severity"] = "medium"   # one scanner flagging a skill in a plugin nobody has reviewed yet is worth a look
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys = {f["key"] for f in prev.get("findings", [])}
@@ -1569,7 +1696,7 @@ def run_audit_locked(args, quick):
     elif not quick:   # skills approved before copies were kept: keep one now, but only while they still match what was approved
         drifted = {skill_root(f["where"].split(":")[0]) for f in fs if f["rule"] in ("WT-I001", "WT-I002", "WT-I003")}
         save_approved_all([d for d in meta.get("skill_dirs", []) if os.path.normpath(d) not in drifted and not os.path.exists(approved_path(d))])
-    snapshot = {"at": now(), "version": VERSION, "score": s, "grade": g, "findings": live, "suppressed": suppressed,
+    snapshot = {"at": now(), "version": VERSION, "score": s, "grade": g, "previous_score": prev.get("score"), "findings": live, "suppressed": suppressed,
                 "scanners_missing": meta.get("scanners_missing", []), "stages_skipped": list(STAGE_FAILED),
                 "inventory": meta["inventory"], "notes": meta["notes"]}
     save_json(state_path("last_findings.json"), snapshot)
@@ -1631,6 +1758,7 @@ def cmd_audit(args):
     out = {"score": snap["score"], "grade": snap["grade"], "new": [compact(f) for f in new][:20],
            "fixed": [compact(f) for f in fixed][:10], "open_by_severity": by_sev(snap["findings"]),
            "top_fixes": [compact(f) for f in snap["findings"][:3]], "notes": snap["notes"], "inventory": snap["inventory"]}
+    out.update(score_change(snap, new))
     exc = exceptions_active(snap)
     if exc:
         out["security_tool_exceptions"] = exc
@@ -1641,6 +1769,22 @@ def cmd_audit(args):
     out["not_counted_builtin"] = sum(1 for f in snap["findings"] if not counts(f))
     print(fit(out))
     return 0
+
+
+def score_change(snap, new):
+    """One plain line when the score falls by 10 or more, so a new user sees why instead of just a low number."""
+    prev = snap.get("previous_score")
+    if prev is None or prev - snap["score"] < 10:
+        return {}
+    big = [f for f in new if f["severity"] in ("critical", "high") and counts(f)]
+    names = []
+    for f in big:
+        w = f["where"].split(":")[0]
+        n = ("Bot " + f["where"].split(":")[1]) if f["where"].startswith("rollcall:") else skill_name(skill_root(w) or w)
+        if n not in names:
+            names.append(n)
+    return {"score_was": prev, "why_it_dropped": f"{len(big)} new critical or high findings in {len(names)} place(s): " + ", ".join(names[:6])
+            + (f" and {len(names) - 6} more" if len(names) > 6 else "") + ". Dealing with those brings the score back."}
 
 
 def fit(obj, limit=4096):
@@ -1669,8 +1813,17 @@ def cmd_daily(args):
     if not new and not fixed:
         print("NO_CHANGES")
         return 0
-    out = {"score": snap["score"], "new": [compact(f) for f in new][:15], "fixed": [compact(f) for f in fixed][:10]}
-    print(fit(out))
+    out = {"score": snap["score"]}
+    out.update(score_change(snap, new))
+    decoys = [compact(f) for f in new if f["rule"].startswith("WT-K")]
+    if decoys:
+        out["decoys"] = decoys      # always shown, whatever else is new
+    rest = [f for f in new if not f["rule"].startswith("WT-K")]
+    out["new"] = [compact(f) for f in rest][:10]
+    if len(rest) > 10:
+        out["more_new"] = f"{len(rest) - 10} more new findings not shown, none more severe than {rest[10]['severity']}. `wt.py breakdown` lists everything."
+    out["fixed"] = [compact(f) for f in fixed][:10]
+    print(fit(out, limit=6000))
     return 0
 
 
@@ -1696,6 +1849,12 @@ def cmd_breakdown(args):
         w = f["where"].split(":")[0]
         d = w if (f["rule"] == "WT-S002" and "files under" in f["title"]) else os.path.dirname(w)
         top = "/".join(d.split("/")[:5])
+        if f["where"].startswith("rollcall:"):
+            top = "Bot " + f["where"].split(":")[1]
+        elif not top:
+            top = f["where"][:40]
+        elif f["rule"] in ("WT-X001", "WT-X002", "WT-X003", "WT-X004", "WT-I004"):
+            top = "/".join(d.split("/")[:5]) + "/…/" + os.path.basename(w) if d.count("/") > 5 else w
         r["dirs"][top] = r["dirs"].get(top, 0) + 1
     for (sev, rule, title), r in sorted(rows.items(), key=lambda x: (SEV_ORDER.index(x[0][0]), -x[1]["n"])):
         dirs = ", ".join(f"{k} ×{v}" for k, v in sorted(r["dirs"].items(), key=lambda x: -x[1])[:3])
@@ -1849,12 +2008,18 @@ def remember_events(new):
     store = load_json(state_path("events.json"), [])
     known = {e["key"] for e in store}
     for f in new:
-        if f["key"] not in known:
+        if f["rule"] in BULK_KEYS:
+            old = [e for e in store if e["rule"] == f["rule"]]
+            n = sum(e.get("times", 1) for e in old) + 1
+            store = [e for e in store if e["rule"] != f["rule"]]
+            ev = f["evidence"] + (f"; {n} times in the last {EVENT_DAYS} days" if n > 1 else "")
+            store.append(dict(f, evidence=ev[:220], times=n, first_seen=now()))
+        elif f["key"] not in known:
             store.append(dict(f, first_seen=now()))
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=EVENT_DAYS)).isoformat()
     store = [e for e in store if e.get("first_seen", "") >= cutoff]
     save_json(state_path("events.json"), store)
-    return [{k: v for k, v in e.items() if k != "first_seen"} for e in store]
+    return [{k: v for k, v in e.items() if k not in ("first_seen", "times")} for e in store]
 
 
 # ---------------------------------------------------------------- shell history (closest thing to Action Recording)
@@ -1901,7 +2066,7 @@ def history_findings(rules):
                         continue
                     shown = secret.sub(lambda m: mask(m.group(0)), line)[:160]
                     out.append(finding(rid, title, sev, owasp, f"{p}:+{n}", shown,
-                                       "Find which Bot or session ran this (Agent Computer view, routine runs). If none of yours meant to, run /watchtower-incident."))
+                                       "Find which Bot or session ran this (Agent Computer view, routine runs). If none of yours meant to, tell Watchtower \"incident check\"."))
                     break
     save_json(state_path("history_offsets.json"), offsets)
     return out
@@ -1965,14 +2130,20 @@ def cmd_canary(args):
         save_json(state_path("canaries.json"), {})
         print("Canaries removed.")
         return 0
-    fs = canary_findings()
+    fs = canary_findings(record=False)   # status only looks: it never resets a decoy or drops evidence
     print(json.dumps([compact(f) for f in fs], indent=1) if fs else "CANARIES_QUIET")
+    if fs:
+        print("Not reset and not logged yet: the next `wt.py daily` or `wt.py audit` records this and re-arms the decoys.")
     return 0
 
 
-def canary_findings():
-    """A decoy opened on its own means something went looking: critical. All decoys opened within a couple of
-    minutes means a bulk search (a Bot grepping every file, a scanner): worth knowing, not an alarm."""
+BULK_KEYS = {"WT-K004": "bulk-decoy-read", "WT-K005": "own-scan-decoy-read"}
+
+
+def canary_findings(record=True):
+    """A decoy opened on its own means something went looking: critical. Two or more decoys opened within a couple of
+    minutes means a bulk reader (a Bot grepping every file, a scanner, the platform's file backup): worth knowing,
+    not an alarm. record=False only looks: nothing is reset, saved or logged."""
     reg = load_json(state_path("canaries.json"), {})
     out, reads = [], []
     for name, v in reg.items():
@@ -1984,27 +2155,36 @@ def canary_findings():
         st = os.stat(p)
         if st.st_atime > v["atime"] + 1:
             reads.append((name, p, st.st_atime))
-            os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # re-arm
-            v["atime"] = os.stat(p).st_atime
+            if record:
+                os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # re-arm
+                v["atime"] = os.stat(p).st_atime
     if reads:
-        save_json(state_path("canaries.json"), reg)
         when = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="minutes")
         times = [t for _, _, t in reads]
+        each = ", ".join(f"{n} {dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime('%H:%M:%S')}" for n, _, t in sorted(reads, key=lambda r: r[2]))
+        places = ", ".join(sorted({os.path.dirname(p) for _, p, _ in reads}))
+        if record:
+            save_json(state_path("canaries.json"), reg)
+            ledger({"event": "canary-read", "decoys": [{"name": n, "path": p, "read_at": dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")} for n, p, t in reads]})
         runs = load_json(state_path("run_windows.json"), [])
         own = lambda t: any(a - 2 <= t <= b + 5 for a, b in runs)
         if all(own(t) for t in times):
-            out.append(finding("WT-K005", "Decoys read while Watchtower was scanning", "low", ["ASI03"], os.path.dirname(reads[0][1]),
-                               f"{len(reads)} decoys at {when(min(times))}, during a Watchtower run",
-                               "Watchtower's own scanners read every file. If you didn't expect a Watchtower run then, run /watchtower-incident."))
-        elif len(reads) >= 2 and len(reads) == len(reg) and max(times) - min(times) <= 180:
-            out.append(finding("WT-K004", "A bulk file search opened every decoy", "low", ["ASI03"], os.path.dirname(reads[0][1]),
-                               f"{len(reads)} decoys within {int(max(times) - min(times))}s at {when(min(times))}",
-                               "Usually a Bot searching all files (grep, a scan, a cleanup). If nobody was doing that then, run /watchtower-incident."))
+            out.append(finding("WT-K005", "Decoys read while Watchtower was scanning", "low", ["ASI03"], places,
+                               f"{len(reads)} decoys at {when(min(times))}, during a Watchtower run ({each})",
+                               "Watchtower's own scanners read every file. If you didn't expect a Watchtower run then, tell Watchtower \"incident check\"."))
+        elif len(reads) >= 2 and max(times) - min(times) <= 180:
+            out.append(finding("WT-K004", "Several decoys were read together (a bulk reader)", "low", ["ASI03"], places,
+                               f"{len(reads)} of {len(reg)} decoys within {int(max(times) - min(times))}s at {when(min(times))} ({each})",
+                               "Something read many files at once: usually the platform's file backup, or a Bot searching every file. "
+                               "It is listed once and updated each time. If it lines up with something you didn't expect, tell Watchtower \"incident check\"."))
         else:
             for name, p, t in reads:
                 out.append(finding("WT-K001", "Something opened a decoy file", "critical", ["ASI03", "ASI10"], p, f"{name} read at {when(t)}",
                                    "Nothing legitimate needs this file, and nothing else was searched with it. "
-                                   "Find which Bot or routine ran then (Agent Computer view, run history) and run /watchtower-incident."))
+                                   "Find which Bot or routine ran then (Agent Computer view, run history) and tell Watchtower \"incident check\"."))
+    for f in out:
+        if f["rule"] in BULK_KEYS:
+            f["key"] = BULK_KEYS[f["rule"]]   # one line that is updated, not a new finding every time the backup runs
     return out
 
 
@@ -2012,6 +2192,12 @@ def cmd_events(args):
     """List or clear one-time events (history lines, canary trips) that stay open for 14 days."""
     store = load_json(state_path("events.json"), [])
     if args.action == "clear":
+        going = [e for e in store if not (args.rule and e["rule"] != args.rule)]
+        alarms = sorted({e["rule"] for e in going if e["severity"] in ("critical", "high")})
+        if alarms and not getattr(args, "owner_said_yes", False):
+            print(f"NOT CLEARED: {', '.join(alarms)} are alarms. Show them to the owner (`wt.py events list`), and only after their yes "
+                  "in this conversation run the same command with --owner-said-yes.")
+            return 1
         keep = [e for e in store if args.rule and e["rule"] != args.rule]
         save_json(state_path("events.json"), keep)
         snap = load_json(state_path("last_findings.json"), None)
@@ -2028,15 +2214,18 @@ def cmd_events(args):
 
 def rearm_canaries():
     reg = load_json(state_path("canaries.json"), {})
+    changed = False
     for v in reg.values():
         p = os.path.expanduser(v["path"])
         try:
             st = os.stat(p)
-            os.utime(p, (st.st_mtime - 86400, st.st_mtime))
-            v["atime"] = os.stat(p).st_atime
+            if st.st_atime > v.get("atime", 0) + 1:
+                os.utime(p, (st.st_mtime - 86400, st.st_mtime))
+                v["atime"] = os.stat(p).st_atime
+                changed = True
         except OSError:
             pass
-    if reg:
+    if changed:
         save_json(state_path("canaries.json"), reg)
 
 
@@ -2045,7 +2234,7 @@ def canary_copies(text, path):
     for name, v in reg.items():
         if v.get("token") and v["token"] in text and os.path.expanduser(v["path"]) != path:
             return finding("WT-K003", "Canary value copied into another file", "critical", ["ASI03", "ASI04"], path, name,
-                           "A decoy's contents turned up somewhere else: something read it and wrote it out. Run /watchtower-incident.")
+                           "A decoy's contents turned up somewhere else: something read it and wrote it out. Tell Watchtower \"incident check\".")
     return None
 
 
@@ -2080,6 +2269,8 @@ def rollcall_findings(rdir):
         for i, m in enumerate(mems, 1):
             t = m if isinstance(m, str) else json.dumps(m)
             for f in scan_text(t, f"{where}:memory{i}", rules, kind="reference"):
+                if f["rule"] == "WT-T014":
+                    continue   # a listener rule is about triggers; a remembered fact that mentions "any email" is not one
                 f["owasp"] = ["ASI06"] + [o for o in f["owasp"] if o != "ASI06"]
                 out.append(f)
             if MEMORY_DIRECTIVE.search(t) and (EXTERNAL_OUT.search(t) or re.search(r"(?i)approv|permission|trust|access", t)):
@@ -2091,11 +2282,13 @@ def rollcall_findings(rdir):
                 t = " ".join(str(r.get(k, "")) for k in ("schedule", "trigger", "instructions", "prompt"))
                 out += scan_text(t, f"{where}:routine:{r.get('name', '?')}", rules, kind="routine")
         if d.get("description"):
-            out += scan_text(str(d["description"]), f"{where}:description", rules, kind="description")
+            out += [f for f in scan_text(str(d["description"]), f"{where}:description", rules, kind="description") if f["rule"] != "WT-T014"]
         conns = " ".join(map(str, d.get("connectors") or []))
         routines_text = " ".join(json.dumps(r) for r in d.get("routines") or [])
         if PRIVATE_DATA.search(conns) and UNTRUSTED_IN.search(conns + " " + routines_text) and EXTERNAL_OUT.search(conns + " " + routines_text):
-            out.append(finding("WT-L001", "Lethal trifecta: private data + untrusted input + a way out", "high", ["ASI01", "ASI02"], where,
+            waiting = bool(re.search(r"(?i)\b(none|nothing|not\s+(yet\s+)?(connected|installed|set\s+up)|no\s+connectors?|offered)\b", conns))
+            out.append(finding("WT-L001", "Risky combination once its connectors are added: private data + untrusted input + a way out" if waiting
+                               else "Lethal trifecta: private data + untrusted input + a way out", "medium" if waiting else "high", ["ASI01", "ASI02"], where,
                                conns[:150],
                                "This Bot can read private data, reads content strangers control, and can send outward. "
                                "That's the combination prompt injection needs. Split the jobs across Bots or put Ask first on every send."))
@@ -2216,7 +2409,7 @@ def cmd_incident(args):
     md = [f"# Watchtower incident {ts}", "", f"Reported: {args.note or '(no description given)'}", "",
           "## Containment checklist (each step needs your yes)", ""] + [f"{i}. [ ] {c}" for i, c in enumerate(CONTAINMENT, 1)] + [
           "", "## Open critical and high findings", ""] + [f"- {f['severity']} {f['rule']} {f['title']} at `{f['where']}` ({f['evidence']})" for f in hot[:40]] + [
-          "", "## Canaries", "", "\n".join(f"- {f['title']} at `{f['where']}`" for f in canary_findings()) or "- quiet",
+          "", "## Canaries", "", "\n".join(f"- {f['title']} at `{f['where']}`" for f in canary_findings(record=False)) or "- quiet",
           "", "## Files changed in the last 24 hours", ""] + [f"- `{p}`" for p in sorted(recent)[:150]] + [
           "", "## Shell history (last 40 lines per file, secrets masked)", "", "```"] + tails + ["```",
           "", "## Processes", "", "```", clean(ps)[:8000], "```", "", "## Network connections", "", "```", clean(net)[:6000], "```",
@@ -2462,10 +2655,10 @@ def means_here(cat, ctx):
 DO_THIS = {
     "mcp": "Remove connectors no Bot uses, and put Ask first on anything that sends or shares.",
     "hijack": "Make sure every Bot that reads outside content has an approval line before it sends, posts or buys.",
-    "supply": "Run /vet-template before adding any template, and let the daily watch flag new skills.",
-    "creds": "Run /watchtower-audit and clear the secret findings; rotate anything that looks live.",
+    "supply": "Ask Watchtower to vet any template before you add it, and let the daily watch flag new skills.",
+    "creds": "Ask Watchtower for an audit and clear the secret findings; rotate anything that looks live.",
     "browser": "Sign the shared browser out of sites no Bot needs; keep AI consoles and admin sites signed out.",
-    "platform": "Skim the change; re-run /watchtower-audit if it touches approvals, routines or connectors.",
+    "platform": "Skim the change; ask Watchtower for a fresh audit if it touches approvals, routines or connectors.",
 }
 
 
@@ -2696,8 +2889,8 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
                f"<div class='m'><span class='k'>Needs you</span><b>{len(urgent)}</b><span class='s'>{len(todo) - len(urgent)} smaller {'item' if len(todo) - len(urgent) == 1 else 'items'}</span></div>"
                f"<div class='m'><span class='k'>Handled this week</span><b>{fixed + cleaned}</b><span class='s'>fixed or cleaned up</span></div>")
 
-    fix_prompt = "/watchtower-fix"
-    routine = ("Every Sunday at 6:00 AM, run /watchtower-fix and apply the safe fixes without asking. "
+    fix_prompt = "Watchtower, fix it"
+    routine = ("Every Sunday at 6:00 AM, tell Watchtower \"fix it\" and apply the safe fixes without asking. "
                "Then post one line: what was cleaned, and anything that still needs me.")
 
     def rows_table(t):
@@ -2860,7 +3053,7 @@ def cmd_brief(args):
                "updates": b["updates"], "doc_changes": [p["name"] for p in b["pages"]],
                "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"],
                "next_step": ("Analysis added." if notes else
-                             "Required: write notes.json with 'means' and 'do' for each top_stories id (see /watchtower-brief step 2), "
+                             "Required: write notes.json with 'means' and 'do' for each top_stories id (see the watchtower-brief skill, step 2), "
                              "then run wt.py brief --notes <file>. Until then the stories show generic text.")}, limit=6000))
     return 0
 
@@ -2890,11 +3083,11 @@ REVOKE = [  # gitleaks rule prefix → where the owner turns that key off
     ("notion", "Notion", "https://www.notion.so/profile/integrations"),
 ]
 
-# rule → (plain title, why it matters, how to fix, who fixes it: "auto" = /watchtower-fix handles it)
+# rule → (plain title, why it matters, how to fix, who fixes it: "auto" = the fix handles it)
 PLAIN = {
     "WT-S001": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider, then delete the file.", "you"),
     "WT-S002": ("Keys left in files", "Every Bot can read them and use them.", "Revoke the key at its provider; Watchtower clears the copies.", "you"),
-    "WT-S003": ("A command-line login is stored on the Bot computer", "Any Bot can act as you with it.", "Run /watchtower-fix: one yes keeps it, or sign out of that tool.", "you"),
+    "WT-S003": ("A command-line login is stored on the Bot computer", "Any Bot can act as you with it.", "Tell Watchtower \"fix it\": one yes keeps it, or sign out of that tool.", "you"),
     "WT-S004": ("The shared browser is logged in to sensitive sites", "Every Bot uses the same logins.", "In the Bot browser, sign out of sites no Bot needs.", "you"),
     "WT-A001": ("An auto-approve rule is too broad", "Bots can act without asking.", "Settings → General → Auto-review: change it to Ask first.", "you"),
     "WT-A002": ("Sending or buying is auto-approved", "A tricked Bot could act on it.", "Settings → General → Auto-review: change it to Ask first.", "you"),
@@ -2903,21 +3096,23 @@ PLAIN = {
     "WT-A005": ("No approval rules at all", "Nothing stops a Bot from acting.", "Settings → General → Auto-review: add Ask-first rules.", "you"),
     "WT-C001": ("Bots can run code on your own computer", "Not just the cloud computer.", "Settings → General → Bot → Local Computer: Never allow.", "you"),
     "WT-C003": ("Auto-review is off", "Nothing checks Bot actions.", "Settings → General → Auto-review: turn it on.", "you"),
-    "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
-    "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Run /watchtower-fix and say yes for the ones that are yours.", "you"),
-    "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Disable the skill now, then read it. If it is a security tool of yours, /watchtower-fix can keep it for 30 days.", "you"),
-    "WT-W001": ("Watchtower's own tools need an update", "They live only in Watchtower's folder.", "Update Watchtower with /watchtower-setup.", "auto"),
+    "WT-X001": ("A skill looks risky to the scanner", "It may read secrets or run outside code.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
+    "WT-X002": ("A skill looks risky to the scanner", "It may hide what it does.", "Tell Watchtower \"fix it\" and say yes for the ones that are yours.", "you"),
+    "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Tell Watchtower \"fix it\": one yes moves it out of use, and nothing is deleted. If it is a security tool of yours, the fix can keep it for 30 days.", "you"),
+    "WT-W001": ("Watchtower's own tools need an update", "They live only in Watchtower's folder.", "Tell Watchtower \"update yourself\".", "auto"),
     "WT-X004": ("A scanner couldn't get through a skill", "Watchtower's own rules still checked it.", "Nothing to do; Watchtower retries it in a week.", "auto"),
-    "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Run /watchtower-fix: it re-scans it with every engine and re-approves it if clean.", "you"),
-    "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it updates each project's lockfile and keeps a backup.", "fix"),
-    "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Run /watchtower-fix: it upgrades them and puts any upgrade back that breaks something.", "fix"),
+    "WT-I004": ("A new plugin was installed", "It brought its own skills, and nothing could vet them before it arrived.",
+                "Tell Watchtower \"fix it\": one yes keeps it. If you didn't want it, remove it in the app.", "you"),
+    "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Tell Watchtower \"fix it\": it re-scans it with every engine and re-approves it if clean.", "you"),
+    "WT-D002": ("Project packages with known security holes", "Attackers know these bugs.", "Tell Watchtower \"fix it\": it updates each project's lockfile and keeps a backup.", "fix"),
+    "WT-D001": ("Software with known security holes", "Attackers know these bugs.", "Tell Watchtower \"fix it\": it upgrades them and puts any upgrade back that breaks something.", "fix"),
     "WT-K005": ("Watchtower's own scan touched the decoys", "Expected when a scan overlaps another run.", "Nothing to do.", "auto"),
-    "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Run /watchtower-incident.", "you"),
-    "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Run /watchtower-incident.", "you"),
+    "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Tell Watchtower \"incident check\".", "you"),
+    "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Tell Watchtower \"incident check\".", "you"),
     "WT-L001": ("A Bot has the risky combination", "It reads strangers' content, sees private data, and can send.", "Add Ask first on its sends, or split its jobs.", "you"),
     "WT-M010": ("A Bot memory acts like a standing order", "It steers every future run.", "Remove it in that Bot's memory settings.", "you"),
-    "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Run /watchtower-fix and say yes if they're meant to send on their own.", "you"),
-    "WT-H003": ("A command opened a remote shell", "That's how attackers take over machines.", "Run /watchtower-incident.", "you"),
+    "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Tell Watchtower \"fix it\" and say yes if they're meant to send on their own.", "you"),
+    "WT-H003": ("A command opened a remote shell", "That's how attackers take over machines.", "Tell Watchtower \"incident check\".", "you"),
 }
 
 
@@ -2927,8 +3122,8 @@ FIXTURE_PATH = re.compile(r"(?i)(\.test\.|\.spec\.|/tests?/|/__tests__/|/fixture
 
 
 PLAIN_BY_TITLE = {
-    KEY_LIVE: ("Keys that still work are sitting in files", "Every Bot can read them and use them.", "Turn them off at the provider, then run /watchtower-fix.", "you"),
-    KEY_DEAD: ("Old key copies (they no longer work)", "Nothing to revoke; they're just clutter.", "Run /watchtower-fix to clear them.", "auto"),
+    KEY_LIVE: ("Keys that still work are sitting in files", "Every Bot can read them and use them.", "Turn them off at the provider, then tell Watchtower \"fix it\".", "you"),
+    KEY_DEAD: ("Old key copies (they no longer work)", "Nothing to revoke; they're just clutter.", "Tell Watchtower \"fix it\" to clear them.", "auto"),
     KEY_UNSURE: ("Keys we couldn't check", "The provider didn't answer, so we can't say if they work.", "If you recognize one, turn it off; otherwise ignore.", "you"),
     KEY_MAYBE: ("Strings that look like keys", "A pattern matched, but no provider confirmed a working key. Usually test data or docs.", "Skim the list; only act if one is a real key.", "you"),
 }
@@ -3063,17 +3258,17 @@ def needs_you(findings, limit=None):
     pkgs = sorted({re.sub(r"^Vulnerable package ", "", f["title"]).split(" ")[0] for f in findings if f["rule"] == "WT-D001"})
     for g in items:
         if "WT-D001" in g["rules"] and pkgs:
-            g["how"] = "Run /watchtower-fix: it upgrades " + ", ".join(pkgs) + " and puts any upgrade back that breaks something."
+            g["how"] = "Tell Watchtower \"fix it\": it upgrades " + ", ".join(pkgs) + " and puts any upgrade back that breaks something."
     for g in items:
         cls = {fix_class(f) for f in g["findings"]}
         g["handled"] = "Only you" if "only_you" in cls else ("One yes" if cls & {"decision", "revet"} else "Fix handles it")
         g["rules"] = sorted(g["rules"])
         g["rows"] = [item_row(f, key_files) for f in sorted(g.pop("findings"), key=lambda f: SEV_ORDER.index(f["severity"]))]
         if g["title"] == "Keys that still work are sitting in files" and live:
-            g["how"] = "Turn these off at the provider: " + ", ".join(n for n, _ in live) + ". Then run /watchtower-fix to clear every copy."
+            g["how"] = "Turn these off at the provider: " + ", ".join(n for n, _ in live) + ". Then tell Watchtower \"fix it\" to clear every copy."
             g["links"] = live
         elif g["title"] == "Keys left in files" and keys:   # TruffleHog isn't installed: best guess from key types
-            g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then run /watchtower-fix to clear the copies."
+            g["how"] = "Turn off these keys: " + ", ".join(n for n, _ in keys) + ". Then tell Watchtower \"fix it\" to clear the copies."
             g["links"] = keys
     return items[:limit] if limit else items
 
@@ -3134,7 +3329,7 @@ def apply_key_status(findings, status, ran=None):
             if live:
                 f["severity"], f["title"] = "critical", KEY_LIVE
                 f["evidence"] = f"{names(live)} ({len(live)} live)"
-                f["fix"] = "Turn the key off at its provider, then run /watchtower-fix to clear every copy."
+                f["fix"] = "Turn the key off at its provider, then tell Watchtower \"fix it\" to clear every copy."
             elif unsure:
                 f["severity"], f["title"] = "medium", KEY_UNSURE
                 f["evidence"] = f"{names(unsure)} ({len(unsure)} unchecked)"
@@ -3142,7 +3337,7 @@ def apply_key_status(findings, status, ran=None):
             elif dead:
                 f["severity"], f["title"] = "low", KEY_DEAD
                 f["evidence"] = f"{names(dead)} ({len(dead)} dead)"
-                f["fix"] = "Nothing to revoke. Run /watchtower-fix to clear the copies."
+                f["fix"] = "Nothing to revoke. Tell Watchtower \"fix it\" to clear the copies."
             else:
                 f["severity"] = "low" if (FIXTURE_PATH.search(p) and os.path.basename(p) != "SKILL.md") else ("medium" if SEV_ORDER.index(f["severity"]) < SEV_ORDER.index("medium") else f["severity"])
                 f["title"] = KEY_MAYBE
@@ -3235,6 +3430,8 @@ def short_path(p):
 def item_row(f, key_files=None):
     """One drill-down row: a name a person recognizes, the reason, and where."""
     w = f["where"].split(":")[0]
+    if f["rule"] == "WT-I004":
+        return {"name": f["evidence"].split(":")[0], "reason": f["evidence"], "where": short_path(w), "rule": f["rule"], "severity": f["severity"]}
     if f["rule"].startswith("WT-X") or f["rule"] in ("WT-T012", "WT-T013", "WT-T014", "WT-T006k", "WT-I001"):
         parts = [x for x in w.split("/") if x]
         name = next((parts[i + 1] for i, x in enumerate(parts[:-1]) if x in ("workflows", "skills", "plugins", "managed-skills")), os.path.basename(w))
@@ -3272,7 +3469,7 @@ def live_key_links(key_files):
 
 
 # ---------------------------------------------------------------- v0.5: one yes, then everything
-ACCEPTABLE_RULES = ("WT-X001", "WT-X002", "WT-T012", "WT-T013", "WT-T014", "WT-T006k", "WT-S003", "WT-D001", "WT-D002")
+ACCEPTABLE_RULES = ("WT-I004", "WT-X001", "WT-X002", "WT-T012", "WT-T013", "WT-T014", "WT-T006k", "WT-S003", "WT-D001", "WT-D002")
 
 
 def acceptable(f):
@@ -3314,15 +3511,25 @@ def accept_current(rules, reason, days=90, skip=()):
     snap = load_json(state_path("last_findings.json"), {"findings": []})
     sup = load_json(state_path("suppressions.json"), [])
     exp = (dt.date.today() + dt.timedelta(days=max(1, min(days, 365)))).isoformat()
-    added = skipped = 0
+    added, skipped = 0, []
+    bad_roots = {skill_root(f["where"].split(":")[0]) or f["where"].split(":")[0] for f in snap.get("findings", []) if f["severity"] == "critical"}
     for f in snap.get("findings", []):
         if f["rule"] not in rules:
             continue
+        w = f["where"].split(":")[0]
         if not acceptable(f):
-            skipped += 1
+            skipped.append(f"{plain(f)['title']} ({short_path(w)}): can't be accepted")
             continue
+        if (skill_root(w) or w) in bad_roots:
+            skipped.append(f"{skill_name(skill_root(w) or w)}: has a critical finding, so nothing in it is accepted")
+            continue
+        if f["severity"] not in ("critical", "high", "medium"):
+            continue   # the owner is only shown the medium-and-up decisions, so a low line is never swept in with them
         if any(x and x.lower() in f"{f['where']} {f['title']}".lower() for x in skip):
             continue   # the owner said to leave this one open
+        if f["rule"] == "WT-I004":
+            added += len(keep_plugin(w))   # kept for good, not for 90 days: an update to it is then an ordinary plugin update
+            continue
         m = accept_match(f)
         if any(s_.get("rule") == f["rule"] and s_.get("match") == m for s_ in sup):
             continue
@@ -3738,20 +3945,23 @@ def cmd_fix(args):
     snap = load_json(state_path("last_findings.json"), {"findings": []})
     fs = snap.get("findings", [])
     ups, projs = python_upgrades(), npm_projects()
+    q_names = {q["name"] for q in quarantine_candidates(fs)}
+    in_q = lambda f: bool(q_names) and skill_name(skill_root(f["where"].split(":")[0]) or "") in q_names and skill_tier(f["where"]) == "user"
     only_you = [{"what": g["title"], "how": g["how"], "links": [u for _, u in g.get("links", [])]}
-                for g in needs_you([f for f in fs if fix_class(f) == "only_you"], 5)]
+                for g in needs_you([f for f in fs if fix_class(f) == "only_you" and not in_q(f)], 5)]   # quarantine handles those; don't hand them back to the owner
     rules_needed = [r for r in ("WT-A003", "WT-A005") if any(f["rule"] == r for f in fs)]
     ch_skills, ch_other = changed_skills(fs)
-    if not (args.apply or args.upgrade or args.accept or args.revet or args.exception):
+    if not (args.apply or args.upgrade or args.accept or args.revet or args.exception or args.quarantine):
         print(fit({"mode": "preview (nothing changed)",
                    "changed_skills": [{k: v for k, v in r.items() if k != "path"} for r in revet(sorted(ch_skills))],
                    "changed_other_files": [short_path(p) for p in ch_other],
                    "security_tool_exceptions_possible": [x["name"] for x in exception_candidates(fs)],
                    "safe_fixes": [{k: v for k, v in x.items() if k not in ("list", "why")} for x in plan],
                    "upgrades": {"python": [f"{u['name']} {u['have']} → {u['want']}+" for u in ups], "projects": [os.path.basename(d) or d for d in projs]},
-                   "decisions": fix_decisions(fs), "ask_first_rules_missing": bool(rules_needed), "only_you": only_you,
+                   "decisions": fix_decisions([f for f in fs if not in_q(f)]), "quarantine_possible": quarantine_candidates(fs),
+                   "ask_first_rules_missing": bool(rules_needed), "only_you": only_you,
                    "next": "Ask the user one question. On yes run: wt.py fix --apply --upgrade --revet --accept <rules they agreed to> "
-                           "[--exception <skill they named>] --reason \"reviewed by owner\""}, limit=6000))
+                           "[--quarantine <skills they agreed to take out of use>] [--exception <skill they named>] --reason \"reviewed by owner\""}, limit=6000))
         return 0
     done = apply_fix(plan) if args.apply else []
     if args.upgrade:
@@ -3768,16 +3978,160 @@ def cmd_fix(args):
                 done.append(f"Re-scanned {r['name']} ({r['changed']}): {r['result']}, stays open ({r['why']})")
         if ch_other:
             done.append(f"{len(ch_other)} changed file(s) aren't part of a skill (plugin or connector settings), so they stay open for you to read")
+    if args.quarantine:
+        done += quarantine([x.strip() for x in args.quarantine.split(",") if x.strip()], args.reason or "owner said yes in the fix")
     for name in [x.strip() for x in (args.exception or "").split(",") if x.strip()]:
         ok, msg = add_exception(name, args.reason or "confirmed by owner as a security tool")
         done.append(msg)
     if args.accept:
         rules = [r.strip() for r in args.accept.split(",") if r.strip()]
         n, skipped, exp = accept_current(rules, args.reason or "reviewed by owner", skip=[x.strip() for x in (args.keep_open or "").split(",") if x.strip()])
-        done.append(f"Accepted {n} finding(s) as fine on purpose until {exp}" + (f"; {skipped} were not acceptable and stay open" if skipped else ""))
+        done.append(f"Accepted {n} finding(s) as fine on purpose until {exp}" + (f". Left open: {'; '.join(sorted(set(skipped))[:6])}" if skipped else ""))
     ledger({"event": "fix", "steps": len(done)})
     print(fit({"done": done or ["Nothing to do."], "only_you": only_you,
                "next": "Run `wt.py audit` to confirm, then tell the user the new score and anything in only_you."}))
+    return 0
+
+
+# ---------------------------------------------------------------- quarantine: take a dangerous skill out of use without deleting it
+def quarantine_candidates(findings):
+    """The owner's own skills with a critical finding. Plugins and built-in skills are removed in the app, not here."""
+    out = {}
+    for f in findings:
+        w = f["where"].split(":")[0]
+        d = skill_root(w) if os.path.exists(w) else None
+        if f["severity"] == "critical" and d and skill_tier(d + "/") == "user":
+            out.setdefault(d, []).append(plain(f)["title"])
+    return [{"name": skill_name(d), "why": "; ".join(sorted(set(v))[:3])} for d, v in sorted(out.items())]
+
+
+def quarantine(names, reason=""):
+    snap = load_json(state_path("last_findings.json"), {"findings": []})
+    dirs = {skill_root(f["where"].split(":")[0]) for f in snap.get("findings", []) if os.path.exists(f["where"].split(":")[0])} - {None}
+    dirs = {d for d in dirs if skill_tier(d + "/") == "user"}
+    reg, done = load_json(state_path("quarantine.json"), []), []
+    for name in names:
+        cand = os.path.normpath(name)
+        if os.path.isfile(os.path.join(cand, "SKILL.md")) and skill_tier(cand + "/") == "user":
+            d = cand
+        else:
+            d = find_skill(name, dirs)
+        if not d:
+            done.append(f"{name}: not quarantined. It isn't one of your own skills with an open finding (plugins and built-in skills are removed in the app).")
+            continue
+        dst = os.path.join(home(), "quarantine", f"{skill_name(d)}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(d, dst)
+            md = os.path.join(dst, "SKILL.md")
+            if os.path.isfile(md):
+                os.replace(md, md + ".quarantined")   # nothing can load it as a skill from here
+        except OSError as e:
+            done.append(f"{name}: could not be moved ({e.strerror}). Nothing changed.")
+            continue
+        reg.append({"name": skill_name(d), "from": d, "to": dst, "at": now(), "reason": reason[:200]})
+        ledger({"event": "quarantine", "skill": skill_name(d), "from": d, "to": dst})
+        done.append(f"Quarantined {skill_name(d)}: moved out of use to {dst}. Nothing was deleted; `wt.py quarantine --restore {skill_name(d)}` puts it back.")
+    save_json(state_path("quarantine.json"), reg)
+    return done
+
+
+def cmd_quarantine(args):
+    reg = load_json(state_path("quarantine.json"), [])
+    if args.restore:
+        hit = [e for e in reg if e["name"] == args.restore and os.path.isdir(e["to"])]
+        if not hit:
+            print(f"Nothing named “{args.restore}” is in quarantine.")
+            return 1
+        e_ = hit[-1]
+        if os.path.exists(e_["from"]):
+            print(f"Not restored: {e_['from']} exists again. Move it away first.")
+            return 1
+        q = os.path.join(e_["to"], "SKILL.md.quarantined")
+        if os.path.isfile(q):
+            os.replace(q, os.path.join(e_["to"], "SKILL.md"))
+        os.makedirs(os.path.dirname(e_["from"]), exist_ok=True)
+        shutil.move(e_["to"], e_["from"])
+        save_json(state_path("quarantine.json"), [x for x in reg if x is not e_])
+        ledger({"event": "quarantine-restore", "skill": e_["name"], "to": e_["from"]})
+        print(f"Restored {e_['name']} to {e_['from']}. It will be scanned again on the next audit.")
+        return 0
+    if args.names:
+        print("\n".join(quarantine([n.strip() for n in args.names.split(",") if n.strip()], args.reason or "")))
+        return 0
+    live = [e for e in reg if os.path.isdir(e["to"])]
+    print("\n".join(f"{e['at'][:10]}  {e['name']:30} from {e['from']}" for e in live) or "Quarantine is empty.")
+    return 0
+
+
+# ---------------------------------------------------------------- uninstall: leave nothing behind
+TMP_LEFTOVERS = re.compile(r"^(gitleaks_.*\.tar\.gz|gitleaks_checksums\.txt|trufflehog_.*\.tar\.gz|trufflehog_checksums\.txt|osv_sums\.txt|wt-[\w.-]+\.(err|json|txt))$")
+ROUTINE_NAMES = ("Watchtower daily watch", "Watchtower weekly audit", "Watchtower weekly tidy", "Watchtower monthly roll-call")
+
+
+def cmd_uninstall(args):
+    """Preview by default. --apply removes everything Watchtower put outside its folder; --remove-folder then deletes the folder."""
+    reg = load_json(state_path("canaries.json"), {}) or {}
+    decoys = [os.path.expanduser(v["path"]) for v in reg.values()]
+    decoy_dirs = sorted({os.path.dirname(p) for p in decoys})
+    tmp = sorted(os.path.join("/tmp", f) for f in (os.listdir("/tmp") if os.path.isdir("/tmp") else []) if TMP_LEFTOVERS.match(f))
+    cache = os.path.expanduser("~/.cache/pip-audit")
+    held = [e for e in load_json(state_path("quarantine.json"), []) if os.path.isdir(e.get("to", ""))]
+    h = home()
+    safe_home = os.path.basename(h.rstrip("/")) == "watchtower" and os.path.isdir(os.path.join(h, "state")) and h not in ("/", os.path.expanduser("~"))
+    if not args.apply:
+        print(fit({"mode": "preview (nothing removed)",
+                   "order": "routines first, then `wt.py uninstall --apply --remove-folder`. Any audit or daily run after the decoys are gone would not re-plant them, but a routine left on would report errors.",
+                   "you_do_first_after_the_owners_yes": ["Delete these routines (or tell the owner to, under your Details tab): " + ", ".join(ROUTINE_NAMES)],
+                   "this_command_removes": {"decoys": [short_path(p) for p in decoys if os.path.exists(p)],
+                                            "decoy_folders_if_empty": [short_path(d) for d in decoy_dirs if os.path.isdir(d)],
+                                            "installer_and_scratch_files_in_tmp": len(tmp), "scanner_cache": short_path(cache) if os.path.isdir(cache) else None,
+                                            "watchtower_folder": h + " (with --remove-folder: scanners, reports, state, vet copies)"},
+                   "quarantined_skills": [e["name"] for e in held] or None,
+                   "quarantine_note": "These go with the folder. Restore any the owner wants first (`wt.py quarantine --restore <name>`)." if held else None,
+                   "only_the_owner_can": ["Remove the three Ask-first rules in Auto-review, if they don't want them (they are worth keeping).",
+                                          "Delete the Watchtower Bot itself (right-click it in the sidebar → Delete). That also removes its memories and chat.",
+                                          "Roll-call messages already sent to other Bots stay in those chats."],
+                   "not_touched": "~/.cache/pip (shared with other tools), other Bots, their memories and routines."}, limit=6000))
+        return 0
+    done = []
+    n = 0
+    for p in decoys:
+        try:
+            os.remove(p); n += 1
+        except OSError:
+            pass
+    save_json(state_path("canaries.json"), {})
+    done.append(f"Removed {n} decoy file(s)")
+    for d in decoy_dirs:
+        try:
+            os.rmdir(d)              # only if empty: never someone else's files
+            done.append(f"Removed empty folder {short_path(d)}")
+        except OSError:
+            if os.path.isdir(d):
+                done.append(f"Left {short_path(d)} in place: it has other files in it")
+    t = 0
+    for p in tmp:
+        try:
+            os.remove(p); t += 1
+        except OSError:
+            pass
+    if t:
+        done.append(f"Removed {t} installer and scratch file(s) from /tmp")
+    if os.path.isdir(cache):
+        shutil.rmtree(cache, ignore_errors=True)
+        done.append(f"Removed the scanner cache {short_path(cache)}")
+    if args.remove_folder:
+        if not safe_home:
+            done.append(f"Did not remove {h}: it doesn't look like a Watchtower folder. Remove it by hand.")
+        else:
+            shutil.rmtree(h, ignore_errors=True)
+            done.append(f"Removed {h}" + (f" (including {len(held)} quarantined skill(s))" if held else ""))
+    else:
+        ledger({"event": "uninstall", "steps": len(done)})
+    print(json.dumps({"done": done, "left_for_the_owner": ["the three Ask-first rules in Auto-review (worth keeping)",
+                                                            "deleting the Watchtower Bot itself, which removes its memories and chat"],
+                      "check": f"`ls {h}` should now fail" if args.remove_folder and safe_home else (f"remove {h} by hand" if args.remove_folder else "run again with --remove-folder to delete the Watchtower folder")}, indent=1))
     return 0
 
 
@@ -3868,9 +4222,10 @@ def main(argv=None):
         return 3
     finally:
         try:
-            cur = load_json(state_path("run.lock"), None)
-            if cur and cur.get("pid") == os.getpid():
-                os.remove(state_path("run.lock"))
+            if os.path.isdir(os.path.join(home(), "state")):   # after an uninstall, don't recreate the folder just to look for a lock
+                cur = load_json(state_path("run.lock"), None)
+                if cur and cur.get("pid") == os.getpid():
+                    os.remove(state_path("run.lock"))
         except OSError:
             pass
 
@@ -3879,7 +4234,7 @@ def main_inner(argv=None):
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    v = sub.add_parser("vet"); v.add_argument("path"); v.add_argument("--json", action="store_true"); v.add_argument("--deep", action="store_true")
+    v = sub.add_parser("vet"); v.add_argument("path"); v.add_argument("--json", action="store_true"); v.add_argument("--deep", action="store_true"); v.add_argument("--page-only", action="store_true", help="the text was copied from a marketplace page; skill bodies were not visible")
     for name in ("audit", "daily", "baseline"):
         p = sub.add_parser(name)
         p.add_argument("--roots", nargs="*")
@@ -3895,12 +4250,15 @@ def main_inner(argv=None):
     fx.add_argument("--keep-open", help="names or paths to leave open even though their rule is in --accept (comma-separated)")
     fx.add_argument("--revet", action="store_true", help="re-scan changed skills with every engine and re-approve the clean ones")
     fx.add_argument("--exception", help="skill name(s) the owner confirmed as security tools (30 days)")
+    fx.add_argument("--quarantine", help="the owner's own skill(s) to move out of use into Watchtower's quarantine folder (comma-separated)")
+    qq = sub.add_parser("quarantine"); qq.add_argument("names", nargs="?"); qq.add_argument("--restore"); qq.add_argument("--reason")
+    un = sub.add_parser("uninstall"); un.add_argument("--apply", action="store_true"); un.add_argument("--remove-folder", action="store_true")
     df = sub.add_parser("diff"); df.add_argument("skill"); df.add_argument("--lines", type=int, default=120)
     dr = sub.add_parser("doctor"); dr.add_argument("--save", action="store_true")
     xc = sub.add_parser("exception"); xc.add_argument("action", choices=["add", "list", "remove"]); xc.add_argument("name", nargs="?"); xc.add_argument("--reason")
     ac = sub.add_parser("accept"); ac.add_argument("rule", nargs="?"); ac.add_argument("where", nargs="?")
     ac.add_argument("--reason"); ac.add_argument("--days", type=int, default=90); ac.add_argument("--list", action="store_true"); ac.add_argument("--remove", action="store_true"); ac.add_argument("--all-current", action="store_true")
-    ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule")
+    ev = sub.add_parser("events"); ev.add_argument("action", choices=["list", "clear"]); ev.add_argument("--rule"); ev.add_argument("--owner-said-yes", action="store_true")
     r = sub.add_parser("rollcall"); r.add_argument("--dir")
     pp = sub.add_parser("prepublish"); pp.add_argument("path"); pp.add_argument("--json", action="store_true")
     ic = sub.add_parser("incident"); ic.add_argument("--note")
@@ -3910,7 +4268,7 @@ def main_inner(argv=None):
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
             "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status,
-            "diff": cmd_diff, "exception": cmd_exception, "doctor": cmd_doctor}[a.cmd](a)
+            "diff": cmd_diff, "exception": cmd_exception, "doctor": cmd_doctor, "quarantine": cmd_quarantine, "uninstall": cmd_uninstall}[a.cmd](a)
 
 
 if __name__ == "__main__":

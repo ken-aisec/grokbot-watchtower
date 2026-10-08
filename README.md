@@ -8,16 +8,19 @@ Watchtower is a security officer for that setup. It is read-only until you say y
 
 | Skill | What you get |
 | --- | --- |
-| `/vet-template` | Install / Install with changes / Do not install for any template, skill or plugin, with a risk score, evidence, its autonomy level (L0 observe → L3 unattended), and the boundary line to paste into its description |
-| `/watchtower-audit` | A 0–100 posture score and the top three fixes across skills, plugins, MCP configs, Auto Review rules, local execution, logged-in browser sessions, CLI credentials, secrets, vulnerable packages, persistence, integrity drift, canaries and shell history |
-| `/watchtower-brief` | The weekly report, one page you can read in a minute: status, score, threat level, trend charts, a one-click fix, what needs you, and the three threats that matter to your setup |
-| `/watchtower-report` | Weekly Markdown report and a self-contained HTML dashboard |
-| `/watchtower-rollcall` | DMs every Bot for its routines, connectors and stored memories, then flags poisoned memories, unsafe routines and the lethal trifecta (private data + untrusted input + a way out) |
-| `/watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
-| `/watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
-| `/watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
-| `/watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages and npm lockfiles (each upgrade is backed up and undone automatically if it breaks something), adds your Ask-first rules, and accepts findings that are fine on purpose, after asking you a single question |
-| `/watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
+| `vet-template` | Install / Install with changes / Do not install for any template, skill or plugin, with a risk score, evidence, its autonomy level (L0 observe → L3 unattended), and the boundary line to paste into its description |
+| `watchtower-audit` | A 0–100 posture score and the top three fixes across skills, plugins, MCP configs, Auto Review rules, local execution, logged-in browser sessions, CLI credentials, secrets, vulnerable packages, persistence, integrity drift, canaries and shell history |
+| `watchtower-brief` | The weekly report, one page you can read in a minute: status, score, threat level, trend charts, a one-click fix, what needs you, and the three threats that matter to your setup |
+| `watchtower-report` | Weekly Markdown report and a self-contained HTML dashboard |
+| `watchtower-rollcall` | DMs every Bot for its routines, connectors and stored memories, then flags poisoned memories, unsafe routines and the lethal trifecta (private data + untrusted input + a way out) |
+| `watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
+| `watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
+| `watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
+| `watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages and npm lockfiles (each upgrade is backed up and undone automatically if it breaks something), moves your own dangerous skills into a quarantine folder (nothing is deleted, and each can be restored), and accepts findings that are fine on purpose, after asking you a single question |
+| `watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
+| `watchtower-uninstall` | Removes Watchtower and everything it created (routines, decoys, scanners, caches, its folder) after one yes |
+
+On a template install these are files the Bot reads, not slash commands: ask in plain words ("audit", "fix it", "roll-call", "vet this link", "uninstall").
 
 | Routine | When | Cost |
 | --- | --- | --- |
@@ -43,14 +46,14 @@ Scripts find, the model judges, you approve. Scanning is deterministic Python wi
 ## Install (in Grok Bot)
 
 1. Add the Watchtower template from its x.ai link.
-2. Run `/watchtower-setup`.
+2. Say yes when Watchtower asks to set itself up.
 
 Manual install on the cloud computer:
 
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.2/scripts/install.sh
-head -30 install.sh && bash install.sh v0.6.2
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.3/scripts/install.sh
+head -30 install.sh && bash install.sh v0.6.3
 bash /workspace/watchtower/app/scripts/install.sh --scanners
 python3 /workspace/watchtower/app/watchtower/wt.py audit
 ```

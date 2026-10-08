@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watchtower installer. Pinned, checksummed, and confined to /workspace/watchtower.
-# Usage: bash install.sh v0.6.2 [commit]   install that tagged release; with a commit ID, refuse anything else
+# Usage: bash install.sh v0.6.3 [commit]   install that tagged release; with a commit ID, refuse anything else
 #        bash install.sh --scanners        add the optional scanners (second half of this file)
 set -euo pipefail
 WT_HOME="${WATCHTOWER_HOME:-/workspace/watchtower}"
@@ -8,7 +8,7 @@ REPO="https://github.com/ken-aisec/grokbot-watchtower"
 
 if [[ "${1:-}" != "--scanners" ]]; then
   # ---- This is everything that runs for `bash install.sh <tag>`. It only writes inside $WT_HOME.
-  TAG="${1:?usage: install.sh <tag> [commit]  (for example v0.6.2)}"; WANT="${2:-}"
+  TAG="${1:?usage: install.sh <tag> [commit]  (for example v0.6.3)}"; WANT="${2:-}"
   mkdir -p "$WT_HOME"/{state,reports,exports,vet}
   rm -rf "$WT_HOME/app.new"
   git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$TAG" "$REPO" "$WT_HOME/app.new"
@@ -72,4 +72,5 @@ if [[ -n "$ga" ]]; then
 fi
 "$WT_HOME/scanners/bin/skillspector" --version || echo "SkillSpector did not install; Watchtower works without it and says so in the audit."
 [[ -x "$WT_HOME/bin/gitleaks" ]] && "$WT_HOME/bin/gitleaks" version || true
+rm -f /tmp/gitleaks_*_linux_*.tar.gz /tmp/gitleaks_checksums.txt /tmp/trufflehog_*_linux_*.tar.gz /tmp/trufflehog_checksums.txt /tmp/osv_sums.txt /tmp/wt-lock.err
 echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."

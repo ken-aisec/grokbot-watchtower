@@ -428,6 +428,9 @@ class Features(unittest.TestCase):
         f = wt.finding("WT-K001", "Canary file was read", "critical", ["ASI03"], "/x", "customers", "fix")
         wt.remember_events([f])
         code, o = self.out("events", "clear", "--rule", "WT-K001")
+        self.assertIn("NOT CLEARED", o)                                   # an alarm is never cleared on the Bot's own say-so
+        self.assertEqual(len(wt.remember_events([])), 1)
+        code, o = self.out("events", "clear", "--rule", "WT-K001", "--owner-said-yes")
         self.assertIn("Cleared 1", o)
         self.assertEqual(wt.remember_events([]), [])
 
@@ -623,7 +626,7 @@ class Features(unittest.TestCase):
               F("WT-D002", "Vulnerable package next 16.3.4", "high", ["ASI04"], "/ws/app", "npm: 1 known", "f")]
         wt.save_json(wt.state_path("last_findings.json"), {"findings": fs})
         n, skipped, exp = wt.accept_current(["WT-X001", "WT-X003", "WT-S002", "WT-D002"], "owner reviewed")
-        self.assertEqual((n, skipped), (3, 2))                                  # X003 and the live key are refused
+        self.assertEqual((n, len(skipped)), (3, 2))                                  # X003 and the live key are refused
         live, acc = wt.active(fs + [F("WT-X001", "SkillSpector: do not install", "high", ["AST01"], "/w/brand-new-skill", "risk 90", "f"),
                                     F("WT-D002", "Vulnerable package next 17.0.0", "high", ["ASI04"], "/ws/app", "npm: 1 known", "f")])
         self.assertEqual(sorted(f["where"] for f in live if f["rule"] in ("WT-X001", "WT-D002")), ["/w/brand-new-skill", "/ws/app"])
@@ -654,7 +657,7 @@ class Features(unittest.TestCase):
         code, o = self.out("fix", "--accept", "WT-X001,WT-X003", "--reason", "owner reviewed")
         done = json.loads(o)["done"]
         self.assertIn("Accepted 1 finding(s)", done[0])
-        self.assertIn("1 were not acceptable and stay open", done[0])
+        self.assertIn("Left open: Two scanners agree a skill is dangerous (/w/evil)", done[0])   # named, not just counted
 
     def test_ask_first_rules_saved_to_exports_count(self):
         ex = os.path.join(os.environ["WATCHTOWER_HOME"], "exports"); os.makedirs(ex)

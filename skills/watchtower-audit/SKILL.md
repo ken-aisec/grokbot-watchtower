@@ -5,11 +5,12 @@ description: Full security posture audit of this Grok Bot computer and roster - 
 
 # Posture audit
 
-1. Check the tools exist: `test -f /workspace/watchtower/app/watchtower/wt.py`. If missing, say so and offer /watchtower-setup. Never reinstall silently from an unpinned source.
+1. Check the tools exist: `test -f /workspace/watchtower/app/watchtower/wt.py`. If missing, say so and offer to run setup (the watchtower-setup skill). Never reinstall silently from an unpinned source.
 2. Run `python3 /workspace/watchtower/app/watchtower/wt.py audit`. Output is compact JSON (under 4 KB): score, new findings, fixed findings, open counts by severity, top fixes, coverage notes.
 3. If the JSON has `scanners_missing`, the scanners the user agreed to at setup are gone (the computer was reset or cleaned). Say so in one line, run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, and run the audit again before reporting. Never report a score from a partial scan as a drop or a gain.
 4. Reply in at most 10 lines:
-   - Score and grade, and the change since last run.
+   - Score and grade, and the change since last run. If the JSON has `why_it_dropped`, say it in one line right after the score.
+   - A "New plugin installed" finding: name the plugin, its size and anything flagged inside it, and say the fix can keep it with one yes.
    - New since last run (severity, title, where).
    - The three fixes worth doing, each with the exact click path or command from `fix`.
    - If `stages_skipped` is there, say which checks didn't finish and that their last results were kept. Don't call the score a drop or a gain because of it.
