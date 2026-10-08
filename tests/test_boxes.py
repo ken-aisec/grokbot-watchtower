@@ -849,6 +849,83 @@ class MainBoxLessons(Box):
         self.assertTrue(any("put back" in n for n in r["notes"]), r["notes"])
         self.assertEqual(wt.load_json(wt.state_path("canaries.json"), {})["api-env"]["token"], reg["api-env"]["token"])
 
+    def test_a_link_where_a_decoy_goes_is_never_written_through(self):
+        """The decoys live in /tmp and /var/tmp, where every Bot can write. v0.6.6 opened the decoy path and wrote to it, so a link
+        planted there in advance made Watchtower overwrite whatever it pointed to."""
+        self.skills(1)
+        root = os.environ["WT_DECOY_ROOT"]
+        victim = os.path.join(self.home, ".bashrc"); open(victim, "w").write("export KEEP=1\n")
+        os.makedirs(os.path.join(root, "tmp", ".archive"))
+        os.symlink(victim, os.path.join(root, "tmp", ".archive", "payments.env"))                 # a link to a file
+        secret_dir = os.path.join(self.home, ".ssh"); os.makedirs(secret_dir)
+        os.makedirs(os.path.join(root, "var", "tmp"))
+        os.symlink(secret_dir, os.path.join(root, "var", "tmp", ".backup"))                        # a link to a folder
+        other = os.path.join(self.home, "notes.txt"); open(other, "w").write("mine\n")
+        os.makedirs(os.path.join(root, "var", "tmp", ".archive"))
+        os.link(other, os.path.join(root, "var", "tmp", ".archive", "customers-export-2025.csv"))  # a second name for someone's file
+        code, o, _ = self.run_cmd("canary", "plant")
+        self.assertEqual(open(victim).read(), "export KEEP=1\n")
+        self.assertEqual(os.listdir(secret_dir), [])
+        self.assertEqual(open(other).read(), "mine\n")
+        self.assertEqual(o.count("REFUSED"), 3, o)
+        self.assertEqual(wt.load_json(wt.state_path("canaries.json"), {}), {})
+        self.audit()
+        k6 = [f for f in self.snap()["findings"] if f["rule"] == "WT-K006"]
+        self.assertEqual(sorted(f["evidence"].split(":")[0] for f in k6), ["api-env", "cloud-keys", "customers"])
+        self.assertEqual({f["severity"] for f in k6}, {"high"})
+        self.assertTrue(os.path.islink(os.path.join(root, "tmp", ".archive", "payments.env")))       # the evidence is left as found
+
+    def test_a_decoy_swapped_for_a_link_after_planting_is_reported_and_not_touched(self):
+        self.skills(1); self.audit()
+        reg = self.decoys()
+        os.makedirs(os.path.join(self.tmp, "outside"))                            # outside what the audit reads, so only the link could touch it
+        victim = os.path.join(self.tmp, "outside", "keep.txt"); open(victim, "w").write("keep\n")
+        os.utime(victim, (1_000_000_000, 1_000_000_000))
+        p = reg["api-env"]["path"]
+        os.remove(p); os.symlink(victim, p)
+        self.audit()
+        self.assertIn("WT-K006", {f["rule"] for f in self.snap()["findings"]})
+        self.assertEqual((os.stat(victim).st_atime, os.stat(victim).st_mtime), (1_000_000_000, 1_000_000_000))   # never re-armed through it
+        self.assertEqual(open(victim).read(), "keep\n")
+        self.assertTrue(os.path.islink(p))
+
+    def test_a_decoy_read_and_then_removed_is_not_put_back_after_a_restart(self):
+        """v0.6.6 put back any missing decoy once the computer had restarted since planting, "cleared by the restart", even one
+        that had been read and then removed. The read and the removal were both lost."""
+        self.skills(2); self.audit()
+        reg = self.decoys()
+        real_boot = wt.boot_time
+        self.addCleanup(lambda: setattr(wt, "boot_time", real_boot))
+        p = reg["api-env"]["path"]
+        os.utime(p, (time.time() - 60, os.stat(p).st_mtime))                      # opened on its own a minute ago
+        self.audit()
+        self.assertIn("WT-K001", {f["rule"] for f in self.snap()["findings"]})
+        os.remove(p)                                                              # then removed
+        wt.boot_time = lambda: time.time() + 5                                    # and the computer restarted
+        r = self.audit()
+        self.assertFalse(os.path.exists(p))                                       # not put back
+        self.assertFalse(any("put back" in n for n in r["notes"]), r["notes"])
+        gone = [f for f in self.snap()["findings"] if f["rule"] == "WT-K002"]
+        self.assertEqual(len(gone), 1)
+        self.assertIn("read at", gone[0]["evidence"])
+        self.assertIn("WT-K001", {f["rule"] for f in self.snap()["findings"]})   # the read itself is still open
+        self.assertIn("canary-gone-not-replanted", open(wt.state_path("ledger.jsonl")).read())
+
+    def test_a_decoy_removed_after_the_restart_is_not_put_back(self):
+        """Read and deleted between two runs after a restart: no run saw the read, but its folder changed after the computer started."""
+        self.skills(1); self.audit()
+        reg = self.decoys()
+        real_boot = wt.boot_time
+        self.addCleanup(lambda: setattr(wt, "boot_time", real_boot))
+        st = wt.load_json(wt.state_path("canaries.json"), {})
+        st["api-env"]["planted_ts"] = time.time() - 100; wt.save_json(wt.state_path("canaries.json"), st)
+        wt.boot_time = lambda: time.time() - 50                                   # planted, then the restart, then...
+        os.remove(reg["api-env"]["path"])                                         # ...the decoy was removed from its folder
+        r = self.audit()
+        self.assertFalse(os.path.exists(reg["api-env"]["path"]))
+        self.assertFalse(any("put back" in n for n in r["notes"]), r["notes"])
+        self.assertIn("WT-K002", {f["rule"] for f in self.snap()["findings"]})
+
     def test_single_skills_get_time_to_finish_and_old_stuck_marks_are_retried(self):
         """Main box, v0.6.6: SkillSpector got 34s on a lone skill; healthy ones with Office files took 37 to 61s and 11 were marked stuck."""
         ds = self.skills(4)

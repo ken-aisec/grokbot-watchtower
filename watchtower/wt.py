@@ -2277,28 +2277,94 @@ def boot_time():
     return None
 
 
-def plant_canaries(only=None, token_file=None):
-    """Write the decoys that aren't there. Returns the names planted."""
+class DecoyLink(Exception):
+    """Something other than a plain folder or file sits where a decoy goes."""
+
+
+def write_decoy(p, content):
+    """Write a decoy without ever following a link. The decoys live in /tmp and /var/tmp, where every Bot can write, so a link
+    planted at the decoy's folder or file would make Watchtower overwrite whatever it points to. The decoy's own folder and file
+    are opened with O_NOFOLLOW from an open handle on the folder above, and every check is made on the opened handle, never on
+    the name, so nothing can be swapped in between the check and the write. Returns (atime, mtime) after re-arming."""
+    folder, fn = os.path.split(p)
+    base, sub = os.path.split(folder)
+    os.makedirs(base, exist_ok=True)                  # /tmp, /var/tmp (or the test root): the system's own folders
+    bfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = fd = None
+    try:
+        try:
+            os.mkdir(sub, 0o755, dir_fd=bfd)
+        except FileExistsError:
+            pass
+        try:
+            dfd = os.open(sub, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=bfd)
+        except OSError as e:
+            raise DecoyLink(f"{folder} is a link or not a folder") from e
+        try:
+            fd = os.open(fn, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except OSError as e:
+            raise DecoyLink(f"{p} is a link") from e
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise DecoyLink(f"{p} is not a plain file of its own ({st.st_nlink} names point at it)")   # a hard link to another file
+        os.ftruncate(fd, 0)
+        os.write(fd, content.encode())
+        st = os.fstat(fd)
+        os.utime(fd, (st.st_mtime - 86400, st.st_mtime))  # atime < mtime so the next read updates atime
+        st = os.fstat(fd)
+        return st.st_atime, st.st_mtime
+    finally:
+        for x in (fd, dfd, bfd):
+            if x is not None:
+                os.close(x)
+
+
+def link_target(p):
+    for q in (p, os.path.dirname(p)):
+        if os.path.islink(q):
+            try:
+                return f"{q} -> {os.readlink(q)}"
+            except OSError:
+                return f"{q} is a link"
+    return p
+
+
+def decoy_link_finding(name, p, why):
+    return finding("WT-K006", "A link was put where a decoy goes", "high", ["ASI10", "ASI05"], p, f"{name}: {why}"[:160],
+                   "Watchtower refused to write the decoy, because writing through that link would have changed the file it points to. "
+                   "Something put the link there on purpose. Tell Watchtower \"incident check\"; once you know what did it, remove the link and plant the decoys again.",
+                   ident=f"{name}|{p}")
+
+
+def plant_canaries(only=None, token_file=None, refused=None):
+    """Write the decoys that aren't there. Returns the names planted. A decoy whose place holds a link is not written: it is
+    recorded as an event (WT-K006) and, when `refused` is a list, added to it."""
     import secrets as _s
     reg = load_json(state_path("canaries.json"), {}) or {}
-    planted = []
+    planted, bad = [], []
     for name, path, body in CANARY_SPECS:
         p = decoy_path(path)
-        if (only is not None and name not in only) or (name in reg and os.path.exists(os.path.expanduser(reg[name]["path"]))):
+        if (only is not None and name not in only) or (name in reg and os.path.lexists(os.path.expanduser(reg[name]["path"]))
+                                                         and not os.path.islink(os.path.expanduser(reg[name]["path"]))):
             continue
         tok = reg.get(name, {}).get("token") if only is not None and name in reg else None
         tok = tok or _s.token_hex(8)                      # a re-planted decoy keeps its value, so a copy made earlier is still recognised
         content = body.format(tok=tok, tokU=tok.upper()[:16])
         if token_file and name == "cloud-keys":
             content = open(token_file).read()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as f:
-            f.write(content)
-        st = os.stat(p)
-        os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # atime < mtime so the next read updates atime
-        reg[name] = {"path": p, "token": tok, "atime": os.stat(p).st_atime, "planted": now(), "planted_ts": time.time()}
+        try:
+            atime, _ = write_decoy(p, content)
+        except DecoyLink as e:
+            bad.append(decoy_link_finding(name, p, f"{link_target(p)}. {e}"))
+            ledger({"event": "canary-refused", "decoy": name, "path": p, "why": str(e)[:200]})
+            continue
+        reg[name] = {"path": p, "token": tok, "atime": atime, "planted": now(), "planted_ts": time.time()}
         planted.append(name)
     save_json(state_path("canaries.json"), reg)
+    if bad:
+        remember_events(bad)
+        if refused is not None:
+            refused += bad
     return planted
 
 
@@ -2340,11 +2406,32 @@ def tend_canaries(notes):
         ledger({"event": "canary-move", "count": len(moved)})
         reg = load_json(state_path("canaries.json"), {}) or {}
     boot = boot_time()
-    wiped = [n for n, v in reg.items() if not os.path.exists(os.path.expanduser(v["path"])) and boot and boot > v.get("planted_ts", float("inf"))]
+    gone = [n for n, v in reg.items() if not os.path.lexists(os.path.expanduser(v["path"])) and boot and boot > v.get("planted_ts", float("inf"))]
+    wiped = [n for n in gone if cleared_by_restart(reg[n], boot)]
+    kept = sorted(set(gone) - set(wiped))
+    new_kept = [n for n in kept if not reg[n].get("gone_noted")]
+    if new_kept:                                          # left missing: the check reports each one as removed, with what is known
+        ledger({"event": "canary-gone-not-replanted", "decoys": [{"name": n, "path": reg[n]["path"], "read_at": reg[n].get("read_at")} for n in new_kept]})
+        for n in new_kept:
+            reg[n]["gone_noted"] = now()
+        save_json(state_path("canaries.json"), reg)
     if wiped:
         plant_canaries(only=set(wiped))
         notes.append(f"{len(wiped)} decoy(s) were cleared when the computer restarted and have been put back.")
         ledger({"event": "canary-replant", "decoys": sorted(wiped)})
+
+
+def cleared_by_restart(v, boot):
+    """A missing decoy is put back quietly only when a restart explains it: it was never seen read, and its folder is gone too or
+    hasn't changed since the computer started. A decoy that was read and then disappeared, or one deleted from a folder that
+    changed after the restart, is evidence: it stays missing and is reported, and the owner decides when to plant it again."""
+    if v.get("read_at"):
+        return False
+    try:
+        st = os.lstat(os.path.dirname(os.path.expanduser(v["path"])))
+    except OSError:
+        return True                                       # the whole folder went, as /tmp does on a restart
+    return stat.S_ISDIR(st.st_mode) and st.st_mtime <= boot
 
 
 def canary_paths():
@@ -2355,7 +2442,10 @@ def canary_paths():
 def cmd_canary(args):
     reg = load_json(state_path("canaries.json"), {})
     if args.action == "plant":
-        plant_canaries(token_file=args.token_file)
+        refused = []
+        plant_canaries(token_file=args.token_file, refused=refused)
+        for f in refused:
+            print(f"REFUSED {f['evidence']}. Not written: a link sits where the decoy goes. It is recorded as a high finding.")
         reg = load_json(state_path("canaries.json"), {})
         probe = state_path("atime-probe")
         with open(probe, "w") as f:
@@ -2399,26 +2489,34 @@ def canary_findings(record=True):
     out, reads = [], []
     for name, v in reg.items():
         p = os.path.expanduser(v["path"])
+        if os.path.islink(p) or os.path.islink(os.path.dirname(p)):
+            out.append(decoy_link_finding(name, p, f"{link_target(p)}, where the decoy was"))
+            continue                                      # never stat or touch through it
         if not os.path.exists(p):
-            out.append(finding("WT-K002", "Canary file deleted or moved", "high", ["ASI10"], p, name,
-                               "Something removed a decoy. Check recent routine runs, then re-plant with `wt.py canary plant`."))
+            seen = f"; it had been read at {v['read_at'][11:16]} UTC before it disappeared" if v.get("read_at") else ""
+            out.append(finding("WT-K002", "Canary file deleted or moved", "high", ["ASI10"], p, name + seen,
+                               "Something removed a decoy" + (" after reading it" if seen else "") + ". It has not been put back, so the evidence stays. "
+                               "Check recent routine runs, then re-plant with `wt.py canary plant`."))
             continue
-        st = os.stat(p)
+        st = os.lstat(p)
         if st.st_atime > v["atime"] + 1:
             reads.append((name, p, st.st_atime))
             if record:
-                os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # re-arm
-                v["atime"] = os.stat(p).st_atime
+                os.utime(p, (st.st_mtime - 86400, st.st_mtime), follow_symlinks=False)  # re-arm; a link swapped in since the check is not followed
+                v["atime"] = os.lstat(p).st_atime
     if reads:
         when = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="minutes")
         times = [t for _, _, t in reads]
         each = ", ".join(f"{n} {dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime('%H:%M:%S')}" for n, _, t in sorted(reads, key=lambda r: r[2]))
         places = ", ".join(sorted({os.path.dirname(p) for _, p, _ in reads}))
-        if record:
-            save_json(state_path("canaries.json"), reg)
-            ledger({"event": "canary-read", "decoys": [{"name": n, "path": p, "read_at": dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")} for n, p, t in reads]})
         runs = load_json(state_path("run_windows.json"), [])
         own = lambda t: any(a - 2 <= t <= b + 5 for a, b in runs)
+        if record:
+            for name, _, t in reads:                      # remembered, so a decoy read and then removed is never put back quietly
+                if not own(t):
+                    reg[name]["read_at"] = dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")
+            save_json(state_path("canaries.json"), reg)
+            ledger({"event": "canary-read", "decoys": [{"name": n, "path": p, "read_at": dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")} for n, p, t in reads]})
         if all(own(t) for t in times):
             out.append(finding("WT-K005", "Decoys read while Watchtower was scanning", "low", ["ASI03"], places,
                                f"{len(reads)} decoys at {when(min(times))}, during a Watchtower run ({each})",
@@ -2468,11 +2566,13 @@ def rearm_canaries():
     changed = False
     for v in reg.values():
         p = os.path.expanduser(v["path"])
+        if os.path.islink(p) or os.path.islink(os.path.dirname(p)):
+            continue                                      # never touch through a link; the check reports it
         try:
-            st = os.stat(p)
+            st = os.lstat(p)
             if st.st_atime > v.get("atime", 0) + 1:
-                os.utime(p, (st.st_mtime - 86400, st.st_mtime))
-                v["atime"] = os.stat(p).st_atime
+                os.utime(p, (st.st_mtime - 86400, st.st_mtime), follow_symlinks=False)
+                v["atime"] = os.lstat(p).st_atime
                 changed = True
         except OSError:
             pass
@@ -3027,7 +3127,7 @@ EXPOSURE_AREAS = [
     ("Approvals and settings", ("WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C003", "WT-C005")),
     ("Bots, memories and routines", ("WT-M010", "WT-L001", "WT-R002", "WT-T013")),
     ("Packages", ("WT-D001",)),
-    ("Tripwires and history", ("WT-K001", "WT-K002", "WT-K003", "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H009")),
+    ("Tripwires and history", ("WT-K001", "WT-K002", "WT-K003", "WT-K006", "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H009")),
 ]
 
 
@@ -3363,6 +3463,7 @@ PLAIN = {
     "WT-K005": ("Watchtower's own scan touched the decoys", "Expected when a scan overlaps another run.", "Nothing to do.", "auto"),
     "WT-K001": ("Something opened a decoy file", "Nothing normal should touch it.", "Tell Watchtower \"incident check\".", "you"),
     "WT-K003": ("A decoy's contents were copied", "Something read it and wrote it elsewhere.", "Tell Watchtower \"incident check\".", "you"),
+    "WT-K006": ("A link was put where a decoy goes", "Writing the decoy would have changed the file it points to.", "Tell Watchtower \"incident check\".", "you"),
     "WT-L001": ("A Bot has the risky combination", "It reads strangers' content, sees private data, and can send.", "Add Ask first on its sends, or split its jobs.", "you"),
     "WT-M010": ("A Bot memory acts like a standing order", "It steers every future run.", "Remove it in that Bot's memory settings.", "you"),
     "WT-T013": ("Some skills send or post without asking", "A tricked Bot could act on them.", "Tell Watchtower \"fix it\" and say yes if they're meant to send on their own.", "you"),
