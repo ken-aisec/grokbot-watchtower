@@ -37,10 +37,11 @@ GARBAGE = "#!/bin/sh\necho '<html>502 Bad Gateway</html>'\nexit 0\n"
 class Box(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.env = {k: os.environ.get(k) for k in ("HOME", "WATCHTOWER_HOME")}
+        self.env = {k: os.environ.get(k) for k in ("HOME", "WATCHTOWER_HOME", "WT_DECOY_ROOT")}
         self.home = os.path.join(self.tmp, "home", "box"); os.makedirs(self.home)
         os.environ["HOME"] = self.home
         os.environ["WATCHTOWER_HOME"] = os.path.join(self.tmp, "workspace", "watchtower")
+        os.environ["WT_DECOY_ROOT"] = os.path.join(self.tmp, "decoys")
         self.ws = os.path.join(self.tmp, "workspace"); os.makedirs(self.ws, exist_ok=True)
         self.roots = [self.home, self.ws]
         self.saved = (wt.RUN_LIMIT, wt.DAILY_LIMIT, wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL)
@@ -746,6 +747,74 @@ class MainBoxLessons(Box):
         self.assertIn("finance", new[0]["evidence"])
         st = wt.load_json(wt.state_path("plugins.json"), {})
         self.assertEqual((st["builtin"]["status"], st["finance"]["status"]), ("known", "new"))
+
+    def decoys(self):
+        self.run_cmd("canary", "plant")
+        return wt.load_json(wt.state_path("canaries.json"), {})
+
+    def read_everything_like_the_backup(self):
+        for root in (self.home, self.ws):
+            for dp, _, fns in os.walk(root):
+                for fn in fns:
+                    try:
+                        open(os.path.join(dp, fn), "rb").read()
+                    except OSError:
+                        pass
+
+    def test_the_backup_reading_every_file_no_longer_trips_the_decoys(self):
+        """The fresh account, Oct 8: the backup read all three decoys 6 to 15 minutes after every reset, so a trip meant nothing."""
+        self.skills(2); self.audit()
+        reg = self.decoys()
+        for v in reg.values():
+            self.assertFalse(v["path"].startswith((self.home, self.ws)), v["path"])   # outside what the platform backs up
+        self.read_everything_like_the_backup()
+        code, o, _ = self.run_cmd("canary", "status")
+        self.assertIn("CANARIES_QUIET", o)
+        p = reg["api-env"]["path"]                                                # now one decoy is opened on its own, a minute ago,
+        os.utime(p, (time.time() - 60, os.stat(p).st_mtime))                      # when no Watchtower run was going
+        r = self.audit()
+        self.assertIn("WT-K001", {f["rule"] for f in self.snap()["findings"]})
+        self.assertEqual(wt.by_sev(self.snap()["findings"])["critical"], 1)
+
+    def test_an_update_moves_decoys_out_of_the_backed_up_folders(self):
+        self.skills(2); self.audit()
+        old = [os.path.join(self.ws, ".archive", "customers-export-2025.csv"), os.path.join(self.home, ".config", "backup", "aws-credentials.bak"),
+               os.path.join(self.ws, ".archive", "payments.env")]
+        saved, saved_old = list(wt.CANARY_SPECS), wt.OLD_CANARY_PATHS
+        self.addCleanup(lambda: (wt.CANARY_SPECS.__setitem__(slice(None), saved), setattr(wt, "OLD_CANARY_PATHS", saved_old)))
+        wt.CANARY_SPECS[:] = [(n, "~" + o[len(self.home):] if o.startswith(self.home) else o, b) for (n, _, b), o in zip(saved, old)]
+        os.environ.pop("WT_DECOY_ROOT")
+        self.run_cmd("canary", "plant")                                           # what v0.6.5 left: decoys in /workspace and home
+        os.environ["WT_DECOY_ROOT"] = os.path.join(self.tmp, "decoys")
+        before = wt.load_json(wt.state_path("canaries.json"), {})
+        keep = os.path.join(self.home, ".config", "backup", "someone-elses.txt"); open(keep, "w").write("keep")
+        wt.CANARY_SPECS[:] = saved; wt.OLD_CANARY_PATHS = tuple(old)
+        self.read_everything_like_the_backup()                                    # the old ones are tripped, as they always were
+        r = self.audit()
+        after = wt.load_json(wt.state_path("canaries.json"), {})
+        self.assertTrue(any("Moved 3 decoys" in n for n in r["notes"]), r["notes"])
+        self.assertFalse(any(os.path.exists(p) for p in old))
+        self.assertFalse(os.path.exists(os.path.join(self.ws, ".archive")))        # an emptied decoy folder goes
+        self.assertTrue(os.path.exists(keep))                                      # a folder with someone else's file stays
+        self.assertTrue(all(os.path.exists(v["path"]) and v["path"].startswith(os.environ["WT_DECOY_ROOT"]) for v in after.values()))
+        self.assertEqual({n: v["token"] for n, v in after.items()}, {n: v["token"] for n, v in before.items()})
+        self.assertEqual([f for f in self.snap()["findings"] if f["rule"].startswith("WT-K")], [])
+        self.assertFalse(any("Moved" in n for n in self.audit()["notes"]))         # once
+
+    def test_decoys_wiped_by_a_restart_are_put_back_quietly_but_a_deleted_one_is_reported(self):
+        self.skills(2); self.audit()
+        reg = self.decoys()
+        real_boot = wt.boot_time
+        self.addCleanup(lambda: setattr(wt, "boot_time", real_boot))
+        os.remove(reg["api-env"]["path"])
+        wt.boot_time = lambda: time.time() - 3600                                 # no restart since planting: someone removed it
+        self.audit()
+        self.assertIn("WT-K002", {f["rule"] for f in self.snap()["findings"]})
+        wt.boot_time = lambda: time.time() + 5                                    # the computer restarted after planting: /tmp was cleared
+        r = self.audit()
+        self.assertTrue(os.path.exists(reg["api-env"]["path"]))
+        self.assertTrue(any("put back" in n for n in r["notes"]), r["notes"])
+        self.assertEqual(wt.load_json(wt.state_path("canaries.json"), {})["api-env"]["token"], reg["api-env"]["token"])
 
 
 if __name__ == "__main__":

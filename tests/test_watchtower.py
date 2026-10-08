@@ -252,6 +252,7 @@ class Flow(unittest.TestCase):
         os.environ["HOME"] = os.path.join(self.tmp, "home")
         os.makedirs(os.environ["HOME"])
         os.environ["WATCHTOWER_HOME"] = os.path.join(self.tmp, "wt")
+        os.environ["WT_DECOY_ROOT"] = os.path.join(self.tmp, "decoys")
         self.root = os.path.join(self.tmp, "computer")
         shutil.copytree(os.path.join(FIX, "clean"), os.path.join(self.root, "skills"))
         self.exports = os.path.join(FIX, "exports")
@@ -327,6 +328,7 @@ class Features(unittest.TestCase):
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = self.tmp
         os.environ["WATCHTOWER_HOME"] = os.path.join(self.tmp, "wt")
+        os.environ["WT_DECOY_ROOT"] = os.path.join(self.tmp, "decoys")
         self.rules = wt.load_rules()
 
     def tearDown(self):
@@ -356,8 +358,6 @@ class Features(unittest.TestCase):
         self.assertEqual([f["rule"] for f in wt.history_findings(self.rules)], ["WT-H003"])
 
     def test_canaries_read_and_copy(self):
-        os.makedirs("/workspace", exist_ok=True) if os.access("/", os.W_OK) else None
-        wt.CANARY_SPECS[:] = [(n, p.replace("/workspace", os.path.join(self.tmp, "workspace")), b) for n, p, b in wt.CANARY_SPECS]
         code, o = self.out("canary", "plant")
         self.assertIn("Planted 3", o)
         reg = json.load(open(os.path.join(os.environ["WATCHTOWER_HOME"], "state", "canaries.json")))

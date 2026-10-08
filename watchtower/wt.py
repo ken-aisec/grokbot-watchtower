@@ -774,6 +774,7 @@ def audit(roots, exports, quick=False):
                           "/workspace/watchtower/exports/auto-review.txt."))
 
     # 5b. tripwires and shell history (zero tokens)
+    soft("decoys", (), notes, None, tend_canaries, notes)
     fs += remember_events(canary_findings() + history_findings(rules))
     if not load_json(state_path("canaries.json"), {}):
         notes.append("No canaries planted: run `wt.py canary plant` for zero-cost tripwires.")
@@ -2161,13 +2162,94 @@ def history_findings(rules):
 
 
 # ---------------------------------------------------------------- canaries (zero-token tripwires)
+# Where the decoys live. Until v0.6.5 they sat in /workspace and the home folder. The platform backs those up after a Bot's turn
+# and reads every file to do it, so the decoys were read within minutes of each reset and could not tell the backup from a snoop.
+# A test on a real box (Oct 8 2026) showed files in /var/tmp and /tmp are not read by the backup, and that reads there are recorded.
 CANARY_SPECS = [
-    ("customers", "/workspace/.archive/customers-export-2025.csv",
+    ("customers", "/var/tmp/.archive/customers-export-2025.csv",
      "name,email,phone,card_last4,notes\nDana Whitfield,{tok}@example.com,555-0101,4417,priority account\n"),
-    ("cloud-keys", "~/.config/backup/aws-credentials.bak",
+    ("cloud-keys", "/var/tmp/.backup/aws-credentials.bak",
      "[default]\naws_access_key_id = AKIA{tokU}\naws_secret_access_key = {tok}{tok}\n"),
-    ("api-env", "/workspace/.archive/payments.env", "STRIPE_SECRET_KEY=rk_live_{tok}{tok}\nPAYOUT_ACCOUNT=acct_{tok}\n"),
+    ("api-env", "/tmp/.archive/payments.env", "STRIPE_SECRET_KEY=rk_live_{tok}{tok}\nPAYOUT_ACCOUNT=acct_{tok}\n"),
 ]
+OLD_CANARY_PATHS = ("/workspace/.archive/customers-export-2025.csv", "~/.config/backup/aws-credentials.bak", "/workspace/.archive/payments.env")
+
+
+def decoy_path(path):
+    """The spec's path on this computer. WT_DECOY_ROOT moves them under another folder (the tests use it)."""
+    p = os.path.expanduser(path)
+    root = os.environ.get("WT_DECOY_ROOT", "")
+    return os.path.join(root, p.lstrip("/")) if root and not path.startswith("~") else p
+
+
+def boot_time():
+    """When this computer last started (seconds since 1970), or None if it can't be told."""
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def plant_canaries(only=None, token_file=None):
+    """Write the decoys that aren't there. Returns the names planted."""
+    import secrets as _s
+    reg = load_json(state_path("canaries.json"), {}) or {}
+    planted = []
+    for name, path, body in CANARY_SPECS:
+        p = decoy_path(path)
+        if (only is not None and name not in only) or (name in reg and os.path.exists(os.path.expanduser(reg[name]["path"]))):
+            continue
+        tok = reg.get(name, {}).get("token") if only is not None and name in reg else None
+        tok = tok or _s.token_hex(8)                      # a re-planted decoy keeps its value, so a copy made earlier is still recognised
+        content = body.format(tok=tok, tokU=tok.upper()[:16])
+        if token_file and name == "cloud-keys":
+            content = open(token_file).read()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(content)
+        st = os.stat(p)
+        os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # atime < mtime so the next read updates atime
+        reg[name] = {"path": p, "token": tok, "atime": os.stat(p).st_atime, "planted": now(), "planted_ts": time.time()}
+        planted.append(name)
+    save_json(state_path("canaries.json"), reg)
+    return planted
+
+
+def tend_canaries(notes):
+    """Before the decoys are checked: move ones still in the old backed-up places, and put back ones a restart wiped.
+    A decoy that vanished with no restart since it was planted is left for the check to report as removed."""
+    reg = load_json(state_path("canaries.json"), {}) or {}
+    if not reg:
+        return
+    old = {os.path.expanduser(p) for p in OLD_CANARY_PATHS}
+    moved = [n for n, v in reg.items() if os.path.expanduser(v["path"]) in old and n in {s_[0] for s_ in CANARY_SPECS}]
+    for n in moved:
+        p = os.path.expanduser(reg[n]["path"])
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(p))
+        except OSError:
+            pass                                          # someone else's files are in that folder: it stays
+    if moved:
+        plant_canaries(only=set(moved))
+        store = [e for e in load_json(state_path("events.json"), []) if e.get("rule") not in ("WT-K004", "WT-K005")]
+        save_json(state_path("events.json"), store)
+        notes.append(f"Moved {len(moved)} decoys to /var/tmp and /tmp. The platform's file backup read the old ones in /workspace and your home folder "
+                     "after every Bot turn, so a read there meant nothing. It doesn't read the new places, so a read now is worth an alarm.")
+        ledger({"event": "canary-move", "count": len(moved)})
+        reg = load_json(state_path("canaries.json"), {}) or {}
+    boot = boot_time()
+    wiped = [n for n, v in reg.items() if not os.path.exists(os.path.expanduser(v["path"])) and boot and boot > v.get("planted_ts", float("inf"))]
+    if wiped:
+        plant_canaries(only=set(wiped))
+        notes.append(f"{len(wiped)} decoy(s) were cleared when the computer restarted and have been put back.")
+        ledger({"event": "canary-replant", "decoys": sorted(wiped)})
 
 
 def canary_paths():
@@ -2178,22 +2260,8 @@ def canary_paths():
 def cmd_canary(args):
     reg = load_json(state_path("canaries.json"), {})
     if args.action == "plant":
-        import secrets as _s
-        for name, path, body in CANARY_SPECS:
-            p = os.path.expanduser(path)
-            if name in reg and os.path.exists(p):
-                continue
-            tok = _s.token_hex(8)
-            content = body.format(tok=tok, tokU=tok.upper()[:16])
-            if args.token_file and name == "cloud-keys":
-                content = open(args.token_file).read()
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w") as f:
-                f.write(content)
-            st = os.stat(p)
-            os.utime(p, (st.st_mtime - 86400, st.st_mtime))  # atime < mtime so the next read updates atime
-            reg[name] = {"path": path, "token": tok, "atime": os.stat(p).st_atime, "planted": now()}
-        save_json(state_path("canaries.json"), reg)
+        plant_canaries(token_file=args.token_file)
+        reg = load_json(state_path("canaries.json"), {})
         probe = state_path("atime-probe")
         with open(probe, "w") as f:
             f.write("x")
