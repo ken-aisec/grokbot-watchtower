@@ -163,7 +163,7 @@
   }
  ],
  "write_verbs": "(?i)\\b(send|sends|email|emails|post|posts|publish|publishes|purchase|buy|buys|pay|pays|delete|deletes|remove|removes|transfer|transfers|submit|submits|merge|deploy|invite|reply)\\b",
- "approval_terms": "(?i)(approval|approve|ask\\s+(me\\s+)?first|ask\\s+me|my\\s+(exact\\s+)?yes|confirm\\s+with\\s+me|wait\\s+for\\s+(my|the user's)|draft[s]?\\s+only|never\\s+(send|post|publish|buy|pay|delete))",
+ "approval_terms": "(?i)(approval|approve|ask\\s+(me\\s+)?first|ask\\s+me|my\\s+(exact\\s+)?yes|confirm\\s+with\\s+me|wait\\s+for\\s+(my|the user's)|draft[s]?\\s+only|read[- ]only|\\bgates?\\b|\\bgated\\b|never\\s+(send|post|publish|buy|pay|delete))",
  "draft_terms": "(?i)\\b(draft|drafts|recommend|propose|suggest)\\b",
  "schedule_terms": "(?i)\\b(every\\s+\\d+\\s+(minutes?|hours?|days?)|every\\s+(day|weekday|week|morning|hour|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|daily|weekly|hourly|routine|cron|schedule[d]?)\\b",
  "nodata_terms": "(?i)(if\\s+(the\\s+)?(source|data|input|site|tool|connector|script)s?\\s+(is|are)?\\s*(unavailable|missing|down|empty|fails?)|report\\s+the\\s+failure|if\\s+nothing|send\\s+nothing|no\\s+new\\s+findings)",

@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased (next batch)
+- **Roll-call false alarms, second pass.** v0.6.5 on 16 real Bots still left 17 "external action with no approval line" findings, 16 of them false. The check now tells a thing from an act ("competitor posts", "booking email", "today's posts"), follows a negation through a list ("never edit post text or publish", "no sends/posts as Ken"), skips labels like "POST-CALL", and counts "Ken gates" and "read-only" as approval lines. "Don't wait, send it now" used to slip through as negated and is now flagged. The test quotes all 17 real lines.
+
 ## v0.6.5 — 2026-10-08 (the first roll-call of 16 real Bots)
 - **"No sends" is not sending, again.** The roll-call flagged 10 Bots at high for acting without approval; 9 were lines saying the opposite. v0.6.3 handled "never send" and "does not send" but not "No sends", "no outbound sends", "**never** publishes" in bold, "drafts Ken sends himself", "for Ken to send", or words like "X posts" and "outreach emails" that name a thing. All are handled now.
 - **"No approval needed" no longer counts as an approval line.** It did, which hid a real finding.

@@ -267,22 +267,61 @@ NEGATED_LIST = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor)\s+\w+(\s*,\
 # "X posts", "the top posts", "3 invites": the thing, not the act.
 NOUN_BEFORE = re.compile(r"(?i)\b(x|twitter|linkedin|blog|social|forum|reddit|outreach|draft|drafts|drafted|of|the|a|an|each|every|this|that|"
                          r"these|those|their|your|my|new|top|recent|latest|all|any|\d+)\s+$")
-NOUN_FORMS = ("post", "posts", "email", "emails", "reply", "tweets", "invite", "invites", "transfer", "transfers", "deploys")
 # "drafts Ken sends himself", "for Ken to send", "for the user to review and publish": the owner acts, not the Bot.
 OWNER_AFTER = re.compile(r"(?i)^\s+(\w+\s+){0,2}(himself|herself|myself|themselves|themself)\b")
 OWNER_BEFORE = re.compile(r"(?i)\bfor\s+(?!(?:the\s+)?(?:bot|agent|it|grok|assistant)\b)(the\s+)?\w+\s+to\s+(\w+\s+and\s+)?$")
+
+
+AMBIGUOUS_PLURAL = ("posts", "emails", "sends", "tweets", "invites", "transfers", "deploys", "replies")   # verb or thing
+AMBIGUOUS_BASE = ("post", "email", "reply", "invite", "transfer", "deploy")
+OBJECT_NEXT = re.compile(r"(?i)^\s+(the|a|an|it|them|this|that|these|those|to|your|my|his|her|their|each|every|all|one|out|in|into|on|"
+                         r"emails?|messages?|mail|dms?|repl(y|ies)|reports?|summar(y|ies)|digests?|invoices?|payments?|money|data|files?)\b|^\s+(?-i:[A-Z@#])\w*")
+VERB_LEAD = re.compile(r"(?i)(^|\b(to|and|then|will|should|must|can|may|also|or|always|never|not|please|now|just|you|i|we|they|it|he|she|bot|"
+                       r"agent|auto|do|does|\w+ly)|,)\s*$")
+SCOPE_BREAK = re.compile(r"(?i)\b(and|but|then|instead|except|unless|so|just)\b")
+NEGATOR = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor|no)\b")
+
+
+def in_negated_list(before, after):
+    """"never edit post text or publish", "no sends/posts as Ken", "does not draft, edit Notion, post, or quote": the verb is one more
+    item in a list that began with a negation. "Don't ask me, just send it" and "no sends and publish now" are not."""
+    neg = list(NEGATOR.finditer(before))
+    if not neg or SCOPE_BREAK.search(before[neg[-1].end():]):
+        return False
+    tail = before.rstrip()
+    if re.search(r"(?i)(\bor|\bnor|/)$", tail):
+        return True
+    return tail.endswith(",") and bool(re.match(r"(?i)^(\s+\w+)?\s*(,|\bor\b|\bnor\b)", after))
+
+
+def names_a_thing(word, before, after):
+    """"competitor posts + OpenSEO", "today's posts,", "careers post for", "booking email," name a thing. "Posts the digest to X" acts."""
+    w = word.lower()
+    if NOUN_BEFORE.search(before) or re.search(r"'s\s+$", before):
+        return w in AMBIGUOUS_PLURAL + AMBIGUOUS_BASE
+    if w in AMBIGUOUS_PLURAL:
+        return not OBJECT_NEXT.match(after)
+    if w in AMBIGUOUS_BASE:
+        if before.rstrip().endswith(","):          # after a comma it could be either: "flags, reply targets" or "draft it, email the client"
+            return not OBJECT_NEXT.match(after)
+        return not VERB_LEAD.search(before)
+    return False
 
 
 def first_action(text, rx):
     """The first match of an action verb that is not negated. "Never send", "does NOT send" and
     "never send, post or publish" say what a skill will not do, so they are not actions."""
     for m in rx.finditer(text):
+        if text[m.end():m.end() + 1] == "-" or text[max(0, m.start() - 1):m.start()] == "-":
+            continue                                                                                        # "post-call", "re-send" as a label
         before = re.sub(r"[*_`]", "", re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1])   # **never** is still never
-        if NEGATED_VERB.search(before) or NEGATED_LIST.search(before) or OWNER_BEFORE.search(before):
+        after = text[m.end():m.end() + 80]
+        bare = re.match(r"(?i)^(\s+\w+)?\s*(,|\bor\b|\bnor\b|\band\b|[.;:!?)\n]|$)", after)   # "post, or publish anything." but not "send it now"
+        if NEGATED_VERB.search(before) or (NEGATED_LIST.search(before) and bare) or OWNER_BEFORE.search(before) or in_negated_list(before, after):
             continue
-        if m.group(0).lower() in NOUN_FORMS and NOUN_BEFORE.search(before):
+        if names_a_thing(m.group(0), before, after):
             continue
-        if OWNER_AFTER.search(re.split(r"[.;:!?\n]", text[m.end():m.end() + 40])[0]):
+        if OWNER_AFTER.search(re.split(r"[.;:!?\n]", after[:40])[0]):
             continue
         return m
     return None
