@@ -29,6 +29,8 @@ description: The one-yes fix. Cleans up, upgrades outdated software (undoing any
 
 4. Reply in at most 6 lines: what was done (the `done` list in plain words, including by name anything it says was left open and why), the new score and the change, and anything still in `only_you`. If an upgrade was undone or skipped, say which and why.
 
+If the user approves only some of the changed skills, run `wt.py fix --apply --revet --only <names, comma-separated>`. The others stay open.
+
 ## Never
 - Turn off or revoke a key. Show the link and let the user do it.
 - Use `--force` with npm, or touch node_modules, or change package.json. The fix only updates lockfiles and keeps a backup.

@@ -4060,7 +4060,13 @@ def cmd_fix(args):
         save_json(state_path("upgrade_left.json"), {"at": now(), "npm": any("left" in x or "put it back" in x or not re.search(r"→ 0\.", x) for x in npm_done),
                                                     "pip": [u["name"] for u in ups if not any(x.startswith(f"Upgraded {u['name']} ") and "put" not in x for x in py_done)]})
     if args.revet:
-        for r in revet(sorted(ch_skills), approve=True):
+        only = {x.strip() for x in (getattr(args, "only", None) or "").split(",") if x.strip()}
+        picked = sorted(d for d in ch_skills if not only or skill_name(d) in only)
+        for missing in sorted(only - {skill_name(d) for d in picked}):
+            done.append(f"{missing}: not re-scanned. It isn't a skill with an open change")
+        if only and len(picked) < len(ch_skills):
+            done.append(f"Left open because you didn't name them: {', '.join(sorted(skill_name(d) for d in ch_skills if d not in picked))}")
+        for r in revet(picked, approve=True):
             if r["result"] == "re-approved":
                 done.append(f"Re-scanned {r['name']} ({r['changed']}) with {', '.join(r['checked_by'])}: clean, re-approved")
             else:
@@ -4338,6 +4344,7 @@ def main_inner(argv=None):
     fx.add_argument("--upgrade", action="store_true"); fx.add_argument("--accept"); fx.add_argument("--reason")
     fx.add_argument("--keep-open", help="names or paths to leave open even though their rule is in --accept (comma-separated)")
     fx.add_argument("--revet", action="store_true", help="re-scan changed skills with every engine and re-approve the clean ones")
+    fx.add_argument("--only", help="with --revet: re-approve only these skills (names, comma-separated); every other changed skill stays open")
     fx.add_argument("--exception", help="skill name(s) the owner confirmed as security tools (30 days)")
     fx.add_argument("--quarantine", help="the owner's own skill(s) to move out of use into Watchtower's quarantine folder (comma-separated)")
     qq = sub.add_parser("quarantine"); qq.add_argument("names", nargs="?"); qq.add_argument("--restore"); qq.add_argument("--reason")

@@ -751,6 +751,20 @@ class Features(unittest.TestCase):
         self.out("audit", "--roots", self.tmp)
         return dirs
 
+    def test_fix_can_reapprove_only_the_skills_the_owner_named(self):
+        dirs = self._audited()
+        for d in dirs[:3]:
+            open(os.path.join(d, "SKILL.md"), "a").write("Also list the open tasks.\n")          # three harmless edits
+        self.out("audit", "--roots", self.tmp)
+        code, o = self.out("fix", "--revet", "--only", "skill001,nope", "--roots", self.tmp)
+        done = " | ".join(json.loads(o)["done"])
+        self.assertIn("skill001", done); self.assertIn("re-approved", done)
+        self.assertIn("Left open because you didn't name them: skill000, skill002", done)
+        self.assertIn("nope: not re-scanned", done)
+        self.out("audit", "--roots", self.tmp)
+        left = sorted(os.path.basename(os.path.dirname(f["where"])) for f in wt.load_json(wt.state_path("last_findings.json"), {})["findings"] if f["rule"] == "WT-I001")
+        self.assertEqual(left, ["skill000", "skill002"])
+
     def test_fix_rescans_changed_skills_and_reapproves_clean_ones(self):
         dirs = self._audited()
         open(os.path.join(dirs[0], "SKILL.md"), "a").write("Also list the open tasks.\n")       # harmless edit
