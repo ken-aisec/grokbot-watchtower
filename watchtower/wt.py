@@ -631,12 +631,65 @@ def cli_credentials():
 USER_SKILL_DIRS = ("/sand-data/workflows/", "/agent-data/workflows/")
 
 
+def user_skill_roots():
+    """The owner's own skill folders: under their home folder, and under /home/box, where Grok Bot always keeps them."""
+    out = []
+    for base in (os.path.expanduser("~"), "/home/box"):
+        for sub in USER_SKILL_DIRS:
+            out.append(os.path.normpath(base + sub))
+    return list(dict.fromkeys(out))
+
+
+def _under(p, roots, strict=False):
+    return any((p == r and not strict) or p.startswith(r + os.sep) for r in roots)
+
+
 def skill_tier(path):
     """user: the user's own saved skills (full rules). Everything else (first-party bundles, marketplace
-    plugins, other agents' skill folders, copies sitting in /workspace) gets malicious-indicator rules only."""
-    if any(x in path for x in USER_SKILL_DIRS):
+    plugins, other agents' skill folders, copies sitting in /workspace) gets malicious-indicator rules only.
+    Decided by where the path starts (or where it really leads), never by a folder name anywhere in it: v0.6.6 called
+    /tmp/x/agent-data/workflows/s one of the owner's own skills, which quarantine and restore then trusted."""
+    p = os.path.normpath(os.path.abspath(str(path).split(":")[0]))
+    roots = user_skill_roots()
+    if _under(p, roots) or _under(os.path.realpath(p), {os.path.realpath(r) for r in roots}):
         return "user"
     return "vendor"
+
+
+def owned_path(p, kind, log=True):
+    """Every path Watchtower moves or deletes comes from one of its own state files, and anything that can write there
+    could aim it anywhere. Before acting, the path is resolved (links followed) and must be inside the place that kind of
+    thing belongs: quarantine (a folder directly inside Watchtower's quarantine folder), skill (inside the owner's own skill
+    folders), decoy (exactly one of the decoy files, not reached through a link), project (a project in the owner's home or
+    workspace, never inside Watchtower's own folder), home (Watchtower's own folder itself, not a link). Anything else is
+    refused and written to the ledger."""
+    ok = False
+    try:
+        n = os.path.normpath(os.path.abspath(os.path.expanduser(str(p))))
+        rp = os.path.realpath(n)
+        if kind == "quarantine":
+            q = os.path.realpath(os.path.join(home(), "quarantine"))
+            ok = os.path.dirname(rp) == q and os.path.basename(rp) == os.path.basename(n) and not os.path.islink(n)
+        elif kind == "skill":
+            ok = _under(rp, {os.path.realpath(r) for r in user_skill_roots()}, strict=True) and _under(n, user_skill_roots(), strict=True)
+        elif kind == "decoy":
+            allowed = {os.path.normpath(decoy_path(x)) for _, x, _ in CANARY_SPECS} | {os.path.normpath(os.path.expanduser(x)) for x in OLD_CANARY_PATHS}
+            d = os.path.dirname(n)
+            ok = n in allowed and not os.path.islink(d) and os.path.realpath(d) == os.path.join(os.path.realpath(os.path.dirname(d)), os.path.basename(d))
+        elif kind == "project":
+            h = os.path.realpath(home())
+            places = {os.path.realpath(os.path.expanduser("~")), os.path.realpath(os.path.dirname(home()))}
+            ok = _under(rp, places, strict=True) and not _under(rp, {h})
+        elif kind == "home":
+            ok = rp == n and os.path.basename(n) == "watchtower" and os.path.isdir(os.path.join(n, "state")) and n not in ("/", os.path.realpath(os.path.expanduser("~")))
+    except (TypeError, ValueError, OSError):
+        ok = False
+    if not ok and log:
+        try:
+            ledger({"event": "refused-path", "kind": kind, "path": str(p)[:300]})
+        except OSError:
+            pass
+    return ok
 
 
 SESSION_FILES = ("chrome-cookie-seed.json", "cookie-seed.json", "cookies.json")
@@ -2389,6 +2442,8 @@ def tend_canaries(notes):
         notes.append(f"Before the move, {len(pending)} of the old decoys had been read at {pending[0]['read_at'][11:16]} UTC (most likely the backup). It is in the log.")
     for n in moved:
         p = os.path.expanduser(reg[n]["path"])
+        if not owned_path(p, "decoy"):
+            continue
         try:
             os.remove(p)
         except OSError:
@@ -2464,8 +2519,12 @@ def cmd_canary(args):
         return 0
     if args.action == "remove":
         for v in reg.values():
+            p = os.path.expanduser(v["path"])
+            if not owned_path(p, "decoy"):
+                print(f"Not removed: {p} is not one of the decoy places.")
+                continue
             try:
-                os.remove(os.path.expanduser(v["path"]))
+                os.remove(p)
             except OSError:
                 pass
         save_json(state_path("canaries.json"), {})
@@ -2501,7 +2560,7 @@ def canary_findings(record=True):
         st = os.lstat(p)
         if st.st_atime > v["atime"] + 1:
             reads.append((name, p, st.st_atime))
-            if record:
+            if record and owned_path(p, "decoy", log=False):
                 os.utime(p, (st.st_mtime - 86400, st.st_mtime), follow_symlinks=False)  # re-arm; a link swapped in since the check is not followed
                 v["atime"] = os.lstat(p).st_atime
     if reads:
@@ -2566,8 +2625,8 @@ def rearm_canaries():
     changed = False
     for v in reg.values():
         p = os.path.expanduser(v["path"])
-        if os.path.islink(p) or os.path.islink(os.path.dirname(p)):
-            continue                                      # never touch through a link; the check reports it
+        if os.path.islink(p) or os.path.islink(os.path.dirname(p)) or not owned_path(p, "decoy", log=False):
+            continue                                      # never touch through a link, or a file that isn't a decoy; the check reports it
         try:
             st = os.lstat(p)
             if st.st_atime > v.get("atime", 0) + 1:
@@ -4243,9 +4302,19 @@ def upgrade_python(ups, py=None):
     return done
 
 
+NPM_REFUSED = []
+
+
 def npm_projects():
+    """Projects the last audit found. The list is a state file, so each one must be in the owner's home or workspace."""
     data = load_json(state_path("osv_projects.json"), {}) or {}
-    return [d for d in data.get("projects", []) if os.path.isfile(os.path.join(d, "package-lock.json"))]
+    out = []
+    NPM_REFUSED[:] = []
+    for d in data.get("projects", []) if isinstance(data.get("projects"), list) else []:
+        if not os.path.isfile(os.path.join(str(d), "package-lock.json")):
+            continue
+        (out if owned_path(d, "project", log=False) else NPM_REFUSED).append(d)
+    return out
 
 
 def npm_issue_count(npm, d):
@@ -4323,6 +4392,9 @@ def cmd_fix(args):
     if args.upgrade:
         py_done = upgrade_python(ups) if ups else []
         npm_done = upgrade_npm(projs) if projs else []
+        for d in NPM_REFUSED:
+            owned_path(d, "project")              # writes the refusal to the ledger
+            npm_done.append(f"{d}: not touched. The project list points outside your home and workspace folders")
         done += py_done + npm_done
         save_json(state_path("upgrade_left.json"), {"at": now(), "npm": any("left" in x or "put it back" in x or not re.search(r"→ 0\.", x) for x in npm_done),
                                                     "pip": [u["name"] for u in ups if not any(x.startswith(f"Upgraded {u['name']} ") and "put" not in x for x in py_done)]})
@@ -4369,19 +4441,26 @@ def quarantine_candidates(findings):
 
 def quarantine(names, reason=""):
     snap = load_json(state_path("last_findings.json"), {"findings": []})
-    dirs = {skill_root(f["where"].split(":")[0]) for f in snap.get("findings", []) if os.path.exists(f["where"].split(":")[0])} - {None}
-    dirs = {d for d in dirs if skill_tier(d + "/") == "user"}
+    dirs = set()                                      # the owner's own skills with an open critical finding, as quarantine_candidates offers them
+    for f in snap.get("findings", []):
+        w = f["where"].split(":")[0]
+        d = skill_root(w) if f["severity"] == "critical" and os.path.exists(w) else None
+        if d and skill_tier(d + "/") == "user":
+            dirs.add(os.path.normpath(d))
     reg, done = load_json(state_path("quarantine.json"), []), []
     for name in names:
         cand = os.path.normpath(name)
-        if os.path.isfile(os.path.join(cand, "SKILL.md")) and skill_tier(cand + "/") == "user":
-            d = cand
+        if os.path.isfile(os.path.join(cand, "SKILL.md")):
+            d = cand if cand in dirs else None        # by path: only a skill the fix would have offered
         else:
             d = find_skill(name, dirs)
         if not d:
-            done.append(f"{name}: not quarantined. It isn't one of your own skills with an open finding (plugins and built-in skills are removed in the app).")
+            done.append(f"{name}: not quarantined. It isn't one of your own skills with an open critical finding (plugins and built-in skills are removed in the app).")
             continue
         dst = os.path.join(home(), "quarantine", f"{skill_name(d)}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        if not (owned_path(d, "skill") and owned_path(dst, "quarantine")):
+            done.append(f"{name}: not quarantined. {d} is not inside your own skill folders. Nothing changed.")
+            continue
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.move(d, dst)
@@ -4406,6 +4485,10 @@ def cmd_quarantine(args):
             print(f"Nothing named “{args.restore}” is in quarantine.")
             return 1
         e_ = hit[-1]
+        if not (owned_path(e_["to"], "quarantine") and owned_path(e_["from"], "skill")):
+            print(f"Not restored: the quarantine record for {args.restore} points outside Watchtower's quarantine folder or your own "
+                  "skill folders. Nothing was moved; the refusal is in the ledger.")
+            return 1
         if os.path.exists(e_["from"]):
             print(f"Not restored: {e_['from']} exists again. Move it away first.")
             return 1
@@ -4436,14 +4519,17 @@ ROUTINE_NAMES = ("Watchtower daily watch", "Watchtower weekly audit", "Watchtowe
 def cmd_uninstall(args):
     """Preview by default. --apply removes everything Watchtower put outside its folder; --remove-folder then deletes the folder."""
     reg = load_json(state_path("canaries.json"), {}) or {}
-    decoys = [os.path.expanduser(v["path"]) for v in reg.values()]
+    listed = [os.path.expanduser(v["path"]) for v in reg.values() if isinstance(v, dict) and v.get("path")]
+    decoys = [p for p in listed if owned_path(p, "decoy", log=args.apply)]
+    refused = [p for p in listed if p not in decoys]
     decoy_dirs = sorted({os.path.dirname(p) for p in decoys})
     tmp_dir = decoy_path("/tmp")                     # /tmp, or the test's own folder: a test never touches the real one
     tmp = sorted(os.path.join(tmp_dir, f) for f in (os.listdir(tmp_dir) if os.path.isdir(tmp_dir) else []) if TMP_LEFTOVERS.match(f))
     cache = os.path.expanduser("~/.cache/pip-audit")
     held = [e for e in load_json(state_path("quarantine.json"), []) if os.path.isdir(e.get("to", ""))]
     h = home()
-    safe_home = os.path.basename(h.rstrip("/")) == "watchtower" and os.path.isdir(os.path.join(h, "state")) and h not in ("/", os.path.expanduser("~"))
+    safe_home = os.path.basename(h.rstrip("/")) == "watchtower" and os.path.isdir(os.path.join(h, "state")) and h not in ("/", os.path.expanduser("~")) \
+        and owned_path(h, "home", log=False)
     if not args.apply:
         print(fit({"mode": "preview (nothing removed)",
                    "order": "routines first, then `wt.py uninstall --apply --remove-folder`. Any audit or daily run after the decoys are gone would not re-plant them, but a routine left on would report errors.",
@@ -4452,6 +4538,7 @@ def cmd_uninstall(args):
                                             "decoy_folders_if_empty": [short_path(d) for d in decoy_dirs if os.path.isdir(d)],
                                             "installer_and_scratch_files_in_tmp": len(tmp), "scanner_cache": short_path(cache) if os.path.isdir(cache) else None,
                                             "watchtower_folder": h + " (with --remove-folder: scanners, reports, state, vet copies)"},
+                   "not_removed_outside_watchtower": [short_path(p) for p in refused] or None,
                    "quarantined_skills": [e["name"] for e in held] or None,
                    "quarantine_note": "These go with the folder. Restore any the owner wants first (`wt.py quarantine --restore <name>`)." if held else None,
                    "only_the_owner_can": ["Remove the three Ask-first rules in Auto-review, if they don't want them (they are worth keeping).",
@@ -4468,6 +4555,8 @@ def cmd_uninstall(args):
             pass
     save_json(state_path("canaries.json"), {})
     done.append(f"Removed {n} decoy file(s)")
+    if refused:
+        done.append(f"Did not remove {len(refused)} path(s) the decoy list pointed to outside the decoy places: {', '.join(short_path(p) for p in refused[:3])}")
     for d in decoy_dirs:
         try:
             os.rmdir(d)              # only if empty: never someone else's files

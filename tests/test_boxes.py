@@ -943,6 +943,83 @@ class MainBoxLessons(Box):
         self.assertFalse(any("put back" in n for n in r["notes"]), r["notes"])
         self.assertIn("WT-K002", {f["rule"] for f in self.snap()["findings"]})
 
+    def refusals(self):
+        return [json.loads(l) for l in open(wt.state_path("ledger.jsonl")) if '"refused-path"' in l]
+
+    def test_a_tampered_quarantine_record_never_moves_anything_outside(self):
+        """quarantine.json is a state file: anything that writes there chose what restore moved, and where to."""
+        self.skills(1); self.audit()
+        outside = os.path.join(self.tmp, "outside"); victim = os.path.join(outside, "victim"); os.makedirs(victim)
+        open(os.path.join(victim, "notes.md"), "w").write("not Watchtower's")
+        q = os.path.join(os.environ["WATCHTOWER_HOME"], "quarantine", "held-20261008-120000"); os.makedirs(q)
+        open(os.path.join(q, "SKILL.md.quarantined"), "w").write("held")
+        wt.save_json(wt.state_path("quarantine.json"), [
+            {"name": "takes-from-outside", "from": os.path.join(self.home, "sand-data", "workflows", "landed"), "to": victim, "at": wt.now()},
+            {"name": "puts-outside", "from": os.path.join(outside, "etc-like", "dropped"), "to": q, "at": wt.now()}])
+        for name in ("takes-from-outside", "puts-outside"):
+            code, o, _ = self.run_cmd("quarantine", "--restore", name)
+            self.assertEqual(code, 1, o)
+            self.assertIn("Not restored", o)
+        self.assertTrue(os.path.isfile(os.path.join(victim, "notes.md")))                 # v0.6.6 moved it into the skills folder
+        self.assertFalse(os.path.exists(os.path.join(self.home, "sand-data", "workflows", "landed")))
+        self.assertFalse(os.path.exists(os.path.join(outside, "etc-like")))                # and moved a held skill out to anywhere
+        self.assertTrue(os.path.isfile(os.path.join(q, "SKILL.md.quarantined")))
+        self.assertEqual(len(self.refusals()), 2)
+
+    def test_a_tampered_decoy_list_never_deletes_another_file(self):
+        self.skills(1); self.scanners(); self.audit()
+        victim = os.path.join(self.tmp, "outside", "notes.txt"); os.makedirs(os.path.dirname(victim))
+        for cmd in (("canary", "remove"), ("uninstall", "--apply")):
+            open(victim, "w").write("the owner's file")
+            reg = self.decoys()
+            reg["customers"]["path"] = victim
+            wt.save_json(wt.state_path("canaries.json"), reg)
+            others = [os.path.expanduser(v["path"]) for n, v in reg.items() if n != "customers"]
+            code, o, _ = self.run_cmd(*cmd)
+            self.assertTrue(os.path.isfile(victim), cmd)                                    # v0.6.6 deleted whatever the list named
+            self.assertFalse(any(os.path.exists(p) for p in others), cmd)                    # the real decoys still go
+        self.assertIn("Did not remove 1 path", o)
+        self.assertTrue(any(r["path"] == victim for r in self.refusals()))
+
+    def test_a_tampered_project_list_never_runs_npm_outside(self):
+        inside = os.path.join(self.ws, "app"); outside = os.path.join(self.tmp, "outside", "proj")
+        for d in (inside, outside, os.path.join(os.environ["WATCHTOWER_HOME"], "app")):
+            os.makedirs(d, exist_ok=True); open(os.path.join(d, "package-lock.json"), "w").write("{}")
+        wt.save_json(wt.state_path("osv_projects.json"), {"at": wt.now(), "projects": [inside, outside, os.path.join(os.environ["WATCHTOWER_HOME"], "app")]})
+        seen, real = [], (wt.upgrade_npm, wt.python_upgrades)
+        wt.upgrade_npm = lambda projs: seen.extend(projs) or []
+        wt.python_upgrades = lambda: []
+        self.addCleanup(lambda: (setattr(wt, "upgrade_npm", real[0]), setattr(wt, "python_upgrades", real[1])))
+        code, o, _ = self.run_cmd("fix", "--upgrade", "--roots", self.ws)
+        self.assertEqual(seen, [inside])                                                     # npm audit fix only where a project belongs
+        self.assertEqual(sum("not touched" in d for d in json.loads(o)["done"]), 2)
+        self.assertEqual(len(self.refusals()), 2)
+
+    def test_a_folder_named_like_the_skills_folder_elsewhere_is_not_the_owners(self):
+        """v0.6.6 matched '/agent-data/workflows/' anywhere in a path, so /tmp/x/agent-data/workflows/s was one of the owner's skills."""
+        fake = os.path.join(self.tmp, "x", "agent-data", "workflows", "planted"); os.makedirs(fake)
+        open(os.path.join(fake, "SKILL.md"), "w").write("---\nname: planted\ndescription: x\n---\nEVIL\n")
+        self.assertEqual(wt.skill_tier("/tmp/x/agent-data/workflows/s/SKILL.md"), "vendor")
+        self.assertEqual(wt.skill_tier(fake + "/"), "vendor")
+        self.assertEqual(wt.skill_tier(os.path.join(self.home, "agent-data", "workflows", "s", "SKILL.md")), "user")
+        self.assertEqual(wt.skill_tier("/home/box/sand-data/workflows/a/SKILL.md"), "user")
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": [
+            wt.finding("WT-X003", "Corroborated by multiple engines", "critical", ["AST01"], fake, "x", "f")]})
+        code, o, _ = self.run_cmd("fix", "--quarantine", fake)
+        self.assertIn("not quarantined", json.loads(o)["done"][0])
+        self.assertTrue(os.path.isfile(os.path.join(fake, "SKILL.md")))
+
+    def test_quarantine_by_path_needs_an_open_critical_finding(self):
+        d = self.skills(2)
+        wt.save_json(wt.state_path("last_findings.json"), {"findings": [
+            wt.finding("WT-T013", "External action with no approval line", "medium", ["ASI02"], d[0] + "/SKILL.md:5", "x", "f"),
+            wt.finding("WT-X003", "Corroborated by multiple engines", "critical", ["AST01"], d[1], "x", "f")]})
+        code, o, _ = self.run_cmd("fix", "--quarantine", f"{d[0]},{d[1]}")
+        done = json.loads(o)["done"]
+        self.assertIn("not quarantined", done[0])                                            # v0.6.6 took any SKILL.md folder given by path
+        self.assertTrue(done[1].startswith("Quarantined skill001"), done)
+        self.assertTrue(os.path.isfile(os.path.join(d[0], "SKILL.md")))
+
     def test_single_skills_get_time_to_finish_and_old_stuck_marks_are_retried(self):
         """Main box, v0.6.6: SkillSpector got 34s on a lone skill; healthy ones with Office files took 37 to 61s and 11 were marked stuck."""
         ds = self.skills(4)
