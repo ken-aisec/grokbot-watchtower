@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased (next batch)
+- **An update no longer waves a plugin through.** Versions before v0.6.3 kept no list of plugins, so the first run after updating recorded every plugin on the computer as known, including one added after setup that nobody had been told about. A plugin that wasn't there when the baseline was taken is now announced as new.
 - **Roll-call false alarms, second pass.** v0.6.5 on 16 real Bots still left 17 "external action with no approval line" findings, 16 of them false. The check now tells a thing from an act ("competitor posts", "booking email", "today's posts"), follows a negation through a list ("never edit post text or publish", "no sends/posts as Ken"), skips labels like "POST-CALL", and counts "Ken gates" and "read-only" as approval lines. "Don't wait, send it now" used to slip through as negated and is now flagged. The test quotes all 17 real lines.
 
 ## v0.6.5 — 2026-10-08 (the first roll-call of 16 real Bots)

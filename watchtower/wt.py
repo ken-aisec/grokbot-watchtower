@@ -1507,17 +1507,23 @@ def plugin_identity(plugin_json):
 def note_plugins(inv):
     """Remember which plugins are on the computer. The first run records what is there. After that, a plugin name not
     seen before is new: the owner (or a template they said yes to) added it, and nothing vetted it first."""
-    here = {}
+    here, manifests = {}, {}
     for p in inv["plugin_files"]:
         if os.path.basename(p) == "plugin.json" and any(x in p for x in ("/plugins/", "/plugin-cache/")):
             name, d = plugin_identity(p)
             here.setdefault(name, []).append(d)
+            manifests.setdefault(name, []).append(p)
     st = load_json(state_path("plugins.json"), None)
     first = not isinstance(st, dict)
     st = {} if first else st
+    # Updating from a version that kept no list of plugins: "what is there" is not all known. A plugin that wasn't on the
+    # computer when the owner's baseline was taken was added since, and nobody has been told about it yet.
+    base = (load_json(state_path("baseline.json"), {}) or {}) if first else {}
+    base_hashes = set(base.values())
+    in_baseline = lambda name: not base or any(p in base or sha256_file(p) in base_hashes for p in manifests[name])
     for name, roots in here.items():
         if name not in st:
-            st[name] = {"since": now(), "status": "known" if first else "new"}
+            st[name] = {"since": now(), "status": "known" if first and in_baseline(name) else "new"}
         st[name]["roots"] = sorted(set(roots))
     save_json(state_path("plugins.json"), st)
     _PENDING["at"] = None

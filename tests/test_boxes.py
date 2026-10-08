@@ -733,6 +733,20 @@ class MainBoxLessons(Box):
         self.assertEqual([t for t in clean if flagged(t)], [])
         self.assertEqual([t for t in bad if not flagged(t)], [])
 
+    def test_a_plugin_added_before_the_update_is_still_announced(self):
+        """The fresh account, updated from v0.6.2: the first v0.6.5 run filed a plugin added after setup as known and accepted its files."""
+        helper = FreshAccountLessons.plugin
+        helper(self, "builtin-1.0", "builtin", {"explain": "Explain invoices."}); self.skills(1); self.scanners()
+        self.audit()                                                            # the owner's baseline: one plugin
+        os.remove(wt.state_path("plugins.json"))                                # v0.6.2 kept no list of plugins
+        helper(self, "finance-2.0", "finance", {"ledger": "Explain ledgers."})                              # added later, never announced
+        self.audit()
+        new = [f for f in self.snap()["findings"] if f["rule"] == "WT-I004"]
+        self.assertEqual(len(new), 1, self.snap()["findings"])
+        self.assertIn("finance", new[0]["evidence"])
+        st = wt.load_json(wt.state_path("plugins.json"), {})
+        self.assertEqual((st["builtin"]["status"], st["finance"]["status"]), ("known", "new"))
+
 
 if __name__ == "__main__":
     unittest.main()
