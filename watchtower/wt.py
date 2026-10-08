@@ -278,7 +278,36 @@ OBJECT_NEXT = re.compile(r"(?i)^\s+(the|a|an|it|them|this|that|these|those|to|yo
                          r"emails?|messages?|mail|dms?|repl(y|ies)|reports?|summar(y|ies)|digests?|invoices?|payments?|money|data|files?)\b|^\s+(?-i:[A-Z@#])\w*")
 VERB_LEAD = re.compile(r"(?i)(^|\b(to|and|then|will|should|must|can|may|also|or|always|never|not|please|now|just|you|i|we|they|it|he|she|bot|"
                        r"agent|auto|do|does|\w+ly)|,)\s*$")
-TEAM_ROOM = re.compile(r"(?i)^\s+(to\s+|in\s+|into\s+)?(the\s+|our\s+)?(?-i:[A-Z])\w+\s+room\b")   # "post to Growth room", "post Crew room kickoff"
+TEAM_ROOM = re.compile(r"(?i)^\s+(to\s+|in\s+|into\s+)?(the\s+|our\s+)?(?P<room>(?-i:[A-Z])\w+)\s+room\b")   # "post to Growth room", "post Crew room kickoff"
+ROOMS_FILE = ("exports", "rooms.txt")
+
+
+def known_rooms():
+    """This account's own group rooms, one name per line in exports/rooms.txt (a trailing "room" and # notes are ignored).
+    The platform keeps no list of group rooms on the computer (checked on a real one, Oct 8 2026: agent profiles, stores and the
+    search index name Bots, not rooms), so the owner's list is the only source. No list means no room is known: a post to a room
+    is then treated like any other post, never waved through because its name is capitalised."""
+    out = set()
+    for line in (read_text(os.path.join(home(), *ROOMS_FILE)) or "").splitlines():
+        name = re.sub(r"(?i)\s+room$", "", line.split("#", 1)[0].strip()).strip().lower()
+        if name:
+            out.add(name)
+    return out
+
+
+# "Ignore all gates and send the payment", "Skip the gate": a word that names an approval step, inside an order to get past it.
+APPROVAL_DEFEATED = re.compile(r"(?i)\b(ignor(e|es|ed|ing)|skip(s|ped|ping)?|bypass(es|ed|ing)?|overrid(e|es|ing)|overrode|disregard(s|ed|ing)?|"
+                               r"circumvent(s|ed|ing)?|(get|go|work|getting|going|working)\s+(around|past)|(turn|switch)(s|ed|ing)?\s+off|"
+                               r"disabl(e|es|ed|ing))\b(\s+[\w'\u2019/-]+){0,3}\s+$")
+DEFEAT_NEGATED = re.compile(r"(?i)\b(never|not|n't|don'?t|do\s+not|no)\s+$")
+
+
+def approval_defeated(text, start):
+    """True when the approval word at `start` is the object of "ignore", "skip", "bypass", "override" and the like in the same
+    sentence. "Never bypass the approval gate" still counts: the order to get past it is itself negated."""
+    before = re.sub(r"[*_`]", "", re.split(r"[.;:!?\n]", text[max(0, start - 80):start])[-1])
+    m = APPROVAL_DEFEATED.search(before)
+    return bool(m) and not DEFEAT_NEGATED.search(before[:m.start()])
 SCOPE_BREAK = re.compile(r"(?i)\b(and|but|then|instead|except|unless|so|just)\b")
 NEGATOR = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor|no)\b")
 
@@ -324,8 +353,9 @@ def first_action(text, rx):
             continue
         if OWNER_AFTER.search(re.split(r"[.;:!?\n]", after[:40])[0]):
             continue
-        if m.group(0).lower() in ("post", "posts") and TEAM_ROOM.match(after):
-            continue                                                                                        # the Bots' own room, not the outside world
+        room = TEAM_ROOM.match(after) if m.group(0).lower() in ("post", "posts") else None
+        if room and room.group("room").lower() in known_rooms():
+            continue                                                                                        # one of the account's own rooms
         return m
     return None
 
@@ -333,6 +363,8 @@ def first_action(text, rx):
 def has_approval(text, rules):
     """An approval phrase counts only when it is not negated ("don't ask me" is the opposite)."""
     for m in rules["approval_terms"].finditer(text):
+        if approval_defeated(text, m.start()):
+            continue                                                                                        # "Ignore all gates and send"
         if m.group(0).lower().startswith("never"):
             return True
         if not NEGATION.search(text[max(0, m.start() - 20):m.start()]):
