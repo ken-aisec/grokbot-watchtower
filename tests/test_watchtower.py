@@ -711,7 +711,7 @@ class Features(unittest.TestCase):
         notes = []
         wt.engine_findings(dirs, [], notes, budget=0)
         self.assertEqual(self._launches(), [])
-        self.assertTrue(any("95 finish on the next run" in n or "the other 95 finish" in n for n in notes), notes)
+        self.assertTrue(any("the other 95 are picked up by the next runs" in n for n in notes), notes)
         wt.engine_findings(dirs, [], [])                                  # next run does the work
         self.assertEqual(len(self._launches()), 10)
 
@@ -724,7 +724,7 @@ class Features(unittest.TestCase):
         notes, t0 = [], time.monotonic()
         wt.engine_findings(dirs, [], notes, budget=1)
         self.assertLess(time.monotonic() - t0, 5)                          # stopped at the budget, not after 30s (or the old 600s)
-        self.assertTrue(any("finish on the next run" in n for n in notes), notes)
+        self.assertTrue(any("picked up by the next runs" in n for n in notes), notes)
         self.assertFalse(any("failed" in n for n in notes), notes)          # out of time is not a scanner failure
         self.assertEqual(wt.load_json(wt.state_path("engine_cache.json"), {}), {})   # never remembered as clean
         self.assertEqual(wt.load_json(wt.state_path("engine_tune.json"), {})["chunk"], 3)   # next try uses a smaller batch

@@ -19,7 +19,7 @@ State lives in $WATCHTOWER_HOME (default /workspace/watchtower).
 """
 import argparse, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(HERE, "..", "rules", "text_rules.json")
 SELF_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -104,11 +104,24 @@ def read_text(path, limit=1_000_000):
         return None
 
 
-def finding(rule_id, title, severity, owasp, where, evidence, fix, source="watchtower"):
+def finding(rule_id, title, severity, owasp, where, evidence, fix, source="watchtower", ident=None):
+    """`ident` names the finding when its evidence holds a count that drifts (63 logins, 6 advisories): the same problem
+    keeps the same key, so it is never reported as fixed and new in one run. `key0` is the key older versions gave it."""
     ev = (evidence or "").replace("\n", " ")[:160]
     key = hashlib.sha1(f"{rule_id}|{where}|{ev}".encode()).hexdigest()[:16]
-    return {"key": key, "rule": rule_id, "title": title, "severity": severity, "owasp": owasp,
-            "where": where, "evidence": ev, "fix": fix, "source": source}
+    out = {"key": key, "rule": rule_id, "title": title, "severity": severity, "owasp": owasp,
+           "where": where, "evidence": ev, "fix": fix, "source": source}
+    if ident is not None:
+        out["key"], out["key0"] = hashlib.sha1(f"{rule_id}|{where}|id:{ident}".encode()).hexdigest()[:16], key
+    return out
+
+
+def keys_of(findings):
+    return {k for f in findings for k in (f.get("key"), f.get("key0")) if k}
+
+
+def known(f, keys):
+    return f["key"] in keys or (f.get("key0") in keys if f.get("key0") else False)
 
 
 def line_of(text, pos):
@@ -562,7 +575,8 @@ def browser_sessions(roots):
             out.append(finding("WT-S004", "Logged-in browser sessions shared by every Bot", "high" if sensitive else "medium",
                                ["ASI03", "AST06"], p, f"{len(domains)} domains; sensitive: {', '.join(sensitive[:8]) or 'none'}",
                                "Every Bot can reuse these logins. In the Grok Bot browser, sign out of sites no Bot needs; "
-                               "for AI consoles and admin sites, also log out all sessions from that site's security settings."))
+                               "for AI consoles and admin sites, also log out all sessions from that site's security settings.",
+                               ident="sensitive" if sensitive else "plain"))
             break
     return out
 
@@ -741,8 +755,11 @@ def audit(roots, exports, quick=False):
                    user_dirs + sorted(changed) + other_dirs, fs, notes, user_roots, budget=max(0, min(ENGINE_BUDGET, time_left() - 20)))
         set_progress("finishing", 0, 0)
         rearm_canaries()  # Watchtower's own scanners just read every file; reset so only other readers trip them
-    elif changed:
-        fs += soft("SkillSpector and husk", (), notes, [], engine_findings, sorted(changed), fs, notes, budget=max(0, min(ENGINE_BUDGET, 120, time_left() - 10)))
+    else:
+        # The daily check re-scans what changed and then works through anything still waiting, two minutes at most.
+        rest = [d for d in user_dirs + sorted(os.path.dirname(x) for x in inv["skills"] if skill_tier(x) != "user") if d not in changed]
+        fs += soft("SkillSpector and husk", (), notes, [], engine_findings, sorted(changed) + rest, fs, notes, user_roots,
+                   budget=max(0, min(ENGINE_BUDGET, 120, time_left() - 10)))
     if quick:
         ks = load_json(state_path("key_status.json"), {}) or {}
         fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
@@ -854,8 +871,11 @@ def tool(name):
 ENGINE_BUDGET = int(os.environ.get("WT_ENGINE_BUDGET", "420"))   # seconds of engine time per run; the rest resumes next run
 ENGINE_CHUNK = 20                                                # skills per launch: small enough that a slow computer still saves progress every batch
 ENGINE_MAX_FILES, ENGINE_MAX_BYTES = 400, 2_000_000
-ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "60"))   # seconds one engine launch may take, plus time per skill.
-ENGINE_LAUNCH_PER_SKILL = 12                                              # measured: 0.2s per skill on a fast computer, 3.3s on a busy one
+ENGINE_LAUNCH_BASE = int(os.environ.get("WT_ENGINE_LAUNCH_BASE", "30"))   # seconds one engine launch may take, plus time per skill.
+ENGINE_LAUNCH_PER_SKILL = 4                                               # measured on a real box: 3s to launch on one small skill, up to 3.3s per skill when busy.
+#                                                                           v0.6.3 allowed 300s per batch, so one skill that hung a scanner used the whole run.
+ENGINE_MAX_TARGETS = 5000
+ENGINE_CURRENT = set()                                                    # skills whose scanner answer is up to date after this run
 ENGINE_HEAVY_BYTES, ENGINE_HEAVY_FILES = 400_000, 120                     # bigger skills are scanned on their own so they can't jam a batch
 STUCK_RETRY_DAYS = 7
 TIMED_OUT = "ran out of time"
@@ -932,6 +952,10 @@ def entry_engines(e_):
 def entry_current(e_, h, installed):
     """A remembered result is good when the skill hasn't changed and every scanner installed now has looked at it."""
     return bool(e_) and e_.get("hash") == h and (bool(e_.get("stuck")) or set(installed) <= entry_engines(e_))
+
+
+def has_binary(d):
+    return any(os.path.splitext(p)[1].lower() not in TEXT_EXT and os.path.getsize(p) > 20_000 for p in skill_files(d))
 
 
 def skill_weight(d):
@@ -1029,6 +1053,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     its files change; work stops at the time budget and resumes next run. A skill is 'corroborated' only when two engines flag it."""
     out, started = [], time.monotonic()
     budget = ENGINE_BUDGET if budget is None else budget
+    ENGINE_CURRENT.clear()
     ss_exe, hk_exe = tool("skillspector"), tool("husk")
     if not ss_exe:
         notes.append("SkillSpector not installed: run install.sh --scanners for a second engine.")
@@ -1039,7 +1064,10 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         d = os.path.normpath(d)
         if d not in targets and os.path.isdir(d) and os.path.isfile(os.path.join(d, "SKILL.md")):
             targets.append(d)
-    targets = targets[:500]
+    if len(targets) > ENGINE_MAX_TARGETS:
+        notes.append(f"This computer has {len(targets)} skills; SkillSpector and husk cover the first {ENGINE_MAX_TARGETS} (yours first). "
+                     f"The other {len(targets) - ENGINE_MAX_TARGETS} were checked by Watchtower's own rules only.")
+        targets = targets[:ENGINE_MAX_TARGETS]
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     hashes = {d: skill_dir_hash(d) for d in targets}
     retry_before = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=STUCK_RETRY_DAYS)).isoformat()
@@ -1062,7 +1090,9 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     size = max(1, min(ENGINE_CHUNK, int(tune.get("chunk", ENGINE_CHUNK))))
     left_s = lambda: budget - (time.monotonic() - started)
     weight = {d: skill_weight(d) for d in todo}
-    heavy = [d for d in todo if weight[d][0] > ENGINE_HEAVY_BYTES or weight[d][1] > ENGINE_HEAVY_FILES]
+    # Big skills, and skills carrying files that aren't text (slide decks, images, archives), are the ones that hang a scanner.
+    # Each runs on its own, after the quick ones, so a hang costs one short launch instead of a whole batch.
+    heavy = [d for d in todo if weight[d][0] > ENGINE_HEAVY_BYTES or weight[d][1] > ENGINE_HEAVY_FILES or has_binary(d)]
     light = [d for d in todo if d not in heavy]
     queue = [light[i:i + size] for i in range(0, len(light), size)] + [[d] for d in heavy]   # big skills alone, after the quick ones
     while queue:
@@ -1112,7 +1142,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     left = len(todo) - scanned
     if left > 0 and not any("failed on a batch" in n for n in notes):
         notes.append(f"SkillSpector and husk checked {scanned} of {len(todo)} new or changed skills in the time budget; "
-                     f"the other {left} finish on the next run (results are remembered).")
+                     f"the other {left} are picked up by the next runs, daily checks included (results are remembered).")
     set_progress("done", scanned, len(todo), started)
 
     wt_hits = {}
@@ -1146,7 +1176,10 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         elif hk_flag:
             out.append(finding("WT-X002", "husk flagged this skill", "medium" if tier == "user" else "low", ["AST01", "AST05"], d,
                                hk[0][:150], "Run `husk package <folder>` for details; one engine alone can be wrong.", source="husk"))
+    if installed:
+        ENGINE_CURRENT.update(d for d in targets if entry_current(cache.get(d) or {}, hashes[d], installed))
     save_json(state_path("engines.json"), {"at": now(), "targets": len(targets), "scanned_this_run": scanned, "cached": len(targets) - len(todo),
+                                           "waiting": max(0, left),
                                            "seconds": round(time.monotonic() - started, 1)})
     return out
 
@@ -1328,7 +1361,7 @@ def package_findings(notes):
             out.append(finding("WT-D001", f"Built-in Python package {d.get('name')} {d.get('version')} has known holes", "low", ["ASI04", "AST02"],
                                f"system python package {d.get('name')}", f"{len(ids)} known: {', '.join(ids[:4])}{'…' if len(ids) > 4 else ''}",
                                "It came with the computer and every Bot shares it. The platform's updates fix it; Watchtower doesn't touch system packages.",
-                               source="pip-audit"))
+                               source="pip-audit", ident=f"{d.get('name')} {d.get('version')}"))
             continue
         out.append(finding("WT-D001", f"Vulnerable package {d.get('name')} {d.get('version')}", "high", ["ASI04", "AST02"],
                            f"python package {d.get('name')}", f"{len(ids)} known: {', '.join(ids[:4])}{'…' if len(ids) > 4 else ''}",
@@ -1542,7 +1575,7 @@ def is_accepted(f, sup, today):
             if f["rule"] == "WT-X003" and os.path.normpath(f["where"]) == s_.get("where") and skill_dir_hash(f["where"]) == s_.get("hash"):
                 return s_
             continue
-        if s_.get("key") and s_["key"] == f["key"]:
+        if s_.get("key") and s_["key"] in (f["key"], f.get("key0")):
             return True
         # rule + text match survives rescans that change a finding's evidence (and so its key)
         if s_.get("rule") == f["rule"] and s_.get("match") and s_["match"] in f"{f['where']} {f['title']} {f['evidence']}":
@@ -1669,10 +1702,10 @@ def run_audit_locked(args, quick):
         ENGINE_BUDGET, DEADLINE = saved, None
     if quick:  # the daily run skips the slow engines; keep their last results instead of calling them fixed
         prev_snap = load_json(state_path("last_findings.json"), {"findings": []})
-        have = {f["key"] for f in fs}
-        rescanned = {f["where"] for f in fs if f["rule"].startswith("WT-X")}
+        have = keys_of(fs)
+        rescanned = {f["where"] for f in fs if f["rule"].startswith("WT-X")} | ENGINE_CURRENT   # these have an up-to-date answer, flagged or clean
         for f in prev_snap.get("findings", []):
-            if f["rule"] in SLOW_RULES and f["key"] not in have and f["where"] not in rescanned:
+            if f["rule"] in SLOW_RULES and not known(f, have) and f["where"] not in rescanned:
                 fs.append(f)
         fs = sort_findings(fs)
     if not quick and "SkillSpector and husk" not in STAGE_FAILED:
@@ -1685,10 +1718,9 @@ def run_audit_locked(args, quick):
             f["severity"] = "medium"   # one scanner flagging a skill in a plugin nobody has reviewed yet is worth a look
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
-    prev_keys = {f["key"] for f in prev.get("findings", [])}
-    cur_keys = {f["key"] for f in live}
-    new = [f for f in live if f["key"] not in prev_keys and f["severity"] != "info"]
-    fixed = [f for f in prev.get("findings", []) if f["key"] not in cur_keys]
+    prev_keys, cur_keys = keys_of(prev.get("findings", [])), keys_of(live)
+    new = [f for f in live if not known(f, prev_keys) and f["severity"] != "info"]
+    fixed = [f for f in prev.get("findings", []) if not known(f, cur_keys)]
     s, g = score([f for f in live if counts(f)])
     if not load_json(state_path("baseline.json"), {}):
         save_json(state_path("baseline.json"), meta["manifest"])
@@ -3399,7 +3431,8 @@ def osv_findings(roots, notes):
         ids = sorted(d["ids"])
         out.append(finding("WT-D002", f"Vulnerable package {name} {ver}", "high" if d["sev"] >= 7 else "medium", ["ASI04", "AST02"], dirs[0],
                            f"{eco}: {len(ids)} known: {', '.join(ids[:3])}" + (f" · used in {len(dirs)} projects" if len(dirs) > 1 else ""),
-                           "Update it in that project (npm update, go get -u, or your package manager), then re-run the audit.", source="osv-scanner"))
+                           "Update it in that project (npm update, go get -u, or your package manager), then re-run the audit.", source="osv-scanner",
+                           ident=f"{eco} {name} {ver} {'high' if d['sev'] >= 7 else 'medium'}"))
     return out
 
 

@@ -596,5 +596,99 @@ class FreshAccountLessons(Box):
         self.assertNotIn(wt.fix_class(out), ("decision",)) if out["title"] == wt.KEY_MAYBE else None
 
 
+# A scanner that hangs whenever a skill holding the word JAMMER is in what it was given, as SkillSpector did on Ken's computer.
+JAM_SS = SCANNERS["skillspector"].replace('skills = []\n', 'import time\nfor r, _, fs in os.walk(stage):\n    for f in fs:\n'
+                                          '        if b"JAMMER" in open(os.path.join(r, f), "rb").read():\n            time.sleep(120)\nskills = []\n')
+
+
+class MainBoxLessons(Box):
+    """Ken's own computer on v0.6.3: 591 skills, one plugin skill that hung SkillSpector, and six releases of history."""
+
+    def engines(self):
+        return wt.load_json(wt.state_path("engines.json"), {})
+
+    def big_box(self, n=600):
+        self.skills(40)
+        for i in range(n - 40):
+            d = os.path.join(self.home, "sand-data", "plugins", f"vendor-{i // 20}", "skills", f"s{i}"); os.makedirs(d)
+            open(os.path.join(d, "SKILL.md"), "w").write(f"---\nname: s{i}\ndescription: Vendor {i}.\n---\nExplain thing {i}.\n")
+
+    def test_every_skill_is_scanned_on_a_600_skill_computer(self):
+        self.big_box(); self.scanners()
+        r = self.audit()
+        e = self.engines()
+        self.assertEqual(e["targets"], 600)                                     # v0.6.3 stopped at 500 and said nothing
+        self.assertEqual(e["waiting"], 0, r["notes"])
+
+    def test_one_skill_that_hangs_the_scanner_costs_one_launch_not_the_run(self):
+        self.big_box(200)
+        jam = os.path.join(self.home, "sand-data", "plugins", "vendor-3", "skills", "s70")
+        open(os.path.join(jam, "notes.md"), "w").write("JAMMER\n")
+        self.scanners(skillspector=JAM_SS)
+        wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL = 60, 3, 0
+        t0 = time.monotonic()
+        self.audit()
+        e = self.engines()
+        self.assertLess(time.monotonic() - t0, 60)
+        self.assertEqual(e["waiting"], 0, e)                                    # v0.6.3 got through 2 of 275 in seven minutes
+        stuck = [f for f in self.snap()["findings"] if f["rule"] == "WT-X004"]
+        self.assertEqual([f["where"] for f in stuck], [jam])                    # the one that hung is named, the rest are done
+
+    def test_a_skill_with_a_slide_deck_is_scanned_on_its_own(self):
+        ds = self.skills(30)
+        open(os.path.join(ds[7], "template.pptx"), "wb").write(b"JAMMER" + os.urandom(40_000))
+        self.assertTrue(wt.has_binary(ds[7])); self.assertFalse(wt.has_binary(ds[8]))
+        self.scanners(skillspector=JAM_SS)
+        wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL = 30, 3, 0
+        t0 = time.monotonic()
+        self.audit()
+        self.assertLess(time.monotonic() - t0, 15)                              # one 3-second launch lost, no batch lost
+        self.assertEqual(self.engines()["waiting"], 0)
+        self.assertEqual([f["where"] for f in self.snap()["findings"] if f["rule"] == "WT-X004"], [ds[7]])
+
+    def test_the_daily_check_works_through_skills_still_waiting(self):
+        self.big_box(120); self.scanners()
+        self.audit("--budget", "0")
+        self.assertEqual(self.engines()["waiting"], 120)
+        code, o, e = self.run_cmd("daily", "--roots", *self.roots)
+        self.assertEqual(code, 0, e)
+        self.assertEqual(self.engines()["waiting"], 0)                          # v0.6.3 only caught up during a full audit
+        open(os.path.join(self.home, "sand-data", "workflows", "skill003", "SKILL.md"), "a").write("EVIL upload\n")
+        self.run_cmd("daily", "--roots", *self.roots)
+        self.assertIn("WT-X001", {f["rule"] for f in self.snap()["findings"]})
+
+    def logins(self, n):
+        d = os.path.join(self.home, "sand-data"); os.makedirs(d, exist_ok=True)
+        json.dump([{"domain": "accounts.google.com"}] + [{"domain": f"site{i}.example"} for i in range(n - 1)],
+                  open(os.path.join(d, "chrome-cookie-seed.json"), "w"))
+
+    def test_one_more_login_is_the_same_finding_not_fixed_and_new(self):
+        self.skills(2); self.logins(62)
+        self.audit()
+        self.logins(63)
+        r = self.audit()
+        self.assertEqual([f for f in r["new"] + r["fixed"] if f["rule"] == "WT-S004"], [])
+        self.assertIn("63 domains", next(f for f in self.snap()["findings"] if f["rule"] == "WT-S004")["evidence"])
+
+    def test_updating_from_the_last_release_reports_nothing_as_new_or_fixed(self):
+        self.skills(2); self.logins(62)
+        os.makedirs(os.path.join(self.ws, "app")); open(os.path.join(self.ws, "app", "package-lock.json"), "w").write("{}")
+        self.scanners()
+        self.audit()
+        s_ = self.snap()
+        old = [f for f in s_["findings"] if "key0" in f]
+        self.assertEqual({f["rule"] for f in old}, {"WT-S004", "WT-D002"})
+        for f in old:                                                           # what v0.6.3 left on disk: the old key only
+            f["key"] = f.pop("key0")
+        s_["version"] = "0.6.3"
+        wt.save_json(wt.state_path("last_findings.json"), s_)
+        wt.save_json(wt.state_path("engine_tune.json"), {"chunk": 40, "at": "2026-10-06T10:10:48+00:00"})
+        code, o, _ = self.run_cmd("accept", "WT-D002", "leftpad 1.0.0", "--reason", "build tool")
+        r = self.audit()
+        self.assertEqual(r["new"], [], r["new"])
+        self.assertEqual([f for f in r["fixed"] if f["rule"] != "WT-D002"], [])
+        self.assertNotIn("WT-D002", {f["rule"] for f in self.snap()["findings"]})   # the accept made before the update still holds
+
+
 if __name__ == "__main__":
     unittest.main()

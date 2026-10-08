@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.4 — 2026-10-08 (the main computer: 591 skills and six releases of history)
+v0.6.3 was the first release to send every skill on the computer to the outside scanners, not just the owner's. On a computer with 591 skills that showed four things the small simulated computers never did.
+- **One skill that hangs a scanner no longer uses up the run.** A plugin skill with a slide deck in it hung SkillSpector. A batch was allowed 300 seconds before Watchtower gave up on it, so a 7-minute run got through 2 of 275 skills. A batch now gets about 110 seconds and a single skill about 35 (a real launch measured 3 seconds). Skills that carry files that aren't text are scanned on their own, after the quick ones, so a hang costs one short launch.
+- **The daily check works through what's waiting.** Skills the scanners hadn't reached were only picked up by a full audit, once a week. The daily check now spends up to two minutes on them, and re-scanned skills that come back clean lose their old finding the same day.
+- **No silent limit.** The scanners stopped at 500 skills without saying so. The limit is now 5,000 and a line says so if it is ever reached. `status` and `doctor` show how many are still waiting.
+- **A count changing is not "fixed" plus "new".** The shared browser-login finding was reported fixed and found again because the number of logged-in sites went from 62 to 63. The same happened when a package gained an advisory. These findings now keep their identity, and accepts and history from v0.6.3 still match.
+- **The fix skill may not edit a project.** The command only updates lockfiles with a backup. The skill now also forbids the Bot running `npm install`, adding overrides or changing versions by hand.
+- 6 new simulated-box tests: a 600-skill computer, a skill that hangs the scanner, a skill with a slide deck, the daily catch-up, the login count, and an update from v0.6.3 state.
+
 ## v0.6.3 — 2026-10-08 (the second fresh-account test, stages 1 to 4)
 v0.6.2 passed a clean install on a new account (94, then 95). Everything below came from the stages after that: an overnight restart, three marketplace templates, planted bad samples, and the fix.
 - **Quarantine.** The fix could not remove a dangerous skill, so three planted bad skills left the score at 16 after "fix it". With one yes it now moves your own skills that have a critical finding into `/workspace/watchtower/quarantine` (`fix --quarantine <names>`). Nothing is deleted; `wt.py quarantine --restore <name>` puts one back.

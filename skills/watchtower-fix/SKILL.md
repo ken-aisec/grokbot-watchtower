@@ -32,6 +32,7 @@ description: The one-yes fix. Cleans up, upgrades outdated software (undoing any
 ## Never
 - Turn off or revoke a key. Show the link and let the user do it.
 - Use `--force` with npm, or touch node_modules, or change package.json. The fix only updates lockfiles and keeps a backup.
+- Run `npm install`, add `overrides`, bump a version, or edit any file in a project yourself, before or after the command. If the command leaves a package open, say so and stop: that project's owner fixes it there.
 - Accept anything the command refuses. It refuses two scanners agreeing a skill is dangerous, a decoy being touched, a working key, and a memory acting as an order.
 - Print a key, even partly.
 - Re-approve a changed skill yourself with `wt.py baseline`. `--revet` only re-approves skills that scan clean; the rest stay open.

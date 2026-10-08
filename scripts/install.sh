@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watchtower installer. Pinned, checksummed, and confined to /workspace/watchtower.
-# Usage: bash install.sh v0.6.3 [commit]   install that tagged release; with a commit ID, refuse anything else
+# Usage: bash install.sh v0.6.4 [commit]   install that tagged release; with a commit ID, refuse anything else
 #        bash install.sh --scanners        add the optional scanners (second half of this file)
 set -euo pipefail
 WT_HOME="${WATCHTOWER_HOME:-/workspace/watchtower}"
@@ -8,7 +8,7 @@ REPO="https://github.com/ken-aisec/grokbot-watchtower"
 
 if [[ "${1:-}" != "--scanners" ]]; then
   # ---- This is everything that runs for `bash install.sh <tag>`. It only writes inside $WT_HOME.
-  TAG="${1:?usage: install.sh <tag> [commit]  (for example v0.6.3)}"; WANT="${2:-}"
+  TAG="${1:?usage: install.sh <tag> [commit]  (for example v0.6.4)}"; WANT="${2:-}"
   mkdir -p "$WT_HOME"/{state,reports,exports,vet}
   rm -rf "$WT_HOME/app.new"
   git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$TAG" "$REPO" "$WT_HOME/app.new"
