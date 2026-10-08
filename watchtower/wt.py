@@ -4427,7 +4427,9 @@ def cmd_quarantine(args):
 
 
 # ---------------------------------------------------------------- uninstall: leave nothing behind
-TMP_LEFTOVERS = re.compile(r"^(gitleaks_.*\.tar\.gz|gitleaks_checksums\.txt|trufflehog_.*\.tar\.gz|trufflehog_checksums\.txt|osv_sums\.txt|wt-[\w.-]+\.(err|json|txt))$")
+# Only what install.sh itself leaves in /tmp. A name like wt-audit-066.json is not Watchtower's: the owner's Bot saved its
+# own copy of a run there (`audit --json > /tmp/...`), and v0.6.3 to v0.6.6 deleted those along with the installer's files.
+TMP_LEFTOVERS = re.compile(r"^(gitleaks_.*\.tar\.gz|gitleaks_checksums\.txt|trufflehog_.*\.tar\.gz|trufflehog_checksums\.txt|osv_sums\.txt|wt-lock\.err)$")
 ROUTINE_NAMES = ("Watchtower daily watch", "Watchtower weekly audit", "Watchtower weekly tidy", "Watchtower monthly roll-call")
 
 
@@ -4436,7 +4438,8 @@ def cmd_uninstall(args):
     reg = load_json(state_path("canaries.json"), {}) or {}
     decoys = [os.path.expanduser(v["path"]) for v in reg.values()]
     decoy_dirs = sorted({os.path.dirname(p) for p in decoys})
-    tmp = sorted(os.path.join("/tmp", f) for f in (os.listdir("/tmp") if os.path.isdir("/tmp") else []) if TMP_LEFTOVERS.match(f))
+    tmp_dir = decoy_path("/tmp")                     # /tmp, or the test's own folder: a test never touches the real one
+    tmp = sorted(os.path.join(tmp_dir, f) for f in (os.listdir(tmp_dir) if os.path.isdir(tmp_dir) else []) if TMP_LEFTOVERS.match(f))
     cache = os.path.expanduser("~/.cache/pip-audit")
     held = [e for e in load_json(state_path("quarantine.json"), []) if os.path.isdir(e.get("to", ""))]
     h = home()

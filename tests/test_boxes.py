@@ -589,6 +589,23 @@ class FreshAccountLessons(Box):
         self.assertFalse(os.path.exists(os.environ["WATCHTOWER_HOME"]))
         self.assertTrue(os.path.isdir(os.path.join(self.home, "sand-data", "workflows", "skill000")))   # the user's own skills are never touched
 
+    def test_uninstall_removes_only_the_installers_files_from_tmp(self):
+        """Main box, Oct 8: /tmp/wt-audit-066.json, wt-audit-t93.json, wt-fix-revet-t93.json and wt-daily-t93.json, saved there by the
+        owner's Bot, disappeared while their .time files stayed. The uninstall test ran `uninstall --apply` and cleared the real /tmp."""
+        self.skills(1); self.scanners(); self.audit()
+        tmp = wt.decoy_path("/tmp"); os.makedirs(tmp, exist_ok=True)
+        owners = ["wt-audit-066.json", "wt-audit-066.time", "wt-audit-t93.json", "wt-fix-revet-t93.json", "wt-daily-t93.json", "wt-notes.txt"]
+        installer = ["gitleaks_8.30.1_linux_x64.tar.gz", "gitleaks_checksums.txt", "trufflehog_3.97.9_linux_amd64.tar.gz",
+                     "trufflehog_checksums.txt", "osv_sums.txt", "wt-lock.err"]
+        for f in owners + installer:
+            open(os.path.join(tmp, f), "w").write("x")
+        code, o, _ = self.run_cmd("uninstall")
+        self.assertEqual(json.loads(o)["this_command_removes"]["installer_and_scratch_files_in_tmp"], len(installer))
+        code, o, _ = self.run_cmd("uninstall", "--apply")
+        self.assertEqual(code, 0, o)
+        self.assertEqual(sorted(os.listdir(tmp)), sorted(owners + [x for x in os.listdir(tmp) if x.startswith(".")]))   # the owner's files stay
+        self.assertTrue(tmp.startswith(self.tmp))                                 # and the test's /tmp is its own, never the real one
+
     def test_the_platforms_own_key_file_is_listed_but_never_counted(self):
         f = wt.finding("WT-S002", wt.KEY_MAYBE, "medium", ["ASI03"], "/home/box/sand-data/teach-queue-key.json:3", "generic key", "f")
         out = wt.platform_owned([f])[0]
