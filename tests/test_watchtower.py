@@ -9,6 +9,29 @@ FIX = os.path.join(ROOT, "tests", "fixtures")
 warnings.simplefilter("ignore", ResourceWarning)
 
 
+# No test may fall back to the real Watchtower folder (/workspace/watchtower) or plant decoys in the real /tmp and /var/tmp:
+# every test that doesn't set its own gets a throwaway folder for the whole module, put back when the module ends.
+_MODULE_ENV = {}
+
+
+def setUpModule():
+    tmp = tempfile.mkdtemp(prefix="wt-tests-")
+    _MODULE_ENV.update({k: os.environ.get(k) for k in ("WATCHTOWER_HOME", "WT_DECOY_ROOT")}, _tmp=tmp)
+    os.environ["WATCHTOWER_HOME"] = os.path.join(tmp, "watchtower")
+    os.environ["WT_DECOY_ROOT"] = os.path.join(tmp, "decoys")
+
+
+def tearDownModule():
+    tmp = _MODULE_ENV.pop("_tmp", None)
+    for k, v in _MODULE_ENV.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def fake_key(n, alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789", seed=7):
     """Realistic-looking random key, built at test time so no key-shaped string is committed."""
     import random
@@ -71,6 +94,18 @@ class FalsePositives(unittest.TestCase):
     """Seen on a real Grok Bot computer, Oct 5 2026."""
     def setUp(self):
         self.rules = wt.load_rules()
+        # Its own home folder: browser_sessions() always looks in ~/sand-data and ~/agent-data, and on a real
+        # computer that is the real browser login file, which turned one expected finding into two.
+        self.old_home = os.environ.get("HOME")
+        self.tmp_home = tempfile.mkdtemp()
+        os.environ["HOME"] = self.tmp_home
+
+    def tearDown(self):
+        if self.old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.old_home
+        shutil.rmtree(self.tmp_home, ignore_errors=True)
 
     def test_slovak_voice_names_are_not_keys(self):
         t = '{"voices": ["sk-SK-ViktoriaNeural-Standard-voice-model", "sk-sk-x-lukas-neural-high-quality-2024"]}'
@@ -248,6 +283,7 @@ class NativeSettings(unittest.TestCase):
 class Flow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.old_env = {k: os.environ.get(k) for k in ("WATCHTOWER_HOME", "WT_DECOY_ROOT")}
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = os.path.join(self.tmp, "home")
         os.makedirs(os.environ["HOME"])
@@ -259,6 +295,11 @@ class Flow(unittest.TestCase):
 
     def tearDown(self):
         os.environ["HOME"] = self.old_home
+        for k_, v_ in self.old_env.items():
+            if v_ is None:
+                os.environ.pop(k_, None)
+            else:
+                os.environ[k_] = v_
         shutil.rmtree(self.tmp)
 
     def call(self, *argv):
@@ -325,6 +366,7 @@ class Flow(unittest.TestCase):
 class Features(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.old_env = {k: os.environ.get(k) for k in ("WATCHTOWER_HOME", "WT_DECOY_ROOT")}
         self.old_home = os.environ.get("HOME")
         os.environ["HOME"] = self.tmp
         os.environ["WATCHTOWER_HOME"] = os.path.join(self.tmp, "wt")
@@ -333,6 +375,11 @@ class Features(unittest.TestCase):
 
     def tearDown(self):
         os.environ["HOME"] = self.old_home
+        for k_, v_ in self.old_env.items():
+            if v_ is None:
+                os.environ.pop(k_, None)
+            else:
+                os.environ[k_] = v_
         shutil.rmtree(self.tmp)
 
     def out(self, *argv):
