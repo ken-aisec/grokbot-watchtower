@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased (next batch)
+- **Sharing Watchtower itself.** The prepublish skill now says to re-save the first-run skill from the release before staging: an update doesn't refresh the saved copy, so the template would ship old instructions.
 - **The decoy move keeps its evidence.** v0.6.6 moved the decoys before recording a read that no run had logged yet, so that read was lost. It is now written to the log and named in a note before the old file is removed.
 
 ## v0.6.6 — 2026-10-08 (one batch from a day on two real computers)
