@@ -2,6 +2,7 @@
 
 ## Unreleased (next batch)
 - **Copies of one skill are scanned once.** The first v0.6.7 audit on the main computer checked 7 of 41 new or changed skills in its time budget. Most of the 41 were the same three skills, byte for byte, in eight clones of one repo, and each copy was queued and scanned on its own (a slide deck makes each a solo scan of up to two minutes). Identical copies now share one scan and its answer.
+- **Model and variable names are not keys.** gitleaks' generic key rule reads "api" inside "EAPI", so on the main computer a cloned repo's model names (`eapi-grok-4-3-internal`) and a variable (`self.eapi_4_3_x_algo`) were reported as keys. A value made only of short lowercase words and version numbers joined by `-`, `_` or `.` no longer counts for that rule; anything with random-looking parts still does (DQ-011).
 
 ## v0.6.7 — 2026-10-09 (the dev queue and a review of the next batch)
 - **A lone skill gets two minutes, not 34 seconds.** v0.6.4 cut the time a scanner gets on one skill to stop a hang using up the run. It was too tight: on a real box, healthy skills carrying Office files took 37 to 61 seconds and 11 were marked stuck, with a week's wait before a retry that would fail the same way. A skill scanned alone now gets 120 seconds, and anything marked stuck under the shorter limit is retried on the next run.

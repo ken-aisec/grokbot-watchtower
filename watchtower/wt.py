@@ -1438,6 +1438,13 @@ description = "A bare 40-character hex string is a git commit, not a Sourcegraph
 targetRules = ["sourcegraph-access-token"]
 regexTarget = "secret"
 regexes = ['''^[a-fA-F0-9]{40}$''']
+
+[[allowlists]]
+description = "A code name made of short lowercase words and version numbers (eapi-grok-4-3-internal, self.eapi_4_3_x_algo) is not a key"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^((([a-z]{1,12}|[0-9]{1,4})[._-])*[0-9]{1,4}([._-]([a-z]{1,12}|[0-9]{1,4}))+|(([a-z]{1,12}|[0-9]{1,4})[._-])+[0-9]{1,4})$''']
+
 """
 
 

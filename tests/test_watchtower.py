@@ -1,4 +1,4 @@
-import datetime as dt, io, json, os, shutil, sys, tempfile, time, unittest, warnings
+import datetime as dt, io, json, os, re, shutil, sys, tempfile, time, unittest, warnings
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1186,6 +1186,45 @@ class Features(unittest.TestCase):
         self.assertIn("2 of 11 news sources responded", page)   # missing feeds are counted, not invented
         self.assertEqual(len(r["top_stories"]), 1)
         self.assertEqual(r["top_stories"][0]["category"], "MCP and connectors")
+
+
+
+def gitleaks_allowlists():
+    """The [[allowlists]] blocks of Watchtower's gitleaks config, read the way gitleaks reads them."""
+    out = []
+    for block in wt.GITLEAKS_CONFIG.split("[[allowlists]]")[1:]:
+        target = re.search(r'regexTarget = "(\w+)"', block)
+        rules = re.search(r"targetRules = \[(.*?)\]", block)
+        regs = re.search(r"regexes = \[(.*?)\]\s*$", block, re.S)
+        out.append({"target": target.group(1) if target else "secret",
+                    "rules": re.findall(r'"([\w-]+)"', rules.group(1)) if rules else [],
+                    "regexes": [re.compile(r) for r in re.findall(r"'''(.*?)'''", regs.group(1))] if regs else []})
+    return out
+
+
+def allowed(rule, target, text):
+    return any((not a["rules"] or rule in a["rules"]) and a["target"] == target and any(r.search(text) for r in a["regexes"])
+               for a in gitleaks_allowlists())
+
+
+REAL_GITLEAKS = shutil.which("gitleaks") or "/workspace/watchtower/bin/gitleaks"   # run, never changed
+
+
+class GitleaksFalseAlarms(unittest.TestCase):
+    """Main box, v0.6.7 (DQ-011): gitleaks' generic-api-key rule reads "api" inside "EAPI", so model and variable names in a
+    cloned repo were reported as keys, and a paging cursor in a saved API result was reported as a key."""
+    REAL_NAMES = ["eapi-grok-4-3-internal", "eapi-grok-4-6-internal", "self.eapi_4_3_x_algo"]   # config.py:90 and :93, classifier.py:667
+    KEY_SHAPES = ["Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA", "3f2b8c1e-9d4a-4e7b-b1c2-5a6d7e8f9a0b", "k9x2-m4p7-q8w3-r5t6-z1y0",
+                  "prod_live_7d93kq2mzx81", "a1b2c3d4e5f6a7b8c9d0e1f2"]   # made up: what a key looks like
+    CURSORS = ["7140dibdnow9c7btw4b0ykk1f4wmw3e8nltv0ccd2o0vo", "b26v89c19zqg8o3fpzbkg5dqg8w7k2d4",
+               "1ZXgaW5Qa2VuOjE2OTk5MjM0NTY3ODk=", "CAESBggAEAAYAA=="]   # made up, in the shapes paging APIs use
+
+    def test_model_and_variable_names_are_not_keys(self):
+        for s in self.REAL_NAMES:
+            self.assertTrue(allowed("generic-api-key", "secret", s), s)
+        for s in self.KEY_SHAPES:
+            self.assertFalse(allowed("generic-api-key", "secret", s), s)
+        self.assertFalse(allowed("aws-access-token", "secret", "eapi-grok-4-3-internal"))   # only the generic rule
 
 
 if __name__ == "__main__":
