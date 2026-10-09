@@ -1226,6 +1226,34 @@ class GitleaksFalseAlarms(unittest.TestCase):
             self.assertFalse(allowed("generic-api-key", "secret", s), s)
         self.assertFalse(allowed("aws-access-token", "secret", "eapi-grok-4-3-internal"))   # only the generic rule
 
+    def test_a_paging_cursor_is_not_a_key_but_its_line_is_still_read(self):
+        for name in ("next_token", "nextPageToken", "next_cursor", "prev_token", "page_token", "continuation_token"):
+            self.assertTrue(allowed("generic-api-key", "match", f'{name}":"{self.CURSORS[0]}"'), name)
+        for m in ('api_key":"Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA"', 'access_token":"Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA"', 'token":"Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA"'):
+            self.assertFalse(allowed("generic-api-key", "match", m), m)
+        self.assertFalse(any(a["target"] == "line" and any(r.search('"next_token"') for r in a["regexes"]) for a in gitleaks_allowlists()))
+
+    @unittest.skipUnless(os.access(REAL_GITLEAKS, os.X_OK), "gitleaks is not installed")
+    def test_with_the_real_gitleaks(self):
+        src = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, src, True)
+        files = {"config.py": 'class Models:\n    EAPI_GROK_4_3_INTERNAL = "eapi-grok-4-3-internal"\n    EAPI_GROK_4_6_INTERNAL = "eapi-grok-4-6-internal"\n',
+                 "classifier.py": "async def _sample_4_3(self, convo):\n    breaker, sampler = _eapi_4_3_x_algo_breaker, self.eapi_4_3_x_algo\n",
+                 "page1.txt": '{"data":[{"id":"1"}],"meta":{"result_count":1,"next_token":"%s"}}' % self.CURSORS[0],
+                 "page2.txt": '{"items":[],"nextPageToken":"%s","next_cursor":"%s"}' % (self.CURSORS[1], self.CURSORS[2]),
+                 "page3.txt": '{"pagination":{"next_token":"%s","prev_token":"%s"}}' % (self.CURSORS[3], self.CURSORS[0]),
+                 "mixed.txt": '{"meta":{"next_token":"%s"},"config":{"api_key":"Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA"}}' % self.CURSORS[0],
+                 "keys.py": 'EAPI_KEY = "Zq8xV3mN7pL2kR9tW4yB6cD1fG5hJ0sA"\n'}
+        for n, t in files.items():
+            open(os.path.join(src, n), "w").write(t)
+        out = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, out, True)
+        cfg, rep = os.path.join(out, "gitleaks.toml"), os.path.join(out, "report.json")
+        open(cfg, "w").write(wt.GITLEAKS_CONFIG)
+        import subprocess
+        subprocess.run([REAL_GITLEAKS, "detect", "--source", src, "--no-git", "--redact", "--config", cfg, "--report-format", "json",
+                        "--report-path", rep, "--exit-code", "0"], capture_output=True, timeout=120, check=True)
+        hits = sorted((os.path.basename(r["File"]), r["Match"].split('"')[0].split(" ")[0]) for r in json.load(open(rep)))
+        self.assertEqual(hits, [("keys.py", "EAPI_KEY"), ("mixed.txt", "api_key")])   # the key after next_token on the same line is still found
+
 
 if __name__ == "__main__":
     unittest.main()

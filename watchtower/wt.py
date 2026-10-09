@@ -1445,6 +1445,11 @@ targetRules = ["generic-api-key"]
 regexTarget = "secret"
 regexes = ['''^((([a-z]{1,12}|[0-9]{1,4})[._-])*[0-9]{1,4}([._-]([a-z]{1,12}|[0-9]{1,4}))+|(([a-z]{1,12}|[0-9]{1,4})[._-])+[0-9]{1,4})$''']
 
+[[allowlists]]
+description = "A paging cursor (next_token, nextPageToken, prev_cursor...) in an API result is not a key. Matched on the found text, not the line"
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = ['''(?i)^["']?(next|prev|previous|page|pagination|continuation)_?(page_?)?(token|cursor)\b''']
 """
 
 
