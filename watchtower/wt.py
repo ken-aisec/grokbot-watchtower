@@ -1281,14 +1281,29 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     todo = [d for d in targets if not entry_current(cache.get(d) or {}, hashes[d], installed)
             or (cache[d].get("stuck") and (cache[d].get("at", "") < retry_before or cache[d].get("limit", 0) < ENGINE_SOLO_LIMIT))] if installed else []
     scanned, stuck_now = 0, []
+    # Copies of one skill (the same files in several clones of a repo) are scanned once; every copy gets that answer.
+    # Up to v0.6.7 each copy was queued and scanned on its own, so eight clones of one big skill cost eight solo scans.
+    twins, first = {}, {}
+    for d in todo:
+        if hashes[d] in first:
+            twins.setdefault(first[hashes[d]], []).append(d)
+        else:
+            first[hashes[d]] = d
+    run = [d for d in todo if first[hashes[d]] == d]
+
+    def remember(d, entry):
+        cache[d] = entry
+        for t in twins.get(d, []):
+            cache[t] = dict(entry)
+        return 1 + len(twins.get(d, []))
     tune = load_json(state_path("engine_tune.json"), {}) or {}
     size = max(1, min(ENGINE_CHUNK, int(tune.get("chunk", ENGINE_CHUNK))))
     left_s = lambda: budget - (time.monotonic() - started)
-    weight = {d: skill_weight(d) for d in todo}
+    weight = {d: skill_weight(d) for d in run}
     # Big skills, and skills carrying files that aren't text (slide decks, images, archives), are the ones that hang a scanner.
     # Each runs on its own, after the quick ones, so a hang costs one short launch instead of a whole batch.
-    heavy = [d for d in todo if weight[d][0] > ENGINE_HEAVY_BYTES or weight[d][1] > ENGINE_HEAVY_FILES or has_binary(d)]
-    light = [d for d in todo if d not in heavy]
+    heavy = [d for d in run if weight[d][0] > ENGINE_HEAVY_BYTES or weight[d][1] > ENGINE_HEAVY_FILES or has_binary(d)]
+    light = [d for d in run if d not in heavy]
     queue = [light[i:i + size] for i in range(0, len(light), size)] + [[d] for d in heavy]   # big skills alone, after the quick ones
     while queue:
         if left_s() <= 0:
@@ -1319,11 +1334,11 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
                 queue[:0] = [[d] for d in sorted(chunk, key=lambda d: weight[d], reverse=True)]
                 continue
             d = chunk[0]                       # found it: remember, report it, and stop spending every run on it
-            cache[d] = {"hash": hashes[d], "stuck": who, "at": now(), "limit": cap}
+            entry = {"hash": hashes[d], "stuck": who, "at": now(), "limit": cap}
             if who == "SkillSpector" and hk_exe and not hk_err:
-                cache[d]["hk"] = hk.get(d)        # husk's answer still counts
-            stuck_now.append(d)
-            scanned += 1
+                entry["hk"] = hk.get(d)           # husk's answer still counts
+            stuck_now += [d] + twins.get(d, [])
+            scanned += remember(d, entry)
             save_json(state_path("engine_cache.json"), cache)
             continue
         for err_, who in ((ss_err, "SkillSpector"), (hk_err, "husk")):
@@ -1332,8 +1347,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
         if ss_err or hk_err:
             continue   # don't remember a batch that didn't finish
         for d in chunk:
-            cache[d] = {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "engines": installed, "at": now()}
-        scanned += len(chunk)
+            scanned += remember(d, {"hash": hashes[d], "ss": ss.get(d), "hk": hk.get(d), "engines": installed, "at": now()})
         save_json(state_path("engine_cache.json"), cache)   # progress survives an interrupted run
         if size < ENGINE_CHUNK and len(chunk) == size:      # a smaller batch fit: go back to the normal size next run
             size = ENGINE_CHUNK

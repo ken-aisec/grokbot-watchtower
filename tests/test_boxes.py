@@ -652,6 +652,28 @@ class MainBoxLessons(Box):
         stuck = [f for f in self.snap()["findings"] if f["rule"] == "WT-X004"]
         self.assertEqual([f["where"] for f in stuck], [jam])                    # the one that hung is named, the rest are done
 
+    def test_copies_of_one_skill_are_scanned_once(self):
+        """Main box, v0.6.7 (DQ-010): the audit checked 7 of 41 new or changed skills in its seven minutes. Most of the 41 were
+        the same three assessment skills, byte for byte, in eight clones of one repo (a 1.4 MB slide deck makes each one a solo
+        scan), and each copy was queued and scanned on its own."""
+        ds = []
+        for clone in ("clone-a", "clone-b", "clone-c", "clone-d", "clone-e", "clone-f", "clone-g", "clone-h"):
+            d = os.path.join(self.ws, clone, "repo", "skills", "assessment", "assessment-deck-2"); os.makedirs(d)
+            open(os.path.join(d, "SKILL.md"), "w").write("---\nname: assessment-deck-2\ndescription: Build the assessment deck.\n---\nFill the deck from the notes.\n")
+            open(os.path.join(d, "deck-template.pptx"), "wb").write(b"PK\x03\x04" + bytes(range(256)) * 96)
+            ds.append(d)
+        self.assertEqual(len({wt.skill_dir_hash(d) for d in ds}), 1)
+        self.assertTrue(wt.has_binary(ds[0]))
+        log = os.path.join(os.environ["WATCHTOWER_HOME"], "launches.log")
+        slow = SCANNERS["skillspector"].replace("skills = []\n", f"import time\nopen({log!r}, 'a').write('x\\n'); time.sleep(1.5)\nskills = []\n")
+        self.scanners(skillspector=slow)
+        wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = 5, 3, 0, 10
+        r = self.audit()
+        self.assertEqual(self.engines()["waiting"], 0, r["notes"])                 # v0.6.7: 3 of 8 copies, the rest left for later runs
+        self.assertEqual(len(open(log).read().split()), 1)                         # one scan for eight copies
+        cache = wt.load_json(wt.state_path("engine_cache.json"), {})
+        self.assertTrue(all(cache[d].get("engines") for d in ds))                  # every copy has the answer
+
     def test_a_skill_with_a_slide_deck_is_scanned_on_its_own(self):
         ds = self.skills(30)
         open(os.path.join(ds[7], "template.pptx"), "wb").write(b"JAMMER" + os.urandom(40_000))
