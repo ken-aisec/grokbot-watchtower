@@ -1,5 +1,5 @@
 """install.sh and publish.sh, run for real with stand-ins for pip, curl and gh. Nothing here reaches the network or GitHub."""
-import os, shutil, subprocess, sys, tempfile, unittest
+import hashlib, io, os, platform, shutil, subprocess, sys, tarfile, tempfile, unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 REAL_PY = shutil.which("python3") or sys.executable
@@ -31,36 +31,77 @@ class InstallScanners(unittest.TestCase):
         stub(self.bin, "python3", f'if [[ "$1" == "-m" && "$2" == "venv" ]]; then mkdir -p "$3/bin"; cp "{self.tmp}/pip.body" "$3/bin/pip"; '
                                   f'sed -i "1i #!/bin/bash" "$3/bin/pip"; chmod +x "$3/bin/pip"; printf "#!/bin/bash\\necho SkillSpector v0\\n" > "$3/bin/skillspector"; '
                                   f'chmod +x "$3/bin/skillspector"; exit 0; fi\nexec {REAL_PY} "$@"\n')
-        stub(self.bin, "curl", 'echo "curl $*" >> "$CALLS"; exit 1\n')
+        self.serve = os.path.join(self.tmp, "releases"); os.makedirs(self.serve)
+        self.release_files()
+        stub(self.bin, "curl", 'echo "curl $*" >> "$CALLS"\nout=""; url=""\nwhile [[ $# -gt 0 ]]; do case "$1" in -o) out="$2"; shift 2;; -*) shift;; *) url="$1"; shift;; esac; done\n'
+                               'f="$SERVE/${url##*/}"; [[ -f "$f" ]] || exit 22; cp "$f" "$out"\n')
+
+    def release_files(self):
+        """Stand-ins for the gitleaks, TruffleHog and OSV-Scanner release downloads, each with its published checksum file."""
+        a = {"x86_64": ("x64", "amd64"), "aarch64": ("arm64", "arm64"), "arm64": ("arm64", "arm64")}.get(platform.machine())
+        if not a:
+            self.skipTest("install.sh skips the binary scanners on " + platform.machine())
+        def tgz(name, tool):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as t:
+                body = f"#!/bin/bash\necho {tool} test build\n".encode()
+                info = tarfile.TarInfo(tool); info.size = len(body); info.mode = 0o755
+                t.addfile(info, io.BytesIO(body))
+            open(os.path.join(self.serve, name), "wb").write(buf.getvalue())
+            return hashlib.sha256(buf.getvalue()).hexdigest()
+        g = f"gitleaks_8.30.1_linux_{a[0]}.tar.gz"; th = f"trufflehog_3.97.9_linux_{a[1]}.tar.gz"; ob = f"osv-scanner_linux_{a[1]}"
+        open(os.path.join(self.serve, "gitleaks_8.30.1_checksums.txt"), "w").write(f"{tgz(g, 'gitleaks')}  {g}\n")
+        open(os.path.join(self.serve, "trufflehog_3.97.9_checksums.txt"), "w").write(f"{tgz(th, 'trufflehog')}  {th}\n")
+        body = b"#!/bin/bash\necho osv-scanner test build\n"
+        open(os.path.join(self.serve, ob), "wb").write(body)
+        open(os.path.join(self.serve, "osv-scanner_SHA256SUMS"), "w").write(f"{hashlib.sha256(body).hexdigest()}  {ob}\n")
+
+    def binaries(self):
+        return sorted(f for f in ("gitleaks", "trufflehog", "osv-scanner") if os.access(os.path.join(self.wt, "bin", f), os.X_OK))
 
     def run_install(self, **env):
-        e = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"], WATCHTOWER_HOME=self.wt, CALLS=self.log, TMPDIR=os.path.join(self.tmp, "t"), **env)
+        e = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"], WATCHTOWER_HOME=self.wt, CALLS=self.log, SERVE=self.serve, TMPDIR=os.path.join(self.tmp, "t"), **env)
         r = subprocess.run(["bash", os.path.join(ROOT, "scripts", "install.sh"), "--scanners"], env=e, capture_output=True, text=True, timeout=60)
         calls = open(self.log).read().splitlines() if os.path.exists(self.log) else []
         return r, calls
 
     def test_a_lock_that_fails_stops_the_install(self):
+        """Ken, Oct 9: a failed lock skips only the Python scanners. The binaries still install from their own checksums,
+        and the script still ends with CHECKSUM LOCK FAILED and a non-zero exit."""
         r, calls = self.run_install(PIP_FAILS="1")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("CHECKSUM LOCK FAILED", r.stdout)
         self.assertIn("DO NOT MATCH THE HASHES", r.stdout)                          # it says why
         self.assertEqual([c for c in calls if c.startswith("pip")], [f"pip install --quiet --require-hashes -r {self.lock}"])   # nothing without the lock
-        self.assertFalse(any(c.startswith("curl") for c in calls))                   # and nothing after it
+        self.assertEqual(self.binaries(), ["gitleaks", "osv-scanner", "trufflehog"], r.stdout)   # the others come from their own checksums
+        self.assertTrue(r.stdout.rstrip().splitlines()[-1].startswith("CHECKSUM LOCK FAILED"), r.stdout)   # the last word, not lost above
+        self.assertNotIn("Scanners installed in", r.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.wt, "app.new")))
         self.assertFalse(os.path.exists(os.path.join(self.wt, "scanners", "LOCKED")))
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "t")), [])                # downloads and the pip log are cleaned up
 
     def test_a_missing_lock_stops_the_install(self):
         os.remove(self.lock)
         r, calls = self.run_install()
         self.assertEqual(r.returncode, 1)
         self.assertIn("is missing", r.stdout)
+        self.assertIn("CHECKSUM LOCK FAILED", r.stdout)
         self.assertEqual([c for c in calls if c.startswith("pip")], [])
+        self.assertEqual(self.binaries(), ["gitleaks", "osv-scanner", "trufflehog"], r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.wt, "scanners", "LOCKED")))
+
+    def test_a_binary_with_a_wrong_checksum_is_not_installed(self):
+        open(os.path.join(self.serve, "gitleaks_8.30.1_checksums.txt"), "w").write("0" * 64 + f"  gitleaks_8.30.1_linux_{'x64' if platform.machine() == 'x86_64' else 'arm64'}.tar.gz\n")
+        r, calls = self.run_install(PIP_FAILS="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.binaries(), ["osv-scanner", "trufflehog"], r.stdout)
 
     def test_a_lock_that_fits_still_installs(self):
         r, calls = self.run_install()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(os.path.exists(os.path.join(self.wt, "scanners", "LOCKED")))
         self.assertIn("Scanners installed from the checksum lock.", r.stdout)
+        self.assertEqual(self.binaries(), ["gitleaks", "osv-scanner", "trufflehog"], r.stdout)
 
 
 class Publish(unittest.TestCase):

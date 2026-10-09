@@ -35,21 +35,24 @@ PIP="$WT_HOME/scanners/bin/pip"; LOCK="$WT_HOME/app/scripts/scanners.lock"; rm -
 SS="skillspector @ git+https://github.com/NVIDIA/SkillSpector@a50b9c93835c94f7d36329f11c6599abbb9c74ee"
 # Pinned and checksummed: a security tool that installs unpinned scanners is its own supply-chain risk.
 # The lock lists every package the scanners need with its checksum; pip refuses anything that doesn't match.
-# If the lock can't be used, nothing is installed without it: up to v0.6.6 this fell back to unchecked downloads.
-LOCK_ERR="${TMPDIR:-/tmp}/wt-lock.err"
+# If the lock can't be used, the Python scanners are not installed without it (up to v0.6.6 this fell back to unchecked
+# downloads). gitleaks, TruffleHog and OSV-Scanner don't come from the lock: they still install from their own checksums,
+# and the script ends with CHECKSUM LOCK FAILED and a non-zero exit so the failure is never missed.
+DL="${TMPDIR:-/tmp}"
+LOCK_ERR="$DL/wt-lock.err"; LOCK_FAILED=""
 if [[ -f "$LOCK" ]] && "$PIP" install --quiet --require-hashes -r "$LOCK" 2>"$LOCK_ERR" \
    && "$PIP" install --quiet --no-deps "$SS" 2>>"$LOCK_ERR"; then
   touch "$WT_HOME/scanners/LOCKED"; echo "Scanners installed from the checksum lock."
 else
+  LOCK_FAILED=1
   if [[ -f "$LOCK" ]]; then
-    echo "CHECKSUM LOCK FAILED - not installing the scanners. pip refused the checksummed packages on this computer's Python ($(python3 --version 2>&1)):"
+    echo "CHECKSUM LOCK FAILED - not installing the Python scanners. pip refused the checksummed packages on this computer's Python ($(python3 --version 2>&1)):"
     tail -n 5 "$LOCK_ERR" 2>/dev/null | sed 's/^/  /' || true
   else
-    echo "CHECKSUM LOCK FAILED - not installing the scanners: $LOCK is missing."
+    echo "CHECKSUM LOCK FAILED - not installing the Python scanners: $LOCK is missing."
   fi
-  echo "Nothing was installed without checksums. Watchtower works without its scanners and the audit says which are missing."
-  rm -f "$LOCK_ERR"; rm -rf "$WT_HOME/app.new"
-  exit 1
+  echo "Nothing is installed without checksums. gitleaks, TruffleHog and OSV-Scanner still install from their own checksums."
+  rm -rf "$WT_HOME/app.new"
 fi
 mkdir -p "$WT_HOME/bin"
 arch="$(uname -m)"; case "$arch" in x86_64) ga=x64;; aarch64|arm64) ga=arm64;; *) echo "skip gitleaks: $arch"; ga="";; esac
@@ -58,28 +61,32 @@ if [[ -n "$ga" ]]; then
   # and the audit says which is missing. (&& chains on purpose: nothing is unpacked unless its checksum passed.)
   tgz="gitleaks_${GITLEAKS_VERSION}_linux_${ga}.tar.gz"
   base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-  curl -fsSL -o "/tmp/$tgz" "$base/$tgz" \
-    && curl -fsSL -o /tmp/gitleaks_checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" \
-    && (cd /tmp && grep " $tgz\$" gitleaks_checksums.txt | sha256sum -c -) \
-    && tar -xzf "/tmp/$tgz" -C "$WT_HOME/bin" gitleaks \
+  curl -fsSL -o "$DL/$tgz" "$base/$tgz" \
+    && curl -fsSL -o "$DL/gitleaks_checksums.txt" "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" \
+    && (cd "$DL" && grep " $tgz\$" gitleaks_checksums.txt | sha256sum -c -) \
+    && tar -xzf "$DL/$tgz" -C "$WT_HOME/bin" gitleaks \
     || echo "gitleaks did not install; Watchtower works without it."
   # TruffleHog: tells live keys from dead ones (asks each key's own provider)
   th="trufflehog_${TRUFFLEHOG_VERSION}_linux_$( [ "$ga" = x64 ] && echo amd64 || echo arm64 ).tar.gz"
   tb="https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}"
-  curl -fsSL -o "/tmp/$th" "$tb/$th" \
-    && curl -fsSL -o /tmp/trufflehog_checksums.txt "$tb/trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt" \
-    && (cd /tmp && grep " $th\$" trufflehog_checksums.txt | sha256sum -c -) \
-    && tar -xzf "/tmp/$th" -C "$WT_HOME/bin" trufflehog \
+  curl -fsSL -o "$DL/$th" "$tb/$th" \
+    && curl -fsSL -o "$DL/trufflehog_checksums.txt" "$tb/trufflehog_${TRUFFLEHOG_VERSION}_checksums.txt" \
+    && (cd "$DL" && grep " $th\$" trufflehog_checksums.txt | sha256sum -c -) \
+    && tar -xzf "$DL/$th" -C "$WT_HOME/bin" trufflehog \
     || echo "TruffleHog did not install; Watchtower works without it."
   # OSV-Scanner: known holes in Node, Go and other project dependencies
   ob="osv-scanner_linux_$( [ "$ga" = x64 ] && echo amd64 || echo arm64 )"
   curl -fsSL -o "$WT_HOME/bin/osv-scanner.new" "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/$ob" \
-    && curl -fsSL -o /tmp/osv_sums.txt "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_SHA256SUMS" \
-    && (cd "$WT_HOME/bin" && grep " $ob\$" /tmp/osv_sums.txt | sed "s/$ob/osv-scanner.new/" | sha256sum -c -) \
+    && curl -fsSL -o "$DL/osv_sums.txt" "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_SHA256SUMS" \
+    && (cd "$WT_HOME/bin" && grep " $ob\$" "$DL/osv_sums.txt" | sed "s/$ob/osv-scanner.new/" | sha256sum -c -) \
     && chmod +x "$WT_HOME/bin/osv-scanner.new" && mv "$WT_HOME/bin/osv-scanner.new" "$WT_HOME/bin/osv-scanner" \
     || { rm -f "$WT_HOME/bin/osv-scanner.new"; echo "OSV-Scanner did not install; Watchtower works without it."; }
 fi
-"$WT_HOME/scanners/bin/skillspector" --version || echo "SkillSpector did not install; Watchtower works without it and says so in the audit."
+[[ -z "$LOCK_FAILED" ]] && { "$WT_HOME/scanners/bin/skillspector" --version || echo "SkillSpector did not install; Watchtower works without it and says so in the audit."; }
 [[ -x "$WT_HOME/bin/gitleaks" ]] && "$WT_HOME/bin/gitleaks" version || true
-rm -f /tmp/gitleaks_*_linux_*.tar.gz /tmp/gitleaks_checksums.txt /tmp/trufflehog_*_linux_*.tar.gz /tmp/trufflehog_checksums.txt /tmp/osv_sums.txt "$LOCK_ERR"
+rm -f "$DL"/gitleaks_*_linux_*.tar.gz "$DL/gitleaks_checksums.txt" "$DL"/trufflehog_*_linux_*.tar.gz "$DL/trufflehog_checksums.txt" "$DL/osv_sums.txt" "$LOCK_ERR"
+if [[ -n "$LOCK_FAILED" ]]; then
+  echo "CHECKSUM LOCK FAILED - the Python scanners (SkillSpector, husk) were not installed. Watchtower works without them and the audit says which are missing."
+  exit 1
+fi
 echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."
