@@ -3886,7 +3886,11 @@ def tidy_apply(plan, args):
         return ["Cleanup not done: there is no list from the last week for the owner to have said yes to. Run `wt.py fix` and show it first."]
     skip = {x.strip() for x in (getattr(args, "skip", None) or "").split(",") if x.strip()}
     shown = {(x.get("action"), x.get("path")) for x in saved["items"]}
-    named = lambda x: x["id"] in skip or x["path"] in skip or short_path(x["path"]) in skip or os.path.basename(x["path"].rstrip("/")) in skip
+    # numbers are the ones on the list the owner saw (tidy_plan.json), never the rebuilt list's: an item that dropped off
+    # since the preview would shift them and the wrong folder would be emptied
+    by_name = lambda x: x["path"] in skip or short_path(x["path"]) in skip or os.path.basename(x["path"].rstrip("/")) in skip
+    skipped = {(x.get("action"), x.get("path")) for x in saved["items"] if str(x.get("id")) in skip or by_name({"path": x.get("path") or ""})}
+    named = lambda x: (x["action"], x["path"]) in skipped or by_name(x)
     go = [x for x in plan if (x["action"], x["path"]) in shown and not named(x)]
     done = apply_fix(go)
     left = [x for x in plan if named(x)]

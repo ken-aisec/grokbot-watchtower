@@ -1016,6 +1016,29 @@ class MainBoxLessons(Box):
         code, o, _ = self.run_cmd("fix", "--roots", *self.roots)
         self.assertEqual([x["path"] for x in json.loads(o)["safe_fixes"] if x["action"] == "empty_tool_cache"], [cur_cache])   # still open
 
+    def test_tidy_skip_numbers_are_the_ones_the_owner_saw(self):
+        """Review of dev at 5fba2b2: --skip numbers were matched against the rebuilt list, so they shifted when an item dropped
+        off between the preview and the yes. Preview 1, 2, 3; the owner says skip 2; item 1 changes before the yes; Watchtower
+        then emptied the old #2 and left the old #3."""
+        self.skills(1); self.scanners(); self.audit()
+        old = time.time() - 3 * 86400
+        caches = [os.path.join(self.ws, name, "agent-tools") for name in ("crew-a", "crew-b", "crew-c")]
+        for d in caches:
+            os.makedirs(d)
+            for i in range(2):
+                f = os.path.join(d, f"{i:08x}-tool-result.txt"); open(f, "w").write("notion page payload"); os.utime(f, (old, old))
+            os.utime(d, (old, old))
+        count = lambda d: len(os.listdir(d))
+        code, o, _ = self.run_cmd("fix", "--roots", *self.roots)                  # the preview the owner saw
+        shown = {x["id"]: x["path"] for x in json.loads(o)["safe_fixes"] if x["action"] == "empty_tool_cache"}
+        self.assertEqual(sorted(shown), ["1", "2", "3"])
+        first, second, third = shown["1"], shown["2"], shown["3"]
+        open(os.path.join(first, "00000009-tool-result.txt"), "w").write("new payload")   # item 1 changes before the yes
+        code, o, _ = self.run_cmd("fix", "--apply", "--owner-said-yes", "--skip", "2", "--roots", *self.roots)
+        done = json.loads(o)["done"]
+        self.assertEqual((count(first), count(second), count(third)), (3, 2, 0), done)   # old #2 kept as asked, old #3 emptied
+        self.assertTrue(any("Left alone as you asked" in d and os.path.basename(os.path.dirname(second)) in d for d in done), done)
+
     def test_the_roll_call_writes_this_accounts_rooms_from_the_roster(self):
         rdir = os.path.join(os.environ["WATCHTOWER_HOME"], "exports", "rollcall"); os.makedirs(rdir)
         json.dump({"name": "Kestrel", "description": "Outreach drafts.", "routines": [{"name": "Growth after-action", "schedule": "daily",
