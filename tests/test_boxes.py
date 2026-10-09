@@ -796,6 +796,37 @@ class MainBoxLessons(Box):
         st = wt.load_json(wt.state_path("plugins.json"), {})
         self.assertEqual((st["builtin"]["status"], st["finance"]["status"]), ("known", "new"))
 
+    def test_a_plugin_a_pre_066_update_filed_as_known_is_announced_once(self):
+        """Main box (DQ-004): AgentMail was installed the evening after the owner's baseline. An earlier version made the plugin
+        list on its first run and filed every plugin as known; the platform roll then accepted its 33 files. v0.6.6 never looked again."""
+        helper = FreshAccountLessons.plugin
+        helper(self, "builtin-1.0", "builtin", {"explain": "Explain invoices."}); self.skills(1); self.scanners()
+        self.audit()
+        wt.ledger({"event": "baseline", "files": 3})
+        time.sleep(1.2)
+        root = helper(self, "agentmail/6314e7d42dd1ce47b77469e35869980d6404caa1", "agentmail", {"agent-email-patterns": "Email patterns."})
+        for meta in (".claude-plugin", ".codex-plugin", ".cursor-plugin", ".plugin"):                  # the real layout: one manifest per app
+            os.makedirs(os.path.join(root, meta)); json.dump({"name": "agentmail", "author": {"name": "AgentMail"}}, open(os.path.join(root, meta, "plugin.json"), "w"))
+        st = wt.load_json(wt.state_path("plugins.json"), {})
+        first = st["builtin"]["since"]
+        st["agentmail"] = {"since": first, "status": "known", "roots": [root]}                         # what the earlier version wrote
+        wt.save_json(wt.state_path("plugins.json"), st)
+        base = wt.load_json(wt.state_path("baseline.json"), {})
+        for dp, _, fns in os.walk(root):                                                               # and what the platform roll accepted
+            for fn in fns:
+                base[os.path.join(dp, fn)] = wt.sha256_file(os.path.join(dp, fn))
+        wt.save_json(wt.state_path("baseline.json"), base)
+        self.audit()
+        st = wt.load_json(wt.state_path("plugins.json"), {})
+        self.assertEqual((st["builtin"]["status"], st["agentmail"]["status"]), ("known", "new"))
+        self.assertEqual(st["agentmail"]["roots"], [root])                                              # not four plugins named after their manifest folders
+        self.assertTrue(any("agentmail" in f["evidence"] for f in self.snap()["findings"] if f["rule"] == "WT-I004"))
+        code, o, _ = self.run_cmd("fix", "--roots", *self.roots)
+        self.assertIn("WT-I004", [d.get("rule") for d in json.loads(o)["decisions"]], o)
+        wt.keep_plugin(root)                                                                            # the owner keeps it: asked once
+        self.audit()
+        self.assertEqual(wt.load_json(wt.state_path("plugins.json"), {})["agentmail"]["status"], "known")
+
     def decoys(self):
         self.run_cmd("canary", "plant")
         return wt.load_json(wt.state_path("canaries.json"), {})

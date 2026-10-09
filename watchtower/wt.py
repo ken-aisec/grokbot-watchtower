@@ -1641,7 +1641,7 @@ def find_key(obj, keys):
 PLATFORM_FILES = ("/sand-data/gateway.json", "/agent-data/gateway.json", "/sand-data/teach-queue-key.json", "/agent-data/teach-queue-key.json")   # Grok Bot's own config; the user can't change it
 
 
-PLUGIN_META_DIRS = (".grok-plugin", ".cursor-plugin", ".claude-plugin")
+PLUGIN_META_DIRS = (".grok-plugin", ".cursor-plugin", ".claude-plugin", ".codex-plugin", ".plugin")   # one plugin, one folder, whichever app it is packaged for
 _PENDING = {"at": None, "roots": ()}
 
 
@@ -1678,9 +1678,59 @@ def note_plugins(inv):
         if name not in st:
             st[name] = {"since": now(), "status": "known" if first and in_baseline(name) else "new"}
         st[name]["roots"] = sorted(set(roots))
+    if not first:
+        recheck_known_plugins(st, here)
     save_json(state_path("plugins.json"), st)
     _PENDING["at"] = None
     return {name: v["roots"] for name, v in st.items() if v.get("status") == "new" and name in here}
+
+
+def last_owner_baseline(before):
+    """When the owner last took a baseline (the ledger's "baseline" events), at or before `before`; None if never."""
+    best = None
+    try:
+        with open(state_path("ledger.jsonl")) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("event") == "baseline" and e.get("at") and e["at"] <= before:
+                    best = e["at"] if best is None or e["at"] > best else best
+    except OSError:
+        return None
+    try:
+        return dt.datetime.fromisoformat(best).timestamp() if best else None
+    except ValueError:
+        return None
+
+
+def recheck_known_plugins(st, here):
+    """Once, after updating: v0.6.3 to v0.6.5 made the plugin list on their first run and filed every plugin there as known,
+    including one added after the owner's baseline (AgentMail on the main computer, installed the evening after). v0.6.6's
+    fix only covered computers with no list yet. A plugin on that first list whose folders were all created after the
+    owner's last baseline before it is filed as new, so it is announced once and the owner decides."""
+    flag = state_path("plugins_rechecked.json")
+    if os.path.exists(flag):
+        return
+    firsts = [v.get("since", "") for v in st.values() if isinstance(v, dict) and v.get("since")]
+    first_at = min(firsts) if firsts else None
+    base_ts = last_owner_baseline(first_at) if first_at else None
+    moved = []
+    if base_ts:
+        for name, v in st.items():
+            if not isinstance(v, dict) or v.get("status") != "known" or v.get("kept") or v.get("since") != first_at or name not in here:
+                continue
+            try:
+                born = min(os.stat(r).st_ctime for r in here[name])
+            except (OSError, ValueError):
+                continue
+            if born > base_ts + 1:
+                v.update(status="new", rechecked=now())
+                moved.append(name)
+    save_json(flag, {"at": now(), "baseline": base_ts, "filed_as_new": moved})
+    if moved:
+        ledger({"event": "plugin-recheck", "new": moved})
 
 
 def pending_plugin_roots():
