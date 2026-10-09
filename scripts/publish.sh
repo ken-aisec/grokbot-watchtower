@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
-TAG="v0.6.6"
+TAG="v0.6.7"
 echo "Publishing $REPO ($TAG)"
 # A published tag is never moved: installed copies and template memories pin its commit.
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || \
