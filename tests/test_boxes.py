@@ -1087,6 +1087,18 @@ class MainBoxLessons(Box):
         self.assertTrue(done[1].startswith("Quarantined skill001"), done)
         self.assertTrue(os.path.isfile(os.path.join(d[0], "SKILL.md")))
 
+    def test_husk_still_checks_a_skill_skillspector_cannot_finish(self):
+        """Main box, v0.6.6 (DQ-001): after SkillSpector timed out on a lone skill, husk never ran on it (`if hk_exe and not ss_err`),
+        and state/husk-cache.json had no entry for any of the 11 stuck skills."""
+        ds = self.skills(3)
+        open(os.path.join(ds[1], "SKILL.md"), "a").write("HUSK loader\n")
+        open(os.path.join(ds[1], "template.docx"), "wb").write(b"JAMMER" + os.urandom(40_000))
+        self.scanners(skillspector=JAM_SS)
+        wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = 30, 3, 0, 3
+        self.audit()
+        mine = sorted(f["rule"] for f in self.snap()["findings"] if f["where"] == ds[1] and f["rule"].startswith("WT-X"))
+        self.assertEqual(mine, ["WT-X002", "WT-X004"])                         # stuck on SkillSpector, and husk's answer still counts
+
     def test_single_skills_get_time_to_finish_and_old_stuck_marks_are_retried(self):
         """Main box, v0.6.6: SkillSpector got 34s on a lone skill; healthy ones with Office files took 37 to 61s and 11 were marked stuck."""
         ds = self.skills(4)

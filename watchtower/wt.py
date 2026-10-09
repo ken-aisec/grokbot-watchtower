@@ -1296,7 +1296,7 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
             # the budget is checked inside the batch too: each engine only gets the time that is left
             if ss_exe:
                 ss, ss_err = (skillspector_batch(ss_exe, stage, mapping, min(cap, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
-            if hk_exe and not ss_err:
+            if hk_exe and (not ss_err or (ss_err == TIMED_OUT and len(chunk) == 1)):   # a lone skill SkillSpector can't finish still gets husk
                 hk, hk_err = (husk_batch(hk_exe, stage, mapping, min(cap, left_s())) if left_s() > 0 else ({}, TIMED_OUT))
         finally:
             shutil.rmtree(stage, ignore_errors=True)
@@ -1311,6 +1311,8 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
                 continue
             d = chunk[0]                       # found it: remember, report it, and stop spending every run on it
             cache[d] = {"hash": hashes[d], "stuck": who, "at": now(), "limit": cap}
+            if who == "SkillSpector" and hk_exe and not hk_err:
+                cache[d]["hk"] = hk.get(d)        # husk's answer still counts
             stuck_now.append(d)
             scanned += 1
             save_json(state_path("engine_cache.json"), cache)
@@ -1345,7 +1347,8 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
             out.append(finding("WT-X004", "A scanner couldn't finish this skill", "low", ["AST08"], d,
                                f"{e_['stuck']} gave no answer in time", "Watchtower's own rules still checked it. Watchtower tries the scanner again in a week, or sooner if the skill changes. "
                                "Big or unusual files are the usual cause.", source="engines"))
-            continue
+            if not e_.get("hk"):
+                continue
         s_, hk = e_.get("ss") or {}, e_.get("hk")
         ss_flag = s_.get("recommendation") == "DO_NOT_INSTALL"
         hk_flag = bool(hk)
