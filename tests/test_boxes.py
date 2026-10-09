@@ -832,6 +832,29 @@ class MainBoxLessons(Box):
         self.audit()
         self.assertEqual(wt.load_json(wt.state_path("plugins.json"), {})["agentmail"]["status"], "known")
 
+    def test_a_plugin_the_platform_reinstalled_after_the_baseline_stays_known(self):
+        """Review of dev at 5fba2b2: the DQ-004 re-check went by folder age alone, so a plugin the owner's baseline held was
+        announced as new when a platform update put it in a new folder (on the main computer: pstack, google-drive and x
+        moved from e5a8186d… to d0ef80d8… on Oct 8). Its skills are the ones the owner saw, so it stays known."""
+        helper = FreshAccountLessons.plugin
+        old = helper(self, "pstack/e5a8186d7b43be8d6ac4452440fbead5f1a51c70", "pstack", {"architect": "Plan the change before writing it."})
+        self.skills(1); self.scanners()
+        self.run_cmd("baseline", "--roots", *self.roots)                          # the owner's baseline keeps a copy of each skill
+        base = max(e["at"] for e in map(json.loads, open(wt.state_path("ledger.jsonl"))) if e.get("event") == "baseline")
+        base_ts = dt.datetime.fromisoformat(base).timestamp()
+        while time.time() <= base_ts + 1.5:                                       # the update comes later (waits on the clock)
+            time.sleep(0.1)
+        new = os.path.join(os.path.dirname(old), "d0ef80d86795816da932a153458c5dbe192d294e")
+        shutil.copytree(old, new); shutil.rmtree(old)                             # the platform update: same skill, new folder
+        mail = helper(self, "agentmail/6314e7d42dd1ce47b77469e35869980d6404caa1", "agentmail", {"agent-email-patterns": "Email patterns."})
+        first = dt.datetime.fromtimestamp(math.ceil(time.time()), dt.timezone.utc).isoformat()
+        wt.save_json(wt.state_path("plugins.json"), {"pstack": {"since": first, "status": "known", "roots": [new]},
+                                                     "agentmail": {"since": first, "status": "known", "roots": [mail]}})   # what the earlier version wrote
+        self.audit()
+        st = wt.load_json(wt.state_path("plugins.json"), {})
+        self.assertEqual((st["pstack"]["status"], st["agentmail"]["status"]), ("known", "new"))
+        self.assertEqual(wt.load_json(wt.state_path("plugins_rechecked.json"), {})["kept_in_baseline"], ["pstack"])
+
     def decoys(self):
         self.run_cmd("canary", "plant")
         return wt.load_json(wt.state_path("canaries.json"), {})

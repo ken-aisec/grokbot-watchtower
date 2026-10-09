@@ -1743,19 +1743,55 @@ def last_owner_baseline(before):
         return None
 
 
+def owner_baseline_skills(base_ts):
+    """The skills the owner's baseline held, by the content of their SKILL.md: the approved copies `baseline` keeps were saved
+    at or before that baseline. Later copies (the platform roll's, re-approvals) don't count, so a plugin the roll accepted
+    after the baseline isn't mistaken for one the owner saw."""
+    out = set()
+    try:
+        names = os.listdir(state_path("approved"))
+    except OSError:
+        return out
+    for fn in names:
+        try:
+            with gzip.open(state_path("approved", fn), "rt", encoding="utf-8") as f:
+                d = json.load(f)
+            if dt.datetime.fromisoformat(d["at"]).timestamp() > base_ts + 1:
+                continue
+            out.update(h for rel, h in (d.get("hashes") or {}).items() if os.path.basename(rel) == "SKILL.md")
+        except (OSError, ValueError, KeyError, TypeError, EOFError):
+            continue
+    return out
+
+
+def plugin_in_baseline(roots, owned):
+    """True when one of the plugin's skills is, word for word, a skill the owner's baseline held: the platform moved or
+    reinstalled its folders, it didn't add it."""
+    if not owned:
+        return False
+    for r in roots:
+        for dp, dns, fns in os.walk(r):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS]
+            if "SKILL.md" in fns and sha256_file(os.path.join(dp, "SKILL.md")) in owned:
+                return True
+    return False
+
+
 def recheck_known_plugins(st, here):
     """Once, after updating: v0.6.3 to v0.6.5 made the plugin list on their first run and filed every plugin there as known,
     including one added after the owner's baseline (AgentMail on the main computer, installed the evening after). v0.6.6's
     fix only covered computers with no list yet. A plugin on that first list whose folders were all created after the
-    owner's last baseline before it is filed as new, so it is announced once and the owner decides."""
+    owner's last baseline before it is filed as new, so it is announced once and the owner decides, unless one of its
+    skills is word for word one the owner's baseline held (the platform moved or reinstalled it)."""
     flag = state_path("plugins_rechecked.json")
     if os.path.exists(flag):
         return
     firsts = [v.get("since", "") for v in st.values() if isinstance(v, dict) and v.get("since")]
     first_at = min(firsts) if firsts else None
     base_ts = last_owner_baseline(first_at) if first_at else None
-    moved = []
+    moved, kept = [], []
     if base_ts:
+        owned = owner_baseline_skills(base_ts)
         for name, v in st.items():
             if not isinstance(v, dict) or v.get("status") != "known" or v.get("kept") or v.get("since") != first_at or name not in here:
                 continue
@@ -1764,9 +1800,12 @@ def recheck_known_plugins(st, here):
             except (OSError, ValueError):
                 continue
             if born > base_ts + 1:
+                if plugin_in_baseline(here[name], owned):   # its folders changed in a platform update; its skills are the owner's baseline's
+                    kept.append(name)
+                    continue
                 v.update(status="new", rechecked=now())
                 moved.append(name)
-    save_json(flag, {"at": now(), "baseline": base_ts, "filed_as_new": moved})
+    save_json(flag, {"at": now(), "baseline": base_ts, "filed_as_new": moved, "kept_in_baseline": kept})
     if moved:
         ledger({"event": "plugin-recheck", "new": moved})
 
