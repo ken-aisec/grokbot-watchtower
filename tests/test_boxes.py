@@ -674,6 +674,31 @@ class MainBoxLessons(Box):
         cache = wt.load_json(wt.state_path("engine_cache.json"), {})
         self.assertTrue(all(cache[d].get("engines") for d in ds))                  # every copy has the answer
 
+    def test_a_key_hit_in_a_tool_cache_names_its_file_and_line(self):
+        """Main box, v0.6.7 (DQ-012): WT-S002 on /workspace/agent-tools said "1 hit(s): generic-api-key" and nothing else, so the
+        owner had to re-run gitleaks by hand to find 9cb25c53-56f1-4ffd-9441-51638d121499.txt:1."""
+        self.skills(1)
+        cache = os.path.join(self.ws, "agent-tools"); os.makedirs(cache)
+        report = os.path.join(self.tmp, "leaks.json")
+        stub = SCANNERS["gitleaks"].replace('open(a[a.index("--report-path") + 1], "w").write("[]")',
+                                            f'open(a[a.index("--report-path") + 1], "w").write(open({report!r}).read() if a[a.index("--source") + 1].endswith("workspace") else "[]")')
+        self.scanners(gitleaks=stub)
+        def hit(name):
+            open(os.path.join(cache, name), "w").write('{"meta":{"result_count":1}}\n')
+            json.dump([{"File": os.path.join(cache, name), "StartLine": 1, "RuleID": "generic-api-key", "Match": 'next_token":"REDACTED"'}], open(report, "w"))
+        hit("9cb25c53-56f1-4ffd-9441-51638d121499.txt")
+        r = self.audit()
+        f1 = [f for f in self.snap()["findings"] if f["rule"] == "WT-S002"]
+        self.assertEqual([f["where"] for f in f1], [cache])                                       # one finding for the folder, as before
+        self.assertIn("9cb25c53-56f1-4ffd-9441-51638d121499.txt:1", f1[0]["evidence"])          # and it names the file and line
+        os.remove(os.path.join(cache, "9cb25c53-56f1-4ffd-9441-51638d121499.txt"))
+        hit("0d4e7a19-2b3c-4d5e-8f60-718293a4b5c6.txt")                                          # the cache refills with a new file
+        r = self.audit()
+        f2 = [f for f in self.snap()["findings"] if f["rule"] == "WT-S002"]
+        self.assertIn("0d4e7a19-2b3c-4d5e-8f60-718293a4b5c6.txt:1", f2[0]["evidence"])
+        self.assertEqual(f2[0]["key"], f1[0]["key"])                                              # the same finding, not fixed and new
+        self.assertFalse([f for f in r["new"] if f["rule"] == "WT-S002"], r["new"])
+
     def test_a_skill_with_a_slide_deck_is_scanned_on_its_own(self):
         ds = self.skills(30)
         open(os.path.join(ds[7], "template.pptx"), "wb").write(b"JAMMER" + os.urandom(40_000))

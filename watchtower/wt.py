@@ -1521,8 +1521,13 @@ def gitleaks_findings(roots, notes):
                        "Hits are often third-party tokens inside those payloads. Check for any of yours, then clear the folder; it refills on its own."
                        if cache else "Check which of these tokens are still live and revoke them, then clear the folder or move it off "
                        "the shared computer. Transcripts and tool output often capture tokens by accident.")
+                # name the files and lines: the folder alone sent the owner re-running gitleaks to find the hit. The files in
+                # these folders come and go, so the finding keeps one name (ident) while its evidence changes
+                locs = [f"{os.path.relpath(l.get('File') or d, d)}:{l.get('StartLine')}" for l in leaks]
+                at = ", ".join(locs[:3]) + (f" and {len(locs) - 3} more" if len(locs) > 3 else "")
                 out.append(finding("WT-S002", f"gitleaks: secrets in {len(files)} {'file' if len(files) == 1 else 'files'} under {os.path.basename(d)}", sev,
-                                   ["ASI03", "LLM02"], d, f"{len(leaks)} hit(s): {', '.join(kinds)[:100]}", why, source="gitleaks"))
+                                   ["ASI03", "LLM02"], d, f"{len(leaks)} hit(s): {', '.join(kinds)[:60]} at {at}", why, source="gitleaks",
+                                   ident="gitleaks:" + ",".join(kinds)))
         for fpath, leaks in per_file.items():
             kinds = sorted({l.get("RuleID", "secret") for l in leaks})
             generic = all(k.startswith("generic") for k in kinds)
