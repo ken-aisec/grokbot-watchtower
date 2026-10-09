@@ -1,4 +1,4 @@
-import datetime as dt, io, json, os, shutil, sys, tempfile, unittest, warnings
+import datetime as dt, io, json, os, shutil, sys, tempfile, time, unittest, warnings
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -486,21 +486,24 @@ class Features(unittest.TestCase):
         tr = os.path.join(self.tmp, "home2", "sand-data", "agent-transcripts", "a")
         os.makedirs(tc); os.makedirs(tr)
         open(os.path.join(tc, "1.txt"), "w").write("notion payload")
+        old = time.time() - 3 * 86400
+        os.utime(os.path.join(tc, "1.txt"), (old, old)); os.utime(tc, (old, old))   # a cache nobody has used for days
         key = "ghp_" + fake_key(36)
         open(os.path.join(tr, "chat.jsonl"), "w").write(f'{{"user": "use {key} for the repo"}}\n{{"ok": 1}}\n')
+        before = open(os.path.join(tr, "chat.jsonl")).read()
         roots = [os.path.join(self.tmp, "ws"), os.path.join(self.tmp, "home2")]
         code, o = self.out("fix", "--roots", *roots)
         r = json.loads(o)
         self.assertIn("preview", r["mode"])
-        self.assertEqual({x["action"] for x in r["safe_fixes"]}, {"empty_tool_cache", "scrub_keys"})
+        self.assertEqual({x["action"] for x in r["safe_fixes"]}, {"empty_tool_cache"})
+        self.assertEqual([(t["path"], t["files"], t["with_keys"]) for t in r["old_transcripts_for_you_to_delete_in_the_app"]], [(tr, 1, 1)])
         self.assertTrue(os.path.exists(os.path.join(tc, "1.txt")))      # preview changes nothing
         self.assertNotIn(key, o)
         code, o = self.out("fix", "--apply", "--roots", *roots)
+        self.assertTrue(os.path.exists(os.path.join(tc, "1.txt")))       # --apply alone is not the owner's yes
+        code, o = self.out("fix", "--apply", "--owner-said-yes", "--roots", *roots)
         self.assertFalse(os.path.exists(os.path.join(tc, "1.txt")))
-        chat = open(os.path.join(tr, "chat.jsonl")).read()
-        self.assertNotIn(key, chat)
-        self.assertIn("[removed by Watchtower]", chat)
-        self.assertIn('{"ok": 1}', chat)                                 # conversation kept
+        self.assertEqual(open(os.path.join(tr, "chat.jsonl")).read(), before)   # another Bot's transcript is never rewritten
 
     def test_plain_needs_you_and_revoke_links(self):
         F = wt.finding
@@ -550,7 +553,8 @@ class Features(unittest.TestCase):
             F("WT-S002", "x", "critical", ["ASI03"], os.path.join(code_dir, "settings.py") + ":1", "e", "f")]})
         targets = wt.scrub_targets_from_findings()
         self.assertEqual(targets, [os.path.join(sess, "s1.json")])                 # chat log yes, code no
-        code, o = self.out("fix", "--apply", "--roots", self.tmp)
+        self.out("fix", "--roots", self.tmp)                                       # the list the owner says yes to
+        code, o = self.out("fix", "--apply", "--owner-said-yes", "--roots", self.tmp)
         self.assertNotIn(key, open(os.path.join(sess, "s1.json")).read())
         self.assertIn(key, open(os.path.join(code_dir, "settings.py")).read())
 

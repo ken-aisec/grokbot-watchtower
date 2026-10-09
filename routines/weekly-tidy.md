@@ -1,5 +1,5 @@
-Every Sunday at 6:00 AM in my time zone, run `python3 /workspace/watchtower/app/watchtower/wt.py fix --apply` (the safe cleanup only: old keys in chat logs, tool caches, decoys, old reports). Do not pass --upgrade, --revet, --accept, --quarantine or --exception.
+Every Sunday at 6:00 AM in my time zone, run `python3 /workspace/watchtower/app/watchtower/wt.py fix` (a preview: it changes nothing). Do not pass --apply, --upgrade, --revet, --accept, --quarantine or --exception.
 
-Then run `wt.py fix` once more as a preview. Post one line: what was cleaned, and if anything is waiting on me, "Say 'fix it' and I'll do the rest with one yes."
-If nothing was cleaned and nothing is waiting, send nothing.
-Never revoke keys, change settings, upgrade software, re-approve a changed skill, quarantine a skill, clear a decoy alarm, or accept a risk on my behalf.
+If `safe_fixes` is empty and nothing is waiting on me, send nothing. Otherwise post ONE list: one line per `safe_fixes` item with its number, what it would empty or change, the path, the file count and whose it is (`owner`). Add one line naming any `safe_fixes_skipped_recent` (used in the last day, so left off), and one line if `old_transcripts_for_you_to_delete_in_the_app` has entries: how many folders and files, whose, and that I delete them in the app. End with: "Reply yes to do all of it, or name the numbers to skip."
+Apply nothing in this run. Only after I reply yes, run `wt.py fix --apply --owner-said-yes`, adding `--skip <numbers>` for anything I named, and reply with the `done` lines.
+Never revoke keys, change settings, upgrade software, re-approve a changed skill, quarantine a skill, clear a decoy alarm, rewrite another Bot's file, or accept a risk on my behalf.

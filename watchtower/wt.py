@@ -3565,9 +3565,55 @@ def revoke_targets(findings):
     return hits
 
 
+TIDY_RECENT_HOURS = 24
+TIDY_PLAN_DAYS = 7
+
+
+def bot_name(agent_id):
+    """A Bot's name from its own profile, for saying whose file it is. Falls back to the start of its ID."""
+    for base in ("~/agent-data/agents", "~/sand-data/agents"):
+        d = load_json(os.path.join(os.path.expanduser(base), agent_id, "profile.json"), None)
+        if isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"].strip():
+            return d["name"].strip()[:60]
+    return f"Bot {agent_id[:8]}"
+
+
+def path_owner(p):
+    """Whose file this is, in words the owner recognises."""
+    m = re.search(r"/(agent-transcripts|agents)/([0-9a-f]{8}-[0-9a-f-]{27,})(/|$)", p)
+    if m:
+        return bot_name(m.group(2))
+    ap = os.path.abspath(p)
+    if ap == os.path.abspath(home()) or ap.startswith(os.path.abspath(home()) + "/"):
+        return "Watchtower"
+    if os.path.basename(ap.rstrip("/")) == "agent-tools" or "/agent-tools/" in ap:
+        return "every Bot (shared tool results)"
+    if "/.grok/sessions/" in ap or "/sessions/" in ap:
+        return "Grok Bot sessions (shared)"
+    return "not known"
+
+
+def newest_change(d, files):
+    times = []
+    for x in [d] + [os.path.join(d, f) for f in files]:
+        try:
+            times.append(os.lstat(x).st_mtime)
+        except OSError:
+            pass
+    return max(times) if times else 0
+
+
+def is_transcript(p):
+    return any(x in p for x in SCRUB_DIRS) or "/agent-transcripts" in p
+
+
 def fix_plan(roots):
-    """Safe, reversible-in-spirit cleanup Watchtower can do itself. Nothing here revokes, uninstalls or changes settings."""
-    plan = []
+    """The weekly tidy's list: every folder or file it would empty or change, with its path, file count and owner. Nothing
+    here runs without the owner's yes to this list (`fix --apply --owner-said-yes`); nothing revokes, uninstalls or changes
+    settings. Returns (plan, extra): extra has the tool caches left off because they changed in the last day, and the old
+    local transcript files, which are reported for the owner to delete in the app and never rewritten."""
+    plan, recent, transcripts = [], [], {}
+    cutoff = time.time() - TIDY_RECENT_HOURS * 3600
     for r in roots:
         r = os.path.expanduser(r)
         for dirpath, dirnames, filenames in os.walk(r):
@@ -3577,43 +3623,86 @@ def fix_plan(roots):
                 dirnames[:] = []
                 continue
             if os.path.basename(ap) == "agent-tools" and filenames:
-                size = sum(os.path.getsize(os.path.join(ap, f)) for f in filenames if os.path.isfile(os.path.join(ap, f)))
-                plan.append({"action": "empty_tool_cache", "path": ap, "files": len(filenames), "bytes": size,
-                             "why": "Oversized tool results (Notion pages, API payloads) any Bot can read."})
+                files = [f for f in filenames if os.path.isfile(os.path.join(ap, f)) and not os.path.islink(os.path.join(ap, f))]
+                size = sum(os.path.getsize(os.path.join(ap, f)) for f in files)
+                item = {"action": "empty_tool_cache", "path": ap, "files": len(files), "bytes": size, "owner": path_owner(ap),
+                        "why": "Oversized tool results (Notion pages, API payloads) any Bot can read."}
+                if newest_change(ap, files) > cutoff:   # a Bot may be using it right now
+                    recent.append({k: item[k] for k in ("path", "files", "owner")})
+                elif files:
+                    plan.append(item)
                 dirnames[:] = []
                 continue
-            if any(x in ap + "/" for x in SCRUB_DIRS):
+            if is_transcript(ap + "/") and filenames:
+                # Grok Bot no longer writes transcripts here, so they are old copies. Rewriting another Bot's conversation
+                # files to take keys out is not Watchtower's to do: they are listed for the owner to delete in the app.
+                top = re.match(r"(.*/agent-transcripts/[^/]+)", ap + "/")
+                key = top.group(1) if top else ap
+                t = transcripts.setdefault(key, {"path": key, "files": 0, "with_keys": 0, "owner": path_owner(key + "/"), "newest": 0})
                 for fn in filenames:
-                    p = os.path.join(ap, fn)
-                    t = read_text(p, limit=20_000_000)
-                    if t and SCRUB.search(t):
-                        plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
-                                     "why": "Keys pasted into or captured by a chat. The conversation stays; the keys go."})
-    have = {s_["path"] for s_ in plan if s_["action"] == "scrub_keys"}
-    caches = [s_["path"] for s_ in plan if s_["action"] == "empty_tool_cache"]
+                    fp = os.path.join(ap, fn)
+                    t["files"] += 1
+                    t["newest"] = max(t["newest"], newest_change(fp, []))
+                    txt = read_text(fp, limit=20_000_000)
+                    if txt and SCRUB.search(txt):
+                        t["with_keys"] += 1
+    caches = [s_["path"] for s_ in plan if s_["action"] == "empty_tool_cache"] + [s_["path"] for s_ in recent]
     for p in scrub_targets_from_findings():
-        if p in have or any(p.startswith(c + "/") for c in caches):
+        if is_transcript(p) or any(p.startswith(c + "/") for c in caches):
             continue
         t = read_text(p, limit=20_000_000)
         if t and SCRUB.search(t):
-            plan.append({"action": "scrub_keys", "path": p, "count": len(SCRUB.findall(t)),
+            plan.append({"action": "scrub_keys", "path": p, "files": 1, "count": len(SCRUB.findall(t)), "owner": path_owner(p),
                          "why": "Keys captured in a chat, session or log. The text stays; the keys go."})
     reg = load_json(state_path("canaries.json"), {})
-    spent = 0
+    spent = []
     for v in reg.values():
         try:
-            spent += os.stat(os.path.expanduser(v["path"])).st_atime > v["atime"] + 1
+            if os.stat(os.path.expanduser(v["path"])).st_atime > v["atime"] + 1:
+                spent.append(os.path.expanduser(v["path"]))
         except (OSError, KeyError, TypeError):
             pass
     if spent:
-        plan.append({"action": "rearm_canaries", "count": spent, "why": "Reset the decoys that were read so the next read is noticed."})
+        plan.append({"action": "rearm_canaries", "path": ", ".join(sorted({os.path.dirname(p) for p in spent})), "files": len(spent), "count": len(spent),
+                     "owner": "Watchtower", "why": "Reset the decoys that were read so the next read is noticed."})
     rdir = os.path.join(home(), "reports")
     if os.path.isdir(rdir):
         old = sorted(f for f in os.listdir(rdir) if re.match(r"(threat-brief-)?\d{4}-W\d{2}\.(md|html)$", f) or re.match(r"threat-brief-\d{4}-W\d{2}\.html$", f))
         stale = old[:-24]
         if stale:
-            plan.append({"action": "prune_reports", "path": rdir, "files": len(stale), "list": stale, "why": "Keep the last 12 weeks."})
-    return plan
+            plan.append({"action": "prune_reports", "path": rdir, "files": len(stale), "list": stale, "owner": "Watchtower", "why": "Keep the last 12 weeks."})
+    for n, item in enumerate(plan, 1):
+        item["id"] = str(n)
+    tr = [dict(v, newest=dt.datetime.fromtimestamp(v["newest"]).strftime("%Y-%m-%d") if v["newest"] else None) for _, v in sorted(transcripts.items())]
+    return plan, {"skipped_recent": recent, "transcripts": tr}
+
+
+def tidy_row(x):
+    return {k: x[k] for k in ("id", "action", "path", "files", "owner", "count") if k in x}
+
+
+def tidy_apply(plan, args):
+    """One list, one yes. Applies only what the owner saw in the last preview (saved in tidy_plan.json) and what is still
+    on the list now (a cache that changed in the last day drops off), minus anything they named to skip."""
+    if not getattr(args, "owner_said_yes", False):
+        return ["Cleanup not done: it needs the owner's yes to the whole list. Run `wt.py fix` to show the list, then "
+                "`wt.py fix --apply --owner-said-yes` after they say yes (add `--skip <ids or paths>` for anything they named)."]
+    saved = load_json(state_path("tidy_plan.json"), {}) or {}
+    if not saved.get("items") or time.time() - float(saved.get("ts", 0)) > TIDY_PLAN_DAYS * 86400:
+        return ["Cleanup not done: there is no list from the last week for the owner to have said yes to. Run `wt.py fix` and show it first."]
+    skip = {x.strip() for x in (getattr(args, "skip", None) or "").split(",") if x.strip()}
+    shown = {(x.get("action"), x.get("path")) for x in saved["items"]}
+    named = lambda x: x["id"] in skip or x["path"] in skip or short_path(x["path"]) in skip or os.path.basename(x["path"].rstrip("/")) in skip
+    go = [x for x in plan if (x["action"], x["path"]) in shown and not named(x)]
+    done = apply_fix(go)
+    left = [x for x in plan if named(x)]
+    if left:
+        done.append("Left alone as you asked, still open: " + "; ".join(f"{short_path(x['path'])} ({x['files']} files, {x['owner']})" for x in left))
+    gone = [x for x in saved["items"] if (x.get("action"), x.get("path")) not in {(y["action"], y["path"]) for y in plan}]
+    if gone:
+        done.append("Not touched because they changed since the list was shown: " + "; ".join(short_path(x.get("path", "")) for x in gone[:5]))
+    ledger({"event": "tidy", "applied": [x["path"] for x in go], "skipped": [x["path"] for x in left]})
+    return done
 
 
 def apply_fix(plan):
@@ -4366,7 +4455,7 @@ def upgrade_npm(projects):
 
 def cmd_fix(args):
     roots = args.roots or [os.path.expanduser("~"), "/workspace"]
-    plan = fix_plan(roots)
+    plan, extra = fix_plan(roots)
     snap = load_json(state_path("last_findings.json"), {"findings": []})
     fs = snap.get("findings", [])
     ups, projs = python_upgrades(), npm_projects()
@@ -4381,14 +4470,18 @@ def cmd_fix(args):
                    "changed_skills": [{k: v for k, v in r.items() if k != "path"} for r in revet(sorted(ch_skills))],
                    "changed_other_files": [short_path(p) for p in ch_other],
                    "security_tool_exceptions_possible": [x["name"] for x in exception_candidates(fs)],
-                   "safe_fixes": [{k: v for k, v in x.items() if k not in ("list", "why")} for x in plan],
+                   "safe_fixes": [tidy_row(x) for x in plan],
+                   "safe_fixes_skipped_recent": extra["skipped_recent"],
+                   "old_transcripts_for_you_to_delete_in_the_app": extra["transcripts"][:20],
+                   "old_transcripts_total": {"folders": len(extra["transcripts"]), "files": sum(t["files"] for t in extra["transcripts"])},
                    "upgrades": {"python": [f"{u['name']} {u['have']} → {u['want']}+" for u in ups], "projects": [os.path.basename(d) or d for d in projs]},
                    "decisions": fix_decisions([f for f in fs if not in_q(f)]), "quarantine_possible": quarantine_candidates(fs),
                    "ask_first_rules_missing": bool(rules_needed), "only_you": only_you,
-                   "next": "Ask the user one question. On yes run: wt.py fix --apply --upgrade --revet --accept <rules they agreed to> "
+                   "next": "Ask the user one question. On yes run: wt.py fix --apply --owner-said-yes [--skip <cleanup ids or paths they named>] --upgrade --revet --accept <rules they agreed to> "
                            "[--quarantine <skills they agreed to take out of use>] [--exception <skill they named>] --reason \"reviewed by owner\""}, limit=6000))
+        save_json(state_path("tidy_plan.json"), {"at": now(), "ts": time.time(), "items": [tidy_row(x) for x in plan]})
         return 0
-    done = apply_fix(plan) if args.apply else []
+    done = tidy_apply(plan, args) if args.apply else []
     if args.upgrade:
         py_done = upgrade_python(ups) if ups else []
         npm_done = upgrade_npm(projs) if projs else []
@@ -4706,6 +4799,8 @@ def main_inner(argv=None):
     fx.add_argument("--only", help="with --revet: re-approve only these skills (names, comma-separated); every other changed skill stays open")
     fx.add_argument("--exception", help="skill name(s) the owner confirmed as security tools (30 days)")
     fx.add_argument("--quarantine", help="the owner's own skill(s) to move out of use into Watchtower's quarantine folder (comma-separated)")
+    fx.add_argument("--owner-said-yes", action="store_true", help="with --apply: the owner said yes to the cleanup list in the last preview")
+    fx.add_argument("--skip", help="with --apply: cleanup items (ids or paths, comma-separated) the owner said to leave alone")
     qq = sub.add_parser("quarantine"); qq.add_argument("names", nargs="?"); qq.add_argument("--restore"); qq.add_argument("--reason")
     un = sub.add_parser("uninstall"); un.add_argument("--apply", action="store_true"); un.add_argument("--remove-folder", action="store_true")
     df = sub.add_parser("diff"); df.add_argument("skill"); df.add_argument("--lines", type=int, default=120)

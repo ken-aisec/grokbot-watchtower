@@ -943,6 +943,48 @@ class MainBoxLessons(Box):
         self.assertFalse(any("put back" in n for n in r["notes"]), r["notes"])
         self.assertIn("WT-K002", {f["rule"] for f in self.snap()["findings"]})
 
+    def test_the_weekly_tidy_is_one_list_and_one_yes(self):
+        """Main box, Oct 8 (DQ-002): `wt.py fix --apply --revet --only ...`, the documented way to re-approve skills, also emptied
+        /workspace/agent-tools (12 files) and ~/.cursor/projects/workspace/agent-tools (3 files), which nobody had asked for."""
+        self.skills(2); self.scanners(); self.audit()
+        old = time.time() - 3 * 86400
+        ws_cache = os.path.join(self.ws, "agent-tools"); cur_cache = os.path.join(self.home, ".cursor", "projects", "workspace", "agent-tools")
+        busy = os.path.join(self.home, ".cursor", "projects", "workspace-x", "agent-tools")
+        for d, n in ((ws_cache, 12), (cur_cache, 3), (busy, 2)):
+            os.makedirs(d)
+            for i in range(n):
+                f = os.path.join(d, f"{i:08x}-tool-result.txt"); open(f, "w").write("notion page payload")
+                if d != busy:
+                    os.utime(f, (old, old))
+            if d != busy:
+                os.utime(d, (old, old))
+        bot = "4f1c2a9e-1111-4222-8333-944455556666"
+        tr = os.path.join(self.home, "sand-data", "agent-transcripts", bot); os.makedirs(tr)
+        key = "ghp_" + "a1B2" * 9
+        open(os.path.join(tr, "t1.jsonl"), "w").write('{"user": "use ' + key + ' for the repo"}\n')
+        os.makedirs(os.path.join(self.home, "sand-data", "agents", bot))
+        json.dump({"name": "Harbor"}, open(os.path.join(self.home, "sand-data", "agents", bot, "profile.json"), "w"))
+        count = lambda d: len(os.listdir(d))
+        code, o, _ = self.run_cmd("fix", "--apply", "--revet", "--only", "skill000", "--roots", *self.roots)   # the command from DQ-002
+        self.assertEqual((count(ws_cache), count(cur_cache)), (12, 3))
+        self.assertIn("Cleanup not done", json.loads(o)["done"][0])
+        code, o, _ = self.run_cmd("fix", "--roots", *self.roots)                  # the list: path, file count, owner
+        prev = json.loads(o)
+        rows = {x["path"]: x for x in prev["safe_fixes"]}
+        self.assertEqual({p: (x["files"], x["owner"]) for p, x in rows.items() if x["action"] == "empty_tool_cache"},
+                         {ws_cache: (12, "every Bot (shared tool results)"), cur_cache: (3, "every Bot (shared tool results)")})
+        self.assertEqual([x["path"] for x in prev["safe_fixes_skipped_recent"]], [busy])   # used in the last day: not on the list
+        self.assertEqual([(t["path"], t["owner"], t["with_keys"]) for t in prev["old_transcripts_for_you_to_delete_in_the_app"]], [(tr, "Harbor", 1)])
+        code, o, _ = self.run_cmd("fix", "--apply", "--roots", *self.roots)       # the old unattended weekly tidy: applies nothing
+        self.assertEqual((count(ws_cache), count(cur_cache), count(busy)), (12, 3, 2))
+        code, o, _ = self.run_cmd("fix", "--apply", "--owner-said-yes", "--skip", rows[cur_cache]["id"], "--roots", *self.roots)
+        done = json.loads(o)["done"]
+        self.assertEqual((count(ws_cache), count(cur_cache), count(busy)), (0, 3, 2))   # one yes for the list, minus what was named
+        self.assertTrue(any("Left alone as you asked" in d and "3 files" in d for d in done), done)
+        self.assertIn(key, open(os.path.join(tr, "t1.jsonl")).read())                     # a transcript is reported, never rewritten
+        code, o, _ = self.run_cmd("fix", "--roots", *self.roots)
+        self.assertEqual([x["path"] for x in json.loads(o)["safe_fixes"] if x["action"] == "empty_tool_cache"], [cur_cache])   # still open
+
     def refusals(self):
         return [json.loads(l) for l in open(wt.state_path("ledger.jsonl")) if '"refused-path"' in l]
 
