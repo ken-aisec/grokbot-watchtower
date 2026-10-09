@@ -4,7 +4,7 @@ Each test builds a small, deliberately awkward computer in a temp folder and run
 The rule being tested is always the same: Watchtower finishes, says plainly what it could not do, never shows a
 stack trace, and never lets a failure change the score.
 """
-import io, json, os, shutil, stat, subprocess, sys, tempfile, time, unittest, warnings
+import datetime as dt, io, json, math, os, shutil, stat, subprocess, sys, tempfile, time, unittest, warnings
 from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -800,15 +800,20 @@ class MainBoxLessons(Box):
         """Main box (DQ-004): AgentMail was installed the evening after the owner's baseline. An earlier version made the plugin
         list on its first run and filed every plugin as known; the platform roll then accepted its 33 files. v0.6.6 never looked again."""
         helper = FreshAccountLessons.plugin
-        helper(self, "builtin-1.0", "builtin", {"explain": "Explain invoices."}); self.skills(1); self.scanners()
+        builtin_root = helper(self, "builtin-1.0", "builtin", {"explain": "Explain invoices."}); self.skills(1); self.scanners()
         self.audit()
-        wt.ledger({"event": "baseline", "files": 3})
-        time.sleep(1.2)
+        iso = lambda ts: dt.datetime.fromtimestamp(ts, dt.timezone.utc).replace(microsecond=0).isoformat()
+        base_ts = math.ceil(os.stat(builtin_root).st_ctime)                      # the owner's baseline: after the built-in plugin...
+        with open(wt.state_path("ledger.jsonl"), "a") as f:
+            f.write(json.dumps({"event": "baseline", "files": 3, "at": iso(base_ts)}) + "\n")
+        while time.time() <= base_ts + 1.5:                                       # ...and before AgentMail (waits on the clock, never on a guess)
+            time.sleep(0.1)
         root = helper(self, "agentmail/6314e7d42dd1ce47b77469e35869980d6404caa1", "agentmail", {"agent-email-patterns": "Email patterns."})
         for meta in (".claude-plugin", ".codex-plugin", ".cursor-plugin", ".plugin"):                  # the real layout: one manifest per app
             os.makedirs(os.path.join(root, meta)); json.dump({"name": "agentmail", "author": {"name": "AgentMail"}}, open(os.path.join(root, meta, "plugin.json"), "w"))
         st = wt.load_json(wt.state_path("plugins.json"), {})
-        first = st["builtin"]["since"]
+        first = iso(math.ceil(time.time()))                       # the earlier version's first run came after AgentMail (05:41 ET Oct 8)
+        st["builtin"]["since"] = first                            # and after the baseline (Oct 6), whatever this machine's speed
         st["agentmail"] = {"since": first, "status": "known", "roots": [root]}                         # what the earlier version wrote
         wt.save_json(wt.state_path("plugins.json"), st)
         base = wt.load_json(wt.state_path("baseline.json"), {})
