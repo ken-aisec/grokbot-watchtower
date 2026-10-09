@@ -21,7 +21,7 @@ Show the user those 30 lines (they are everything that runs), then run `bash ins
 Your skills are the SKILL.md files under `/workspace/watchtower/app/skills/`. Don't copy them anywhere; read them from there, so they always match the installed release. They are not slash commands: the owner asks in plain words.
 
 ## 2. Scanners
-Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`. Each tool installs on its own from a checksum lock; if one says it did not install, carry on. Watchtower works without it and the audit says which is missing.
+Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`. Each tool installs on its own from a checksum lock; if one says it did not install, carry on. Watchtower works without it and the audit says which is missing. If it stops with `CHECKSUM LOCK FAILED`, nothing was installed without checksums: tell the owner the reason it printed and carry on; never install the scanners another way.
 
 ## 3. Baseline, decoys, first audit
 1. `python3 /workspace/watchtower/app/watchtower/wt.py baseline`

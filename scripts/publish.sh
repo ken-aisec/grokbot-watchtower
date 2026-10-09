@@ -7,6 +7,12 @@ OWNER="$(gh api user -q .login)"
 REPO="$OWNER/grokbot-watchtower"
 TAG="v0.6.6"
 echo "Publishing $REPO ($TAG)"
+# A published tag is never moved: installed copies and template memories pin its commit.
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || \
+   { git remote get-url origin >/dev/null 2>&1 && git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; }; then
+  echo "STOPPED: tag $TAG already exists. Choose a new version number, set it here and in the release files, and run this again. Nothing pushed."
+  exit 1
+fi
 if grep -rlq GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh .; then
   grep -rl GITHUB_OWNER --exclude-dir=.git --exclude=publish.sh . | xargs perl -pi -e "s/GITHUB_OWNER/$OWNER/g"
   git add -A && git commit -qm "Set repository owner to $OWNER"
@@ -20,20 +26,19 @@ if gh repo view "$REPO" >/dev/null 2>&1; then
   echo "Repo exists; pushing to it."
   git remote get-url origin >/dev/null 2>&1 || git remote add origin "https://github.com/$REPO.git"
   if git fetch -q origin main 2>/dev/null && ! git merge-base --is-ancestor origin/main HEAD; then
-    echo "GitHub has commits that aren't in this folder (for example a README). Overwrite them? Type yes:"
-    read -r ok; [ "$ok" = "yes" ] || { echo "Stopped. Nothing pushed."; exit 1; }
-    FORCE="--force"
+    echo "STOPPED: GitHub has commits on main that aren't in this folder. Bring them in first (git pull), then run this again. Nothing pushed; main is never overwritten."
+    exit 1
   fi
-  git push -u ${FORCE:-} origin main
+  git push -u origin main
 else
   gh repo create "$REPO" --public --source . --push \
     --description "Read-only security watch for Grok Bot: vet templates before install, audit skills, routines and approvals, weekly report."
 fi
 if [ "$(gh repo view "$REPO" --json visibility -q .visibility)" != "PUBLIC" ]; then
-  gh repo edit "$REPO" --visibility public --accept-visibility-change-consequences
-  echo "Repo set to public so the Grok Bot installer can reach it."
+  echo "STOPPED: $REPO is not public, so the Grok Bot installer can't reach it. This script never changes a repo's visibility; that is the owner's decision. No tag pushed."
+  exit 1
 fi
-git tag -f -a "$TAG" -m "Watchtower $TAG" && git push -f origin "$TAG"
+git tag -a "$TAG" -m "Watchtower $TAG" && git push origin "refs/tags/$TAG"
 echo "Done: https://github.com/$REPO (tag $TAG)"
 # The template's memories carry this release's tag and commit ID, so an installed copy can refuse anything else.
 COMMIT="$(git rev-parse HEAD)"

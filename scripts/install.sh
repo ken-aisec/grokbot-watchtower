@@ -35,12 +35,21 @@ PIP="$WT_HOME/scanners/bin/pip"; LOCK="$WT_HOME/app/scripts/scanners.lock"; rm -
 SS="skillspector @ git+https://github.com/NVIDIA/SkillSpector@a50b9c93835c94f7d36329f11c6599abbb9c74ee"
 # Pinned and checksummed: a security tool that installs unpinned scanners is its own supply-chain risk.
 # The lock lists every package the scanners need with its checksum; pip refuses anything that doesn't match.
-if [[ -f "$LOCK" ]] && "$PIP" install --quiet --require-hashes -r "$LOCK" 2>/tmp/wt-lock.err \
-   && "$PIP" install --quiet --no-deps "$SS"; then
+# If the lock can't be used, nothing is installed without it: up to v0.6.6 this fell back to unchecked downloads.
+LOCK_ERR="${TMPDIR:-/tmp}/wt-lock.err"
+if [[ -f "$LOCK" ]] && "$PIP" install --quiet --require-hashes -r "$LOCK" 2>"$LOCK_ERR" \
+   && "$PIP" install --quiet --no-deps "$SS" 2>>"$LOCK_ERR"; then
   touch "$WT_HOME/scanners/LOCKED"; echo "Scanners installed from the checksum lock."
 else
-  echo "The checksum lock doesn't fit this computer's Python ($(python3 --version 2>&1)); installing the pinned versions without it."
-  "$PIP" install --quiet "$SS" "husk-scanner==1.3.5" "pip-audit==2.10.1" || echo "The Python scanners did not install; Watchtower works without them."
+  if [[ -f "$LOCK" ]]; then
+    echo "CHECKSUM LOCK FAILED - not installing the scanners. pip refused the checksummed packages on this computer's Python ($(python3 --version 2>&1)):"
+    tail -n 5 "$LOCK_ERR" 2>/dev/null | sed 's/^/  /' || true
+  else
+    echo "CHECKSUM LOCK FAILED - not installing the scanners: $LOCK is missing."
+  fi
+  echo "Nothing was installed without checksums. Watchtower works without its scanners and the audit says which are missing."
+  rm -f "$LOCK_ERR"; rm -rf "$WT_HOME/app.new"
+  exit 1
 fi
 mkdir -p "$WT_HOME/bin"
 arch="$(uname -m)"; case "$arch" in x86_64) ga=x64;; aarch64|arm64) ga=arm64;; *) echo "skip gitleaks: $arch"; ga="";; esac
@@ -72,5 +81,5 @@ if [[ -n "$ga" ]]; then
 fi
 "$WT_HOME/scanners/bin/skillspector" --version || echo "SkillSpector did not install; Watchtower works without it and says so in the audit."
 [[ -x "$WT_HOME/bin/gitleaks" ]] && "$WT_HOME/bin/gitleaks" version || true
-rm -f /tmp/gitleaks_*_linux_*.tar.gz /tmp/gitleaks_checksums.txt /tmp/trufflehog_*_linux_*.tar.gz /tmp/trufflehog_checksums.txt /tmp/osv_sums.txt /tmp/wt-lock.err
+rm -f /tmp/gitleaks_*_linux_*.tar.gz /tmp/gitleaks_checksums.txt /tmp/trufflehog_*_linux_*.tar.gz /tmp/trufflehog_checksums.txt /tmp/osv_sums.txt "$LOCK_ERR"
 echo "Scanners installed in $WT_HOME (Watchtower finds them there automatically)."
