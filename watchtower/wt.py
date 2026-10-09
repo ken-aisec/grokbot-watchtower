@@ -1571,6 +1571,7 @@ def self_findings(notes):
     """Watchtower holds its own tools to the same standard: known holes in the scanners' packages, and whether they were
     installed from the checksum lock."""
     py, exe, out = scanners_python(), tool("pip-audit"), []
+    update_notes(notes)
     if not py:
         return out
     if not os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(py)), "LOCKED")):
@@ -1600,10 +1601,21 @@ def self_findings(notes):
             out.append(finding("WT-W001", f"Watchtower's own tool needs an update: {d.get('name')} {d.get('version')}", "low", ["ASI04", "AST02"],
                                "watchtower scanners", f"{len(ids)} known: {', '.join(ids[:3])}",
                                "Update Watchtower: each release carries newer pinned scanners. This package lives only in Watchtower's own folder.", source="pip-audit"))
-    upd = [u for u in (load_json(state_path("last_brief.json"), {}) or {}).get("updates", []) if "watchtower" in u.get("name", "").lower()]
-    if upd:
-        notes.append(f"A newer Watchtower is out ({upd[0].get('have')} → {upd[0].get('latest')}). Tell Watchtower \"update yourself\".")
     return out
+
+
+def update_notes(notes):
+    """Tell the owner a newer Watchtower is out. Only tells: nothing here installs or updates anything."""
+    b = load_json(state_path("last_brief.json"), {}) or {}
+    upd = [u for u in b.get("updates", []) if "watchtower" in u.get("name", "").lower()]
+    if upd:
+        u = upd[0]
+        notes.append(f"A newer Watchtower is out ({u.get('have')} → {u.get('latest')}" + (f", commit {u['commit'][:12]}" if u.get("commit") else "")
+                     + "). Tell Watchtower \"update yourself\" when you want it.")
+    moved = b.get("watchtower_tag_moved")
+    if moved:
+        notes.append(f"The {moved.get('tag')} tag on GitHub now points at commit {str(moved.get('now'))[:12]}, not {str(moved.get('installed'))[:12]}, "
+                     "the one installed here. A published tag should never move: don't update from it until you know why.")
 
 
 def find_key(obj, keys):
@@ -3094,6 +3106,39 @@ def threat_level(b, snap, stories):
     return 4, "Severe", pts
 
 
+def app_commit():
+    """The commit this copy of Watchtower was installed from (install.sh keeps the clone's .git), or None."""
+    g = os.path.join(SELF_ROOT, ".git")
+    try:
+        head = open(os.path.join(g, "HEAD")).read().strip()
+        if head.startswith("ref: "):
+            head = open(os.path.join(g, head[5:])).read().strip()
+        return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+    except OSError:
+        return None
+
+
+def watchtower_update(r, get):
+    """Watchtower is published as tags, not GitHub releases, so releases/latest has nothing to say. Read the tags, take the
+    highest version, and check that the tag for the installed version still points at the commit installed here.
+    Returns (update or None, tag-moved warning or None). Only reads: it never installs or updates."""
+    tags = json.loads(get(f"https://api.github.com/repos/{r['repo']}/tags?per_page=100", accept="application/vnd.github+json"))
+    vers = [(vtuple(t["name"]), t) for t in tags if isinstance(t, dict) and re.fullmatch(r"v?\d+\.\d+(\.\d+)?", str(t.get("name", "")))]
+    if not vers:
+        return None, None
+    best = max(vers, key=lambda x: x[0])[1]
+    have = VERSION
+    mine = next((t for v, t in vers if v == vtuple(have)), None)
+    installed, moved = app_commit(), None
+    if mine and installed and (mine.get("commit") or {}).get("sha") and mine["commit"]["sha"] != installed:
+        moved = {"tag": mine["name"], "now": mine["commit"]["sha"], "installed": installed}
+    if vtuple(best["name"]) > vtuple(have):
+        sha = (best.get("commit") or {}).get("sha", "")
+        return ({"name": r["name"], "have": have, "latest": best["name"].lstrip("v"), "tag": best["name"], "commit": sha,
+                 "url": f"https://github.com/{r['repo']}/tree/{best['name']}"}, moved)
+    return None, moved
+
+
 def gather_brief(cfg, offline=None):
     """Collect everything the brief needs. offline: dict of url->text for tests."""
     get = (lambda u, **k: offline[u]) if offline is not None else http_get
@@ -3150,9 +3195,15 @@ def gather_brief(cfg, offline=None):
         kev_status = f"unavailable ({type(e).__name__})"
     sources.append({"name": "CISA Known Exploited Vulnerabilities", "url": cfg["kev_url"], "status": kev_status, "items": len(kev)})
 
-    updates = []
+    updates, tag_moved = [], None
     for r in cfg.get("releases", []):
-        if "ken-aisec" in r["repo"]:
+        if r.get("installed") == "watchtower":    # v0.6.6 skipped its own repo here, so the newer-version notice could never fire
+            try:
+                u, tag_moved = watchtower_update(r, get)
+                if u:
+                    updates.append(u)
+            except Exception:
+                pass
             continue
         try:
             rel_ = json.loads(get(f"https://api.github.com/repos/{r['repo']}/releases/latest", accept="application/vnd.github+json"))
@@ -3176,7 +3227,7 @@ def gather_brief(cfg, offline=None):
         except Exception:
             continue
     save_json(state_path("watch_pages.json"), page_state)
-    return {"research": research, "kev": kev, "updates": updates, "pages": pages, "sources": sources, "window_days": days}
+    return {"research": research, "kev": kev, "updates": updates, "pages": pages, "sources": sources, "window_days": days, "watchtower_tag_moved": tag_moved}
 
 
 EXPOSURE_AREAS = [

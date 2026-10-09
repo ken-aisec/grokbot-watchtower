@@ -1095,6 +1095,45 @@ class Features(unittest.TestCase):
         self.assertTrue(os.path.exists(r["evidence_pack"]))
         self.assertIn("Containment checklist", open(r["evidence_pack"]).read())
 
+    def test_the_newer_version_notice_reads_tags_and_never_updates(self):
+        """v0.6.6 skipped its own repo (`if "ken-aisec" in r["repo"]: continue`), so "A newer Watchtower is out" never showed;
+        and the repo publishes tags, not GitHub releases, so releases/latest would have had nothing to say."""
+        import subprocess as sp
+        cfg = json.load(open(wt.FEEDS_PATH))
+        cfg.update(feeds=[], watch_pages=[], releases=[r for r in cfg["releases"] if r["installed"] == "watchtower"])
+        repo = cfg["releases"][0]["repo"]
+        self.assertIn("ken-aisec", repo)
+        installed = "1" * 40
+        tags = [{"name": "v0.6.6", "commit": {"sha": installed}}, {"name": "v0.6.10", "commit": {"sha": "a" * 40}},
+                {"name": "v0.6.9", "commit": {"sha": "9" * 40}}, {"name": "nightly", "commit": {"sha": "b" * 40}}]
+        offline = {f"https://api.github.com/repos/{repo}/tags?per_page=100": json.dumps(tags)}   # no releases/latest on purpose
+        calls, saved = [], (wt.run, sp.run, sp.Popen, os.system, wt.app_commit, wt.VERSION)
+        def no(*a, **k):
+            calls.append(a)
+            raise AssertionError(f"the update check ran a command: {a}")
+        wt.run, sp.run, sp.Popen, os.system = no, no, no, no
+        wt.app_commit, wt.VERSION = (lambda: installed), "0.6.6"
+        try:
+            app = os.path.join(wt.SELF_ROOT, "watchtower", "wt.py"); before = os.stat(app).st_mtime
+            b = wt.gather_brief(cfg, offline=offline)
+            self.assertEqual([(u["latest"], u["commit"]) for u in b["updates"]], [("0.6.10", "a" * 40)])   # the highest version, not the last listed
+            self.assertIsNone(b["watchtower_tag_moved"])
+            wt.save_json(wt.state_path("last_brief.json"), b)
+            notes = []
+            wt.update_notes(notes)
+            self.assertEqual(len(notes), 1)
+            self.assertIn("A newer Watchtower is out (0.6.6 → 0.6.10, commit aaaaaaaaaaaa)", notes[0])
+            tags[0]["commit"]["sha"] = "c" * 40                                  # the tag for the installed version was moved
+            offline[next(iter(offline))] = json.dumps(tags)
+            wt.save_json(wt.state_path("last_brief.json"), wt.gather_brief(cfg, offline=offline))
+            notes = []
+            wt.update_notes(notes)
+            self.assertTrue(any("tag on GitHub now points at commit cccccccccccc" in n for n in notes), notes)
+            self.assertEqual(calls, [])                                          # never an install or an update
+            self.assertEqual(os.stat(app).st_mtime, before)
+        finally:
+            wt.run, sp.run, sp.Popen, os.system, wt.app_commit, wt.VERSION = saved
+
     def test_brief_offline_renders_and_is_safe(self):
         cfg = json.load(open(wt.FEEDS_PATH))
         today = dt.datetime.now(dt.timezone.utc)
