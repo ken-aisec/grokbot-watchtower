@@ -4077,7 +4077,41 @@ def trufflehog_status(paths, notes):
     return status
 
 
+SITE_PLAYBOOK_ROOTS = ("sand-data/managed-skills/skills", "agent-data/managed-skills/skills")   # under the home folder
+
+
+def builtin_site_playbook(path):
+    """A site playbook the platform ships to every account (site-playbooks-resy, site-playbooks-target...): decided by where
+    the file really is, under the platform's managed-skills folder in the home folder, never by a folder name anywhere in it."""
+    rp = os.path.realpath(path)
+    for sub in SITE_PLAYBOOK_ROOTS:
+        root = os.path.realpath(os.path.join(os.path.expanduser("~"), sub)) + "/"
+        if rp.startswith(root) and rp[len(root):].split("/")[0].startswith("site-playbooks-"):
+            return True
+    return False
+
+
+def cap_playbook_keys(findings, status):
+    """A key-shaped string in a built-in site playbook is a site's public client key in the platform's own instructions;
+    every new account has them. gitleaks alone keeps it at low. If a second engine agrees (TruffleHog found a key in that
+    file, or Watchtower's own key rule flagged it), it keeps the severity it was given."""
+    own = {f["where"].split(":")[0] for f in findings if f["rule"] == "WT-S001"}
+    out = []
+    for f in findings:
+        if f["rule"] == "WT-S002" and f.get("source") == "gitleaks" and f["severity"] != "low":
+            p = f["where"].split(":")[0]
+            if builtin_site_playbook(p) and not (status or {}).get(os.path.abspath(p)) and p not in own:
+                f = dict(f, severity="low", fix="A site playbook the platform ships to every account. Only one scanner matched a pattern here; "
+                                                "it's usually the site's public client key. Nothing for you to do unless another scanner agrees.")
+        out.append(f)
+    return out
+
+
 def apply_key_status(findings, status, ran=None):
+    return cap_playbook_keys(key_status_severity(findings, status, ran), status)
+
+
+def key_status_severity(findings, status, ran=None):
     """TruffleHog asks each key's own provider whether it works, so when it ran it is the authority:
     working key = critical. Provider said no = low (copies only). Provider didn't answer = medium.
     Gitleaks matched a pattern but TruffleHog found no key = medium, low in tests and docs.

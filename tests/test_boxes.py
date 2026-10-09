@@ -699,6 +699,51 @@ class MainBoxLessons(Box):
         self.assertEqual(f2[0]["key"], f1[0]["key"])                                              # the same finding, not fixed and new
         self.assertFalse([f for f in r["new"] if f["rule"] == "WT-S002"], r["new"])
 
+    # The lines from the platform's own site playbooks on a fresh account, word for word except the key values: those are the
+    # sites' real public client keys, replaced here by made-up values of the same shape (32 letters and digits; 40 hex).
+    RESY = ("Resy's web app reads a public JSON API at `https://api.resy.com`. Call it yourself with `curl` in the box shell before any browser dispatch, with these headers on every call:\n"
+            "\n```\n-H 'Authorization: ResyAPI api_key=\"Qm7RkT2vWx9LpB4nZc8HdJ3fYs6GaE1u\"' -H 'Origin: https://resy.com' -H 'Referer: https://resy.com/' -A '<desktop Chrome User-Agent>'\n```\n")
+    TARGET = ("Target's search page is a shell over a public JSON aggregation at `redsky.target.com`. The key is a static public token from Target's JS bundles. The call is unreliable from the box, where it usually returns HTTP 435 (PerimeterX). Dispatch the snippet in the same round as any shell attempt; the snippet tries the call once and falls back to the search page in the browser.\n"
+              "\n```\nGET https://redsky.target.com/redsky_aggregations/v1/web/plp_search_v2\n    ?key=3c9e1f7a2b8d4e6f0a5c1b9d7e3f2a8c6b4d0e1f\n    &channel=WEB\n    &keyword=<URL-encoded query>\n    &page=%2Fs%2F<URL-encoded query>\n```\n")
+
+    def playbook_keys(self, where, trufflehog=None):
+        """Write the two playbooks under `where` (relative to home), with gitleaks reporting the key line in each, as it did."""
+        report, hits = os.path.join(self.tmp, "leaks.json"), []
+        for name, text, key_line in (("site-playbooks-resy", self.RESY, 'ResyAPI api_key="REDACTED"'), ("site-playbooks-target", self.TARGET, "key=REDACTED")):
+            d = os.path.join(self.home, where, name); os.makedirs(d, exist_ok=True)
+            body = f"---\nname: {name}\ndescription: How to use {name[15:]}.\n---\n" + text
+            open(os.path.join(d, "SKILL.md"), "w").write(body)
+            line = next(i for i, l in enumerate(body.splitlines(), 1) if ("api_key=" in l or "?key=" in l))
+            hits.append({"File": os.path.join(d, "SKILL.md"), "StartLine": line, "RuleID": "generic-api-key", "Match": key_line})
+        json.dump(hits, open(report, "w"))
+        stub = SCANNERS["gitleaks"].replace('open(a[a.index("--report-path") + 1], "w").write("[]")',
+                                            f'open(a[a.index("--report-path") + 1], "w").write(open({report!r}).read() if a[a.index("--source") + 1] == {self.home!r} else "[]")')
+        self.scanners(gitleaks=stub, **({"trufflehog": trufflehog} if trufflehog else {}))
+        self.audit()
+        return {f["where"].split("/")[-2]: f["severity"] for f in self.snap()["findings"] if f["rule"] == "WT-S002"}
+
+    def test_a_key_in_a_built_in_site_playbook_is_low_when_only_gitleaks_sees_it(self):
+        """Fresh v0.6.7 account (DQ-012 batch): every first run raised these two platform lines as medium "looks like a key"."""
+        self.skills(1)
+        self.assertEqual(self.playbook_keys("sand-data/managed-skills/skills"), {"site-playbooks-resy": "low", "site-playbooks-target": "low"})
+
+    def test_a_built_in_site_playbook_key_a_second_engine_agrees_on_keeps_its_severity(self):
+        self.skills(1)
+        resy = os.path.join(self.home, "sand-data", "managed-skills", "skills", "site-playbooks-resy", "SKILL.md")
+        th = ("#!/bin/sh\necho '" + json.dumps({"SourceMetadata": {"Data": {"Filesystem": {"file": resy, "line": 8}}}, "DetectorName": "Resy",
+                                                 "Verified": False, "VerificationError": "provider timed out"}) + "'\n")
+        self.assertEqual(self.playbook_keys("sand-data/managed-skills/skills", trufflehog=th),
+                         {"site-playbooks-resy": "medium", "site-playbooks-target": "low"})   # TruffleHog agrees on Resy only
+
+    def test_the_same_key_line_outside_the_platforms_playbooks_is_unchanged(self):
+        self.skills(1)
+        self.assertEqual(self.playbook_keys("sand-data/workflows"), {"site-playbooks-resy": "medium", "site-playbooks-target": "medium"})   # the owner's own skill
+        self.tearDown(); self.setUp(); self.skills(1)
+        self.assertEqual(self.playbook_keys("projects/copy/sand-data/managed-skills/skills"),   # the folder names, somewhere else
+                         {"site-playbooks-resy": "medium", "site-playbooks-target": "medium"})
+        self.tearDown(); self.setUp(); self.skills(1)
+        self.assertEqual(self.playbook_keys("sand-data/managed-skills/skills"), {"site-playbooks-resy": "low", "site-playbooks-target": "low"})
+
     def test_a_skill_with_a_slide_deck_is_scanned_on_its_own(self):
         ds = self.skills(30)
         open(os.path.join(ds[7], "template.pptx"), "wb").write(b"JAMMER" + os.urandom(40_000))
