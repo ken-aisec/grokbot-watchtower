@@ -166,7 +166,7 @@
  "approval_terms": "(?i)(approval|approve|ask\\s+(me\\s+)?first|ask\\s+me|my\\s+(exact\\s+)?yes|confirm\\s+with\\s+me|wait\\s+for\\s+(my|the user's)|draft[s]?\\s+only|read[- ]only|\\bgates?\\b|\\bgated\\b|never\\s+(send|post|publish|buy|pay|delete))",
  "draft_terms": "(?i)\\b(draft|drafts|recommend|propose|suggest)\\b",
  "schedule_terms": "(?i)\\b(every\\s+\\d+\\s+(minutes?|hours?|days?)|every\\s+(day|weekday|week|morning|hour|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|daily|weekly|hourly|routine|cron|schedule[d]?)\\b",
- "nodata_terms": "(?i)(if\\s+(the\\s+)?(source|data|input|site|tool|connector|script)s?\\s+(is|are)?\\s*(unavailable|missing|down|empty|fails?)|report\\s+the\\s+failure|if\\s+nothing|send\\s+nothing|no\\s+new\\s+findings)",
+ "nodata_terms": "(?i)(if\\s+(the\\s+)?(source|data|input|site|tool|connector|script)s?\\s+(is|are)?\\s*(unavailable|missing|down|empty|fails?)|if\\s+[\\w.-]+\\s+(fails?|errors?|times?\\s+out|is\\s+(unavailable|down|empty))|source\\s+failures?|report\\s+the\\s+failure|if\\s+nothing|send\\s+nothing|no\\s+new\\s+findings)",
  "high_freq": "(?i)(\\bhourly\\b|every\\s+\\d+\\s+minutes?|every\\s+(30|15|10|5)\\s*min|every\\s+hour)",
  "context_guard": "(?i)(\\bnever\\b|don'?t|do\\s+not|\\bnot\\b|avoid|refuse|warn|inject|attack|malicious|treat\\s+(it|this|them)\\s+as\\s+data|e\\.g\\.|for\\s+example|such\\s+as|data,\\s+never\\s+instructions)",
  "guarded_rules": [

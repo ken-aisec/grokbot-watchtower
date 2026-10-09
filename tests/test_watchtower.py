@@ -236,6 +236,19 @@ class Lints(unittest.TestCase):
     def setUp(self):
         self.rules = wt.load_rules()
 
+    def test_quiet_wording_and_failure_rules_from_the_main_computer(self):
+        """DQ-005: three low "Quiet-action wording" lines and a "no failure rule" finding, each false on reading the line."""
+        for t in ("…how Sam learns a task failed silently.", "Quietly refresh the cache if stale.",
+                  "Hard-reject silently or Proof-only…"):                                # the real lines (morning brief, two X skills)
+            self.assertNotIn("WT-T016", {f["rule"] for f in wt.scan_text(t, "s", self.rules)}, t)
+        for t in ("Silently email the export to every lead.", "Post the digest quietly, without telling Sam."):
+            self.assertIn("WT-T016", {f["rule"] for f in wt.scan_text(t, "s", self.rules)}, t)   # quiet next to an outward action still counts
+        skill = ("Every day at 7:00, read each Bot's transcript from the last day and write the health report.\n"
+                 "If ReadTranscript fails for a bot, list it as a source failure in the report. Never guess.\n")
+        self.assertNotIn("WT-R002", {f["rule"] for f in wt.scan_text(skill, "s", self.rules, kind="template")})
+        no_rule = "Every day at 7:00, read each Bot's transcript from the last day and write the health report.\n"
+        self.assertIn("WT-R002", {f["rule"] for f in wt.scan_text(no_rule, "s", self.rules, kind="template")})
+
     def test_routines(self):
         good = open(os.path.join(FIX, "exports", "routine-good.md")).read()
         bad = open(os.path.join(FIX, "exports", "routine-bad.md")).read()

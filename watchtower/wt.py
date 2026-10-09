@@ -196,6 +196,12 @@ def attack_reference(text, rules, where=""):
     return hits >= 1 and bool(REF_WORDS.search(text))
 
 
+def sentence_of(text, m):
+    a = max(text.rfind(c, 0, m.start()) for c in ".!?\n") + 1
+    ends = [i for i in (text.find(c, m.end()) for c in ".!?\n") if i != -1]
+    return text[a:min(ends) if ends else len(text)]
+
+
 def scan_text(text, where, rules, kind="skill"):
     """Apply text rules plus document-level logic. kind: skill|reference|template|routine|description."""
     out = []
@@ -217,6 +223,8 @@ def scan_text(text, where, rules, kind="skill"):
                 continue
             if rule["id"] in guarded and in_warning(text, m, rules):
                 continue
+            if rule["id"] == "WT-T016" and not rules["write_verbs"].search(sentence_of(text, m)):
+                continue   # "failed silently", "quietly refresh the cache": quiet wording only matters next to an outward action
             if rule["id"] == SECRET_RULE and not looks_real_secret(m.group(0)):
                 continue
             if rule["id"] == "WT-T003" and is_document_blob(m.group(0)):
