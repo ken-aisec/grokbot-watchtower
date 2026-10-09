@@ -1041,6 +1041,26 @@ class MainBoxLessons(Box):
     def snap_rollcall(self):
         return wt.load_json(wt.state_path("rollcall_findings.json"), {}).get("findings", [])
 
+    def test_an_old_saved_getting_started_skill_is_reported(self):
+        """DQ-007: v0.6.6 moved the decoys, but the saved getting-started skill still said to plant them in the old places."""
+        self.skills(1)
+        d = os.path.join(self.home, "sand-data", "workflows", "getting-started"); os.makedirs(d)
+        current = open(os.path.join(ROOT, "bot", "getting-started.md")).read()
+        old = current.replace("(/var/tmp/.archive/customers-export-2025.csv, /var/tmp/.backup/aws-credentials.bak, /tmp/.archive/payments.env)",
+                              "(/workspace/.archive/customers-export-2025.csv, /workspace/.archive/payments.env, ~/.config/backup/aws-credentials.bak)")
+        self.assertNotEqual(old, current)
+        open(os.path.join(d, "SKILL.md"), "w").write("---\nname: getting-started\ndescription: First run.\n---\n" + old)
+        notes = self.audit("--quick")["notes"] if False else self.run_daily_notes()
+        hit = [n for n in notes if "getting-started skill" in n]
+        self.assertEqual(len(hit), 1, notes)
+        self.assertIn("/workspace/.archive/customers-export-2025.csv", hit[0])
+        open(os.path.join(d, "SKILL.md"), "w").write("---\nname: getting-started\ndescription: First run.\n---\n" + current)
+        self.assertFalse([n for n in self.run_daily_notes() if "getting-started skill" in n])
+
+    def run_daily_notes(self):
+        code, o, e = self.run_cmd("audit", "--roots", *self.roots)
+        return json.loads(o)["notes"]
+
     def refusals(self):
         return [json.loads(l) for l in open(wt.state_path("ledger.jsonl")) if '"refused-path"' in l]
 

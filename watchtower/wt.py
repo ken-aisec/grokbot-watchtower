@@ -872,6 +872,7 @@ def audit(roots, exports, quick=False):
     # 5b. tripwires and shell history (zero tokens)
     fs += soft("hooks", ("WT-C005",), notes, [], hook_findings, roots, inv)
     soft("decoys", (), notes, None, tend_canaries, notes)
+    soft("saved first-run skill", (), notes, None, saved_skill_notes, notes)
     fs += remember_events(canary_findings() + history_findings(rules))
     if not load_json(state_path("canaries.json"), {}):
         notes.append("No canaries planted: run `wt.py canary plant` for zero-cost tripwires.")
@@ -1613,6 +1614,35 @@ def self_findings(notes):
                                "watchtower scanners", f"{len(ids)} known: {', '.join(ids[:3])}",
                                "Update Watchtower: each release carries newer pinned scanners. This package lives only in Watchtower's own folder.", source="pip-audit"))
     return out
+
+
+def norm_body(t):
+    t = re.sub(r"(?s)\A---\n.*?\n---\n", "", t or "")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def saved_skill_notes(notes):
+    """The template's first-run skill is the owner's saved `getting-started` skill, and an update doesn't refresh it. After
+    v0.6.6 moved the decoys, the saved copy on the main computer still named the old places. Say so when it differs."""
+    app = read_text(os.path.join(SELF_ROOT, "bot", "getting-started.md"))
+    if not app:
+        return
+    seen = set()
+    for root in [os.path.normpath(os.path.expanduser("~") + sub) for sub in USER_SKILL_DIRS]:   # this home folder only
+        p = os.path.join(root, "getting-started", "SKILL.md")
+        rp = os.path.realpath(p)
+        if rp in seen or not os.path.isfile(p):
+            continue
+        seen.add(rp)
+        saved = read_text(p) or ""
+        if "You are Watchtower" not in saved or norm_body(saved) == norm_body(app):
+            continue
+        old = [x for x in OLD_CANARY_PATHS if x in saved]
+        msg = (f"Your saved getting-started skill ({short_path(p)}) is older than this Watchtower"
+               + (f": it still names the old decoy places ({', '.join(old)})" if old else "")
+               + ". A template made from this Bot would ship it. Re-save it from /workspace/watchtower/app/bot/getting-started.md.")
+        if msg not in notes:                   # the check can run twice in one audit; say it once
+            notes.append(msg)
 
 
 def update_notes(notes):
