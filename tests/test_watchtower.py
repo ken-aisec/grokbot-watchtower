@@ -580,6 +580,15 @@ class Features(unittest.TestCase):
         self.assertLessEqual(one - many, 7)                     # sixty more of the same cost at most 6 more
         self.assertEqual(wt.score([F("WT-T013", "x", "low", ["ASI02"], "/a", "e", "f")] * 50)[0], 100 - round(0.3 * 1.5))
 
+    def test_closing_four_high_findings_raises_the_score(self):
+        """DQ-006: on v0.6.5 the score stayed 68 after 4 high WT-I001 were re-approved (high 24 to 20). Current scoring must move."""
+        F = wt.finding
+        rest = [F("WT-X001", "x", "high", ["AST01"], f"/home/box/sand-data/workflows/s{i}", "e", "f") for i in range(20)] + \
+               [F("WT-T013", "x", "medium", ["ASI02"], f"/home/box/sand-data/workflows/m{i}/SKILL.md:3", "e", "f") for i in range(30)]
+        changed = [F("WT-I001", "Skill changed since baseline", "high", ["AST07"], f"/home/box/sand-data/workflows/{n}/SKILL.md", "changed", "f")
+                   for n in ("morning-brief", "saas-launch-film", "transcript-healthcheck", "x-scout-signal-for-revenue")]   # the four re-approved
+        self.assertGreater(wt.score(rest)[0], wt.score(rest + changed)[0])
+
     def test_history_shows_only_comparable_full_audits(self):
         old = [("2026-10-05T08:00:00+00:00", 0, 90), ("2026-10-05T09:00:00+00:00", 41, 80)]           # old formula, 3 columns
         with open(wt.state_path("score_history.csv"), "w") as f:
