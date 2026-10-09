@@ -2718,10 +2718,62 @@ def rollcall_findings(rdir):
     return out, bots
 
 
+ROSTER_FILE = ("exports", "roster.json")
+ROOM_KINDS = {"room", "rooms", "group", "group room", "group chat", "groupchat", "team room", "channel"}
+BOT_KINDS = {"bot", "agent", "dm", "direct message", "person"}
+
+
+def roster_rooms(roster):
+    """The group rooms in the roster the roll-call saw: entries marked as a room or group, or with two or more members.
+    Bots, people and anything it can't tell are left out, so an unclear entry never becomes a room."""
+    items = roster.get("entries", roster.get("roster", [])) if isinstance(roster, dict) else roster
+    out = []
+    for e in items if isinstance(items, list) else []:
+        if not isinstance(e, dict) or not isinstance(e.get("name"), str):
+            continue
+        kind = str(e.get("kind") or e.get("type") or "").strip().lower()
+        room = kind in ROOM_KINDS or (not kind and isinstance(e.get("members"), list) and len(e["members"]) >= 2)
+        if not room or kind in BOT_KINDS:
+            continue
+        name = re.sub(r"(?i)\s+room$", "", re.sub(r"[\r\n#]+", " ", e["name"]).strip())[:60].strip()
+        if name and name.lower() not in {x.lower() for x in out}:
+            out.append(name)
+    return out
+
+
+def write_rooms(rooms):
+    """Rewrite exports/rooms.txt from the roster: lines the owner marked with a trailing `# manual` are kept, the rest come
+    from the roster. Written to a new file beside it and swapped in, so a reader never sees half a list (and a link put
+    where the file goes is replaced, not written through)."""
+    path = os.path.join(home(), *ROOMS_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    manual = [l.rstrip() for l in (read_text(path) or "").splitlines() if re.search(r"#\s*manual\s*$", l) and not os.path.islink(path)]
+    manual_names = {re.sub(r"(?i)\s+room$", "", l.split("#", 1)[0].strip()).lower() for l in manual}
+    lines = [f"# Written by the roll-call from the roster on {now()[:10]}. Add a room by hand with a trailing '# manual' and it is kept."]
+    lines += manual + [f"{r} room" for r in rooms if r.lower() not in manual_names]
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return {"rooms": len(rooms), "kept_manual": len(manual)}
+
+
 def cmd_rollcall(args):
     rdir = args.dir or os.path.join(home(), "exports", "rollcall")
+    roster = load_json(os.path.join(home(), *ROSTER_FILE), None)     # rooms first, so the replies are judged with this account's rooms
+    rooms_file = write_rooms(roster_rooms(roster)) if roster is not None else "no roster saved: rooms.txt left as it was"
     fs, bots = rollcall_findings(rdir)
-    print(fit({"bots": bots, "findings": [compact(f) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs)}))
+    print(fit({"bots": bots, "findings": [compact(f) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs), "rooms_file": rooms_file}))
     ledger({"event": "rollcall", "bots": len(bots), "findings": len(fs)})
     return 0
 
