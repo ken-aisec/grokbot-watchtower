@@ -5196,6 +5196,63 @@ def cmd_doctor(args):
     return 0
 
 
+# ---------------------------------------------------------------- self-check
+COMMIT_FILE = "installed_commit"
+SELF_CHECK_SKIP = ("doctor", "uninstall")   # so the owner can still diagnose it, or take it off
+
+
+def git_head(root):
+    """The commit the installed copy is at, read from its .git folder without running git."""
+    try:
+        head = open(os.path.join(root, ".git", "HEAD")).read().strip()
+    except OSError:
+        return None
+    if not head.startswith("ref:"):
+        return head
+    ref = head[4:].strip()
+    try:
+        return open(os.path.join(root, ".git", ref)).read().strip()
+    except OSError:
+        for line in (read_text(os.path.join(root, ".git", "packed-refs")) or "").splitlines():
+            if line.endswith(" " + ref):
+                return line.split()[0]
+    return None
+
+
+def self_check():
+    """Before every run, the installed copy checks itself: every file against MANIFEST.sha256, and the commit against the one
+    install.sh recorded. Returns the problems found ([] when all is well, None when this is not an installed copy, such as a
+    developer's checkout). An install from before v0.6.8 has no recorded commit: the current one is recorded once, and said."""
+    root = os.path.realpath(SELF_ROOT)
+    if root != os.path.realpath(os.path.join(home(), "app")):
+        return None
+    problems = []
+    man = read_text(os.path.join(root, "MANIFEST.sha256"))
+    if not man:
+        return ["MANIFEST.sha256 is missing"]
+    for line in man.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        want, rel = parts[0], parts[1].lstrip("*").strip()
+        p = os.path.join(root, rel)
+        if os.path.realpath(p) != os.path.normpath(p) or not os.path.isfile(p):
+            problems.append(f"{rel} is missing or not a plain file")
+        elif sha256_file(p) != want:
+            problems.append(f"{rel} changed since install")
+    head = git_head(root)
+    rec_path = state_path(COMMIT_FILE)
+    rec = (read_text(rec_path) or "").strip()
+    if not head:
+        problems.append("the installed commit can't be read (.git is missing)")
+    elif rec and rec != head:
+        problems.append(f"the installed commit is {head[:12]}, but install.sh recorded {rec[:12]}")
+    elif not rec and not problems:
+        with open(rec_path, "w") as f:
+            f.write(head + "\n")
+    return problems
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     """Never show a stack trace to the Bot or the user: one plain line, the detail saved for `wt.py doctor`."""
@@ -5264,6 +5321,14 @@ def main_inner(argv=None):
     cs = sub.add_parser("codescan"); cs.add_argument("path")
     br = sub.add_parser("brief"); br.add_argument("--summary"); br.add_argument("--notes"); br.add_argument("--offline")
     a = ap.parse_args(argv)
+    if a.cmd not in SELF_CHECK_SKIP:
+        problems = self_check()
+        if problems:
+            ledger({"event": "self-check-failed", "problems": problems[:20]})
+            print("SELF-CHECK FAILED - Watchtower stopped before doing anything. Its own files don't match the release it installed: "
+                  + "; ".join(problems[:5]) + (f" (and {len(problems) - 5} more)" if len(problems) > 5 else "")
+                  + ". Tell the owner now. Don't run Watchtower again until they reinstall it from the release (setup skill, section 1).")
+            return 4
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
             "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status,

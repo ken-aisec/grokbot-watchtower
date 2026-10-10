@@ -19,6 +19,7 @@ if [[ "${1:-}" != "--scanners" ]]; then
   fi
   (cd "$WT_HOME/app.new" && sha256sum --quiet -c MANIFEST.sha256) || { echo "MANIFEST CHECK FAILED - not installing"; rm -rf "$WT_HOME/app.new"; exit 1; }
   rm -rf "$WT_HOME/app" && mv "$WT_HOME/app.new" "$WT_HOME/app"
+  echo "$GOT" > "$WT_HOME/state/installed_commit"   # wt.py checks itself against this and the manifest before every run
   python3 "$WT_HOME/app/watchtower/wt.py" --version >/dev/null
   echo "Watchtower $TAG installed at $WT_HOME/app (commit $GOT, manifest verified$([[ -n "$WANT" ]] && echo ", commit matches the template"))."
   echo "NEXT: read $WT_HOME/app/skills/watchtower-setup/SKILL.md and follow it from section 2."

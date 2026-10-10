@@ -107,3 +107,69 @@ class RestrictiveRules(Base):
         src = open(os.path.join(ROOT, "watchtower", "wt.py")).read()
         self.assertNotIn("Remove the three Ask-first rules", src)
         self.assertIn("Keep the three Ask-first rules", src)
+
+
+class SelfCheck(Base):
+    def install(self):
+        """An installed copy: this checkout's tracked files, a manifest made for them, and a .git that names a commit."""
+        import subprocess, hashlib
+        app = os.path.join(os.environ["WATCHTOWER_HOME"], "app")
+        shutil.rmtree(app, ignore_errors=True)
+        files = subprocess.run(["git", "-C", ROOT, "ls-files"], capture_output=True, text=True).stdout.split()
+        lines = []
+        for rel in files:
+            if rel == "MANIFEST.sha256" or not os.path.isfile(os.path.join(ROOT, rel)):
+                continue
+            os.makedirs(os.path.dirname(os.path.join(app, rel)), exist_ok=True)
+            shutil.copy(os.path.join(ROOT, rel), os.path.join(app, rel))
+            lines.append(f"{hashlib.sha256(open(os.path.join(app, rel), 'rb').read()).hexdigest()}  {rel}")
+        open(os.path.join(app, "MANIFEST.sha256"), "w").write("\n".join(sorted(lines, key=lambda l: l.split()[1])) + "\n")
+        os.makedirs(os.path.join(app, ".git"))
+        open(os.path.join(app, ".git", "HEAD"), "w").write("a" * 40 + "\n")
+        os.makedirs(os.path.join(os.environ["WATCHTOWER_HOME"], "state"), exist_ok=True)
+        open(os.path.join(os.environ["WATCHTOWER_HOME"], "state", "installed_commit"), "w").write("a" * 40 + "\n")
+        return app
+
+    def run_app(self, app, *argv):
+        import subprocess
+        p = subprocess.run([sys.executable, os.path.join(app, "watchtower", "wt.py"), *argv], capture_output=True, text=True,
+                           env=dict(os.environ), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_a_clean_install_runs(self):
+        app = self.install()
+        code, o = self.run_app(app, "status")
+        self.assertNotIn("SELF-CHECK FAILED", o)
+
+    def test_a_changed_file_stops_every_run(self):
+        app = self.install()
+        with open(os.path.join(app, "rules", "text_rules.json"), "a") as f:
+            f.write(" ")
+        for cmd in (["status"], ["audit", "--roots", self.tmp], ["canary", "status"], ["report"]):
+            code, o = self.run_app(app, *cmd)
+            self.assertEqual(code, 4, (cmd, o)); self.assertIn("SELF-CHECK FAILED", o); self.assertIn("rules/text_rules.json changed", o)
+        code, o = self.run_app(app, "doctor")                                        # the owner can still see what happened
+        self.assertNotIn("SELF-CHECK FAILED", o)
+
+    def test_a_missing_file_or_a_different_commit_stops_it(self):
+        app = self.install()
+        os.remove(os.path.join(app, "skills", "watchtower-fix", "SKILL.md"))
+        code, o = self.run_app(app, "status")
+        self.assertEqual(code, 4); self.assertIn("watchtower-fix/SKILL.md is missing", o)
+        app = self.install()
+        open(os.path.join(app, ".git", "HEAD"), "w").write("b" * 40 + "\n")
+        code, o = self.run_app(app, "status")
+        self.assertEqual(code, 4); self.assertIn("recorded aaaaaaaaaaaa", o)
+
+    def test_an_install_from_before_the_check_records_its_commit_once(self):
+        app = self.install()
+        os.remove(os.path.join(os.environ["WATCHTOWER_HOME"], "state", "installed_commit"))
+        code, o = self.run_app(app, "status")
+        self.assertNotIn("SELF-CHECK FAILED", o)
+        self.assertEqual(open(os.path.join(os.environ["WATCHTOWER_HOME"], "state", "installed_commit")).read().strip(), "a" * 40)
+
+    def test_a_developer_checkout_is_not_an_install(self):
+        self.assertIsNone(wt.self_check())
+
+    def test_the_installer_records_the_commit(self):
+        self.assertIn('echo "$GOT" > "$WT_HOME/state/installed_commit"', open(os.path.join(ROOT, "scripts", "install.sh")).read())
