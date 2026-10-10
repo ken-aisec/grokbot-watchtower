@@ -3386,11 +3386,17 @@ def parse_feed(xml_text):
                 d["link"] = c.attrib.get("href") or (c.text or "").strip() or d.get("link", "")
             elif ct in ("pubDate", "published", "updated", "date") and "date" not in d:
                 d["date"] = parse_date(c.text)
-            elif ct in ("description", "summary", "content", "encoded") and "summary" not in d:
-                d["summary"] = strip_tags(c.text or "")[:400]
+            elif ct in ("description", "summary", "content", "encoded"):
+                # The article text is never kept or passed on (it is someone else's words, and may be written to steer a Bot).
+                # Only the CVE IDs in it are taken.
+                d.setdefault("cves", set()).update(x.upper() for x in CVE_ID.findall(c.text or ""))
         if d.get("title"):
+            d["cves"] = sorted(d.get("cves", set()) | {x.upper() for x in CVE_ID.findall(d["title"])})
             items.append(d)
     return items
+
+
+CVE_ID = re.compile(r"(?i)\bCVE-\d{4}-\d{4,7}\b")
 
 
 def version_of(name):
@@ -3580,7 +3586,7 @@ def gather_brief(cfg, offline=None):
         for it in items:
             if it.get("date") and it["date"] < since:
                 continue
-            text = f"{it['title']} {it.get('summary', '')}"
+            text = f"{it['title']} {' '.join(it.get('cves', []))}"   # title and CVE IDs only, never the article text
             if not (fd.get("all_relevant") or rel.search(text)):
                 continue
             if re.search(r"(?i)\b(podcast|webinar|sponsored|ebook|whitepaper|on-demand|register now|live demo)\b", it["title"]):
@@ -3591,7 +3597,7 @@ def gather_brief(cfg, offline=None):
             cat, label = classify(text)
             research.append({"id": hashlib.sha1(it["title"].encode()).hexdigest()[:8], "source": fd["name"], "kind": fd["kind"],
                              "title": it["title"], "link": it.get("link", ""), "date": it["date"].date().isoformat() if it.get("date") else "",
-                             "summary": clip(it.get("summary", ""), 380), "score": sc, "category": cat, "category_label": label})
+                             "cves": it.get("cves", []), "score": sc, "category": cat, "category_label": label})
     seen, dedup = set(), []
     for r in sorted(sorted(research, key=lambda x: x["date"], reverse=True), key=lambda x: -x["score"]):
         k = re.sub(r"\W+", "", r["title"].lower())[:60]
@@ -3612,8 +3618,7 @@ def gather_brief(cfg, offline=None):
                 text = f"{v.get('vendorProject')} {v.get('product')}"
                 kev.append({"cve": v.get("cveID"), "vendor": v.get("vendorProject"), "product": v.get("product"),
                             "name": v.get("vulnerabilityName"), "added": v.get("dateAdded"), "due": v.get("dueDate"),
-                            "ransomware": v.get("knownRansomwareCampaignUse") == "Known", "relevant": bool(watch.search(text)),
-                            "action": (v.get("requiredAction") or "")[:200]})
+                            "ransomware": v.get("knownRansomwareCampaignUse") == "Known", "relevant": bool(watch.search(text))})   # no free text from the feed
         kev.sort(key=lambda x: (not x["relevant"], x["added"]))
     except Exception as e:
         kev_status = f"unavailable ({type(e).__name__})"
@@ -3918,6 +3923,8 @@ def cmd_brief(args):
     tag = f"{week[0]}-W{week[1]:02d}"
     # adding analysis re-renders this week's brief from saved data instead of fetching again
     b = last if (reuse and last and last.get("tag") == tag and offline is None) else gather_brief(cfg, offline)
+    for r in (b or {}).get("research", []) or []:
+        r.pop("summary", None)                            # a brief saved before v0.6.8 kept article text; it is never passed on
     snap = load_json(state_path("last_findings.json"), None)
     pkg = load_json(state_path("package_vulns.json"), None)
     hist = load_history()
@@ -3933,7 +3940,7 @@ def cmd_brief(args):
     top, _ = split_stories(b)
     print(fit({"brief": path, "threat_level": threat_level(b, snap, top)[1],
                "top_stories": [{"id": r["id"], "tier": r["tier"], "category": r["category_label"], "title": r["title"],
-                                "summary": r["summary"][:260], "source": r["source"]} for r in top],
+                                "cves": r.get("cves", []), "source": r["source"]} for r in top],
                "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:6],
                "updates": b["updates"], "doc_changes": [p["name"] for p in b["pages"]],
                "sources_down": [s["name"] for s in b["sources"] if s["status"] != "ok"],
