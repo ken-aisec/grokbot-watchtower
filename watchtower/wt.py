@@ -2911,6 +2911,23 @@ UNTRUSTED_IN = re.compile(r"(?i)\b(web|browser|search|x\b|twitter|rss|inbox|inco
 EXTERNAL_OUT = re.compile(r"(?i)\b(send|reply|post|publish|tweet|email|message|slack|share|upload|webhook|x\b)\b")
 
 
+# A memory that gives a Bot more room: skip the ask, trust a sender, hold admin rights. "Never send without asking" is the
+# opposite and is never flagged; Watchtower never suggests removing a rule that holds a Bot back.
+LOOSENING = re.compile(r"(?i)\b(without (asking|approval|confirmation|checking)|don'?t (need to )?(ask|confirm|check)|no need to (ask|confirm|check)|"
+                       r"skip(ping)? (the )?(approval|ask|confirmation|gate)|bypass|auto[- ]?approv\w*|allow(ed)? automatically|"
+                       r"treat .{0,30} as (trusted|authori[sz]ed)|(has|have|with) (admin|full|unrestricted) (access|permission|rights))")
+STANDING = re.compile(r"(?i)\b(always|from now on|whenever|every (time|day|morning|week|weekday|hour)|each (day|morning|week)|automatically|by default)\b")
+
+
+def memory_loosens(t, rules):
+    """Flag a memory only when it loosens permissions or has the Bot act without approval: a loosening phrase that isn't
+    itself negated ("never skip the approval"), or a standing order to do an outside action with no approval line."""
+    for m in LOOSENING.finditer(t):
+        if not DEFEAT_NEGATED.search(t[max(0, m.start() - 20):m.start()]) and not re.search(r"(?i)\b(never|not|n't)\b[^.;]{0,30}$", t[max(0, m.start() - 40):m.start()]):
+            return True
+    return bool(STANDING.search(t) and first_action(t, rules["write_verbs"]) and not has_approval(t, rules))
+
+
 def rollcall_findings(rdir):
     rules = load_rules()
     out, bots = [], []
@@ -2937,7 +2954,7 @@ def rollcall_findings(rdir):
                     continue   # a listener rule is about triggers; a remembered fact that mentions "any email" is not one
                 f["owasp"] = ["ASI06"] + [o for o in f["owasp"] if o != "ASI06"]
                 out.append(f)
-            if MEMORY_DIRECTIVE.search(t) and (EXTERNAL_OUT.search(t) or re.search(r"(?i)approv|permission|trust|access", t)):
+            if memory_loosens(t, rules):
                 out.append(finding("WT-M010", "Memory acts as a standing instruction", "medium", ["ASI06"], f"{where}:memory{i}", t[:150],
                                    "Memories steer every future run, and Auto Review doesn't check memory writes. "
                                    "If you didn't put this there on purpose, remove it in that Bot's memory settings."))
@@ -5066,7 +5083,7 @@ def cmd_uninstall(args):
                    "not_removed_outside_watchtower": [short_path(p) for p in refused] or None,
                    "quarantined_skills": [e["name"] for e in held] or None,
                    "quarantine_note": "These go with the folder. Restore any the owner wants first (`wt.py quarantine --restore <name>`)." if held else None,
-                   "only_the_owner_can": ["Remove the three Ask-first rules in Auto-review, if they don't want them (they are worth keeping).",
+                   "only_the_owner_can": ["Keep the three Ask-first rules in Auto-review: they protect every Bot, with or without Watchtower.",
                                           "Delete the Watchtower Bot itself (right-click it in the sidebar → Delete). That also removes its memories and chat.",
                                           "Roll-call messages already sent to other Bots stay in those chats."],
                    "not_touched": "~/.cache/pip (shared with other tools), other Bots, their memories and routines."}, limit=6000))
