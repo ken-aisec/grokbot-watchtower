@@ -2337,6 +2337,7 @@ def fit(obj, limit=4096):
 
 
 def cmd_daily(args):
+    sweep_old_replies()
     try:
         snap, new, fixed = run_audit(args, quick=True)
     except Busy:
@@ -3228,8 +3229,56 @@ def rollcall_findings(rdir):
                                "That's the combination prompt injection needs. Split the jobs across Bots or put Ask first on every send."))
     for f in out:                                         # only masked findings are kept, never the reply itself
         f["evidence"] = mask_rollcall(f["evidence"])
-    save_json(state_path("rollcall_findings.json"), {"at": now(), "bots": bots, "findings": out})
+    save_json(state_path("rollcall_findings.json"), {"at": now(), "masked": VERSION, "bots": bots, "findings": out})
     return out, bots
+
+
+REPLY_MAX_AGE = 3600
+
+
+def sweep_old_replies(rdir=None):
+    """The daily check removes any roll-call reply file older than an hour (a roll-call that never finished) and logs it."""
+    rdir = rdir or os.path.join(home(), "exports", "rollcall")
+    if not os.path.isdir(rdir) or os.path.islink(rdir):
+        return 0
+    gone, cutoff = 0, time.time() - REPLY_MAX_AGE
+    for fn in os.listdir(rdir):
+        p = os.path.join(rdir, fn)
+        try:
+            if (os.path.islink(p) or os.path.isfile(p)) and os.lstat(p).st_mtime < cutoff:
+                os.remove(p); gone += 1
+        except OSError:
+            pass
+    if gone:
+        ledger({"event": "rollcall-replies-swept", "count": gone, "older_than_seconds": REPLY_MAX_AGE})
+    return gone
+
+
+def migrate_rollcall_state():
+    """A rollcall_findings.json written before v0.6.8 kept evidence unmasked. Mask it once with mask_rollcall, keeping only
+    at/bots/findings; if it can't be read as findings, delete it. Either way it is logged."""
+    p = state_path("rollcall_findings.json")
+    if not os.path.isfile(p):
+        return None
+    d = load_json(p, None)
+    if isinstance(d, dict) and d.get("masked"):
+        return None
+    try:
+        fs = d["findings"]
+        assert isinstance(fs, list) and all(isinstance(f, dict) and isinstance(f.get("rule"), str) and isinstance(f.get("where"), str) for f in fs)
+        for f in fs:
+            f["evidence"] = mask_rollcall(f.get("evidence", ""))
+        bots = [mask_rollcall(b, 60) for b in d.get("bots", []) if isinstance(b, str)]
+        save_json(p, {"at": d.get("at") or now(), "masked": VERSION, "bots": bots, "findings": fs})
+        ledger({"event": "rollcall-state-masked", "findings": len(fs)})
+        return "masked"
+    except (KeyError, TypeError, AssertionError):
+        try:
+            os.remove(p)
+        except OSError:
+            return None
+        ledger({"event": "rollcall-state-deleted", "why": "written before v0.6.8 and could not be masked"})
+        return "deleted"
 
 
 ROSTER_FILE = ("exports", "roster.json")
@@ -3323,14 +3372,23 @@ def delete_raw_replies(rdir):
 
 def cmd_rollcall(args):
     rdir = args.dir or os.path.join(home(), "exports", "rollcall")
+    try:
+        return _rollcall(args, rdir)
+    finally:                                   # every path: NOT RUN, an error partway, or a finished run
+        removed = delete_raw_replies(rdir)
+        if removed:
+            ledger({"event": "rollcall-replies-deleted", "count": removed})
+
+
+def _rollcall(args, rdir):
     if not args.owner_said_yes:
         print("NOT RUN: a roll-call needs the owner's yes in this conversation, every time. Ask them, then run "
-              "`wt.py rollcall --owner-said-yes`. The replies saved so far were not read.")
+              "`wt.py rollcall --owner-said-yes`. The replies saved so far were deleted unread; ask the Bots again after the yes.")
         return 2
     roster = load_json(os.path.join(home(), *ROSTER_FILE), None)     # rooms first, so the replies are judged with this account's rooms
     rooms_file = write_rooms(roster_rooms(roster)) if roster is not None else "no roster saved: rooms.txt left as it was"
     fs, bots = rollcall_findings(rdir)
-    removed = delete_raw_replies(rdir)
+    removed = sum(1 for fn in os.listdir(rdir) if os.path.isfile(os.path.join(rdir, fn)) or os.path.islink(os.path.join(rdir, fn))) if os.path.isdir(rdir) and not os.path.islink(rdir) else 0
     print(fit({"bots": bots, "findings": [dict(compact(f), key=f["key"]) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs), "rooms_file": rooms_file,
                "raw_replies_deleted": removed, "counted_in_score": False,
                "recommend_each_bot_adds": ROLLCALL_RULE}))
@@ -5597,6 +5655,8 @@ def main_inner(argv=None):
                   + "; ".join(problems[:5]) + (f" (and {len(problems) - 5} more)" if len(problems) > 5 else "")
                   + ". Tell the owner now. Don't run Watchtower again until they reinstall it from the release (setup skill, section 1).")
             return 4
+    if a.cmd not in SELF_CHECK_SKIP:
+        migrate_rollcall_state()
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show, "dismiss": cmd_dismiss,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
             "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status,

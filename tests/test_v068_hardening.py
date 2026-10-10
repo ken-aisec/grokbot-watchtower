@@ -41,7 +41,7 @@ class RollCall(Base):
         d = self.reply()
         code, o, _ = self.run_wt("rollcall")
         self.assertEqual(code, 2); self.assertIn("owner's yes", o)
-        self.assertTrue(os.path.exists(os.path.join(d, "harbor.json")))            # not read, not deleted
+        self.assertFalse(os.path.exists(os.path.join(d, "harbor.json")))           # not read, and deleted (Claude's review, Oct 10)
         self.assertFalse(os.path.exists(wt.state_path("rollcall_findings.json")))
 
     def test_replies_are_deleted_and_only_masked_findings_are_kept(self):

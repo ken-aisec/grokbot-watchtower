@@ -102,6 +102,8 @@ State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledg
 - Static engines can be bypassed. Three independent engines, hash drift, tripwires and history review make that harder, and the reports say they're evidence, not proof.
 - Roll-call relies on each Bot describing itself. A compromised Bot could lie, which is why the filesystem evidence comes first.
 - Canary reads need a filesystem that records access times; setup tells you if yours doesn't.
+- The self-check catches accidental or careless changes to Watchtower's own files, not a Bot that rewrites both the code and the manifest. Every Bot runs as the same user on the same computer, so nothing stops one from editing both.
+- The decoy names are random per install, which stops generic snooping, not a targeted attacker who reads Watchtower's state first.
 - Grok Bot is in beta and changes weekly. The brief watches xAI's security docs for changes.
 
 ## Tests
