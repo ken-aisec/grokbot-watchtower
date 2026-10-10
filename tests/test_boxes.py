@@ -996,6 +996,7 @@ class MainBoxLessons(Box):
         self.addCleanup(lambda: (wt.CANARY_SPECS.__setitem__(slice(None), saved), setattr(wt, "OLD_CANARY_PATHS", saved_old)))
         wt.CANARY_SPECS[:] = [(n, "~" + o[len(self.home):] if o.startswith(self.home) else o, b) for (n, _, b), o in zip(saved, old)]
         os.environ.pop("WT_DECOY_ROOT")
+        wt.save_json(wt.state_path("decoy_layout.json"), {n: p for n, p, _ in wt.CANARY_SPECS})   # v0.6.5 used the same names everywhere
         self.run_cmd("canary", "plant")                                           # what v0.6.5 left: decoys in /workspace and home
         os.environ["WT_DECOY_ROOT"] = os.path.join(self.tmp, "decoys")
         before = wt.load_json(wt.state_path("canaries.json"), {})
@@ -1044,6 +1045,7 @@ class MainBoxLessons(Box):
         other = os.path.join(self.home, "notes.txt"); open(other, "w").write("mine\n")
         os.makedirs(os.path.join(root, "var", "tmp", ".archive"))
         os.link(other, os.path.join(root, "var", "tmp", ".archive", "customers-export-2025.csv"))  # a second name for someone's file
+        wt.save_json(wt.state_path("decoy_layout.json"), {n: p for n, p, _ in wt.CANARY_SPECS})   # the names the links were put at
         code, o, _ = self.run_cmd("canary", "plant")
         self.assertEqual(open(victim).read(), "export KEEP=1\n")
         self.assertEqual(os.listdir(secret_dir), [])
@@ -1204,7 +1206,7 @@ class MainBoxLessons(Box):
         self.skills(1)
         d = os.path.join(self.home, "sand-data", "workflows", "getting-started"); os.makedirs(d)
         current = open(os.path.join(ROOT, "bot", "getting-started.md")).read()
-        old = current.replace("(/var/tmp/.archive/customers-export-2025.csv, /var/tmp/.backup/aws-credentials.bak, /tmp/.archive/payments.env)",
+        old = current.replace("in /tmp and /var/tmp, with folder and file names picked at random for this computer",
                               "(/workspace/.archive/customers-export-2025.csv, /workspace/.archive/payments.env, ~/.config/backup/aws-credentials.bak)")
         self.assertNotEqual(old, current)
         open(os.path.join(d, "SKILL.md"), "w").write("---\nname: getting-started\ndescription: First run.\n---\n" + old)

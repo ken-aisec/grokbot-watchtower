@@ -759,7 +759,7 @@ def owned_path(p, kind, log=True):
         elif kind == "skill":
             ok = _under(rp, {os.path.realpath(r) for r in user_skill_roots()}, strict=True) and _under(n, user_skill_roots(), strict=True)
         elif kind == "decoy":
-            allowed = {os.path.normpath(decoy_path(x)) for _, x, _ in CANARY_SPECS} | {os.path.normpath(os.path.expanduser(x)) for x in OLD_CANARY_PATHS}
+            allowed = decoy_places() | {os.path.normpath(os.path.expanduser(x)) for x in OLD_CANARY_PATHS}
             d = os.path.dirname(n)
             ok = n in allowed and not os.path.islink(d) and os.path.realpath(d) == os.path.join(os.path.realpath(os.path.dirname(d)), os.path.basename(d))
         elif kind == "project":
@@ -1494,8 +1494,6 @@ paths = [
   '''(^|/)\.config/(google-chrome[^/]*|chromium[^/]*|BraveSoftware)/''',
   '''(^|/)scoped_dir[^/]*/''',
   '''(^|/)chrome-profile/''',
-  '''(^|/)\.archive/(customers-export-2025\.csv|payments\.env)$''',
-  '''(^|/)\.config/backup/aws-credentials\.bak$''',
   '''(^|/)(\.codex/auth\.json|\.claude/\.credentials\.json|\.config/gh/hosts\.yml|\.aws/credentials|\.git-credentials|\.netrc|\.docker/config\.json|\.npmrc)$''',
   '''(^|/)watchtower/(state|reports|app|\.venv|scanners|bin)/''',
   '''chrome-cookie-seed\.json$''',
@@ -1582,8 +1580,10 @@ def gitleaks_findings(roots, notes):
             reason = next((l for l in re.sub(r"\x1b\[[0-9;]*m", "", err).splitlines() if "FTL" in l or "error" in l.lower()), err.strip()[:160] or "no report written")
             notes.append(f"gitleaks FAILED on {r} ({reason.strip()[-160:]}): secrets there were NOT checked by gitleaks.")
             continue
-        per_file = {}
+        per_file, decoys = {}, canary_paths()
         for leak in load_json(tmp, []) or []:
+            if os.path.abspath(str(leak.get("File") or "")) in decoys:
+                continue                                  # Watchtower's own decoys (their names are this install's, not in this config)
             per_file.setdefault(leak.get("File"), []).append(leak)
         by_dir = {}
         for fpath in per_file:
@@ -1746,7 +1746,7 @@ def saved_skill_notes(notes):
         saved = read_text(p) or ""
         if "You are Watchtower" not in saved or norm_body(saved) == norm_body(app):
             continue
-        old = [x for x in OLD_CANARY_PATHS if x in saved]
+        old = [x for x in OLD_CANARY_PATHS + PUBLISHED_CANARY_PATHS if x in saved]
         msg = (f"Your saved getting-started skill ({short_path(p)}) is older than this Watchtower"
                + (f": it still names the old decoy places ({', '.join(old)})" if old else "")
                + ". A template made from this Bot would ship it. Re-save it from /workspace/watchtower/app/bot/getting-started.md.")
@@ -2564,6 +2564,60 @@ CANARY_SPECS = [
     ("api-env", "/tmp/.archive/payments.env", "STRIPE_SECRET_KEY=rk_live_{tok}{tok}\nPAYOUT_ACCOUNT=acct_{tok}\n"),
 ]
 OLD_CANARY_PATHS = ("/workspace/.archive/customers-export-2025.csv", "~/.config/backup/aws-credentials.bak", "/workspace/.archive/payments.env")
+# v0.6.8: the spec paths above were the same on every install and printed in Watchtower's own docs, so anything that read the
+# docs knew which files not to touch. Each install now picks its own folder and file names (kept in state/decoy_layout.json);
+# the spec gives only the place (/var/tmp or /tmp) and the kind of file. Decoys found at a published name are moved once.
+PUBLISHED_CANARY_PATHS = tuple(x for _, x, _ in CANARY_SPECS)
+DECOY_FOLDERS = ("cache", "backup", "old", "export", "sync", "restore", "snapshots", "archive", "tmpdata", "stash")
+DECOY_STEMS = {"customers": ("customers", "clients", "crm-export", "contacts", "accounts"),
+               "cloud-keys": ("aws-credentials", "cloud-keys", "credentials", "deploy-keys", "iam-backup"),
+               "api-env": ("payments", "billing", "prod", "stripe", "secrets")}
+_RANDOM_DECOY = re.compile(r"^\.[a-z]+-[0-9a-f]{6}/[a-z0-9-]+-[0-9a-f]{4}\.[a-z0-9]+$")
+
+
+def _spec_base(path):
+    return os.path.dirname(os.path.dirname(path))
+
+
+def valid_layout_path(name, logical):
+    """A layout entry is used, and its file may ever be removed, only if it is one of this install's random names in the spec's own
+    place (or a published or older name, which Watchtower once used). Anything else in the layout file is ignored, so a Bot that
+    edits it can't point Watchtower at another file."""
+    spec = {n: x for n, x, _ in CANARY_SPECS}.get(name)
+    if not spec or not isinstance(logical, str):
+        return False
+    if logical in (spec,) + PUBLISHED_CANARY_PATHS + OLD_CANARY_PATHS:
+        return True
+    base = _spec_base(spec)
+    rel = logical[len(base):].lstrip("/") if logical.startswith(base.rstrip("/") + "/") else ""
+    return bool(_RANDOM_DECOY.match(rel)) and os.path.splitext(rel)[1] == os.path.splitext(spec)[1]
+
+
+def random_decoy_path(name, spec):
+    import secrets as _s
+    stem = _s.choice(DECOY_STEMS.get(name, ("data",)))
+    return os.path.join(_spec_base(spec), f".{_s.choice(DECOY_FOLDERS)}-{_s.token_hex(3)}", f"{stem}-{_s.token_hex(2)}{os.path.splitext(spec)[1]}")
+
+
+def decoy_layout(renew=()):
+    """This install's decoy places, one per spec, picked at random the first time and kept. `renew` names get new places."""
+    path = state_path("decoy_layout.json")
+    lay = load_json(path, {}) or {}
+    lay = {n: v for n, v in lay.items() if valid_layout_path(n, v)} if isinstance(lay, dict) else {}
+    changed = False
+    for name, spec, _ in CANARY_SPECS:
+        if name not in lay or name in renew:
+            lay[name] = random_decoy_path(name, spec); changed = True
+    if changed:
+        save_json(path, lay)
+    return lay
+
+
+def decoy_places():
+    """Every place a decoy of this install may be: its own random ones, plus the published and older names it may have used."""
+    lay = load_json(state_path("decoy_layout.json"), {}) or {}
+    mine = [v for n, v in lay.items() if valid_layout_path(n, v)] if isinstance(lay, dict) else []
+    return {os.path.normpath(decoy_path(x)) for x in list(mine) + [x for _, x, _ in CANARY_SPECS] + list(PUBLISHED_CANARY_PATHS)}
 
 
 def decoy_path(path):
@@ -2649,8 +2703,9 @@ def plant_canaries(only=None, token_file=None, refused=None):
     import secrets as _s
     reg = load_json(state_path("canaries.json"), {}) or {}
     planted, bad = [], []
+    layout = decoy_layout()
     for name, path, body in CANARY_SPECS:
-        p = decoy_path(path)
+        p = decoy_path(layout[name])
         if (only is not None and name not in only) or (name in reg and os.path.lexists(os.path.expanduser(reg[name]["path"]))
                                                          and not os.path.islink(os.path.expanduser(reg[name]["path"]))):
             continue
@@ -2682,7 +2737,12 @@ def tend_canaries(notes):
     if not reg:
         return
     old = {os.path.expanduser(p) for p in OLD_CANARY_PATHS}
+    published = {os.path.normpath(decoy_path(p)) for p in PUBLISHED_CANARY_PATHS}
     moved = [n for n, v in reg.items() if os.path.expanduser(v["path"]) in old and n in {s_[0] for s_ in CANARY_SPECS}]
+    renamed = [n for n, v in reg.items() if n not in moved and os.path.normpath(os.path.expanduser(v["path"])) in published
+               and n in {s_[0] for s_ in CANARY_SPECS}]
+    from_old = set(moved)
+    moved += renamed
     pending = []
     for n in moved:                                       # a read that no run has recorded yet goes in the log before the file does
         try:
@@ -2707,11 +2767,16 @@ def tend_canaries(notes):
         except OSError:
             pass                                          # someone else's files are in that folder: it stays
     if moved:
+        decoy_layout(renew=set(moved))                    # new random names, never the published ones again
         plant_canaries(only=set(moved))
         store = [e for e in load_json(state_path("events.json"), []) if e.get("rule") not in ("WT-K004", "WT-K005")]
         save_json(state_path("events.json"), store)
-        notes.append(f"Moved {len(moved)} decoys to /var/tmp and /tmp. The platform's file backup read the old ones in /workspace and your home folder "
-                     "after every Bot turn, so a read there meant nothing. It doesn't read the new places, so a read now is worth an alarm.")
+        if from_old:
+            notes.append(f"Moved {len(from_old)} decoys to /var/tmp and /tmp. The platform's file backup read the old ones in /workspace and your home folder "
+                         "after every Bot turn, so a read there meant nothing. It doesn't read the new places, so a read now is worth an alarm.")
+        if renamed:
+            notes.append(f"Moved {len(renamed)} decoys to new folders and names picked at random for this computer. The old names were printed in "
+                         "Watchtower's own instructions, so anything that read them knew which files to leave alone.")
         ledger({"event": "canary-move", "count": len(moved)})
         reg = load_json(state_path("canaries.json"), {}) or {}
     boot = boot_time()

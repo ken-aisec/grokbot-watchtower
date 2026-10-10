@@ -7,7 +7,7 @@ description: First-run setup for Watchtower. After the owner's one yes it instal
 
 The owner's first yes covers everything in sections 1 to 4: the install, the six scanners, the three decoys and the three routines. Your first message listed all of it. Do not ask again for any of those; work through them and post a short progress line every minute or two. If the owner left something out ("no decoys", "no routines"), skip that part and say so at the end.
 
-Say once, up front: "Setup only writes inside /workspace/watchtower, plus the three decoy files I named."
+Say once, up front: "Setup only writes inside /workspace/watchtower, plus three decoy files in /tmp and /var/tmp."
 
 ## 1. Install the pinned release
 Skip this section if `/workspace/watchtower/app/watchtower/wt.py` already exists and `wt.py --version` prints 0.6.7.
@@ -25,7 +25,7 @@ Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`. Each tool in
 
 ## 3. Baseline, decoys, first audit
 1. `python3 /workspace/watchtower/app/watchtower/wt.py baseline`
-2. `wt.py canary plant`. Tell the user the three paths it prints. Never open, list or search those files or their folders yourself, now or later: a read by you looks the same as a read by an intruder.
+2. `wt.py canary plant`. It picks new random folder and file names for this computer. Tell the owner the three paths it prints, in this chat only; never write them into a memory, a skill, a routine, a file or another Bot's chat. Never open, list or search those files or their folders yourself, now or later: a read by you looks the same as a read by an intruder.
 3. `wt.py audit`. Summarize in five lines: score, counts by severity, the top three fixes.
 
 ## 4. Routines
