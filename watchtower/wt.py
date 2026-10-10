@@ -4979,7 +4979,7 @@ def cmd_fix(args):
                 for g in needs_you([f for f in fs if fix_class(f) == "only_you" and not in_q(f)], 5)]   # quarantine handles those; don't hand them back to the owner
     rules_needed = [r for r in ("WT-A003", "WT-A005") if any(f["rule"] == r for f in fs)]
     ch_skills, ch_other = changed_skills(fs)
-    if not (args.apply or args.upgrade or args.accept or args.revet or args.exception or args.quarantine):
+    if not (args.apply or args.upgrade or args.upgrade_projects or args.accept or args.revet or args.exception or args.quarantine):
         print(fit({"mode": "preview (nothing changed)",
                    "changed_skills": [{k: v for k, v in r.items() if k != "path"} for r in revet(sorted(ch_skills))],
                    "changed_other_files": [short_path(p) for p in ch_other],
@@ -4988,7 +4988,9 @@ def cmd_fix(args):
                    "safe_fixes_skipped_recent": extra["skipped_recent"],
                    "old_transcripts_for_you_to_delete_in_the_app": extra["transcripts"][:20],
                    "old_transcripts_total": {"folders": len(extra["transcripts"]), "files": sum(t["files"] for t in extra["transcripts"])},
-                   "upgrades": {"python": [f"{u['name']} {u['have']} → {u['want']}+" for u in ups], "projects": [os.path.basename(d) or d for d in projs]},
+                   "upgrades": {"python": [f"{u['name']} {u['have']} → {u['want']}+" for u in ups]},
+                   "project_upgrades": {"projects": [os.path.basename(d) or d for d in projs],
+                                        "ask": "Separate question: these are the owner's own projects. Only on a yes to this list, run wt.py fix --upgrade-projects."} if projs else None,
                    "decisions": fix_decisions([f for f in fs if not in_q(f)]), "quarantine_possible": quarantine_candidates(fs),
                    "ask_first_rules_missing": bool(rules_needed), "only_you": only_you,
                    "next": "Ask the user one question. On yes run: wt.py fix --apply --owner-said-yes [--skip <cleanup ids or paths they named>] --upgrade --revet --accept <rules they agreed to> "
@@ -4996,15 +4998,19 @@ def cmd_fix(args):
         save_json(state_path("tidy_plan.json"), {"at": now(), "ts": time.time(), "items": [tidy_row(x) for x in plan]})
         return 0
     done = tidy_apply(plan, args) if args.apply else []
-    if args.upgrade:
-        py_done = upgrade_python(ups) if ups else []
-        npm_done = upgrade_npm(projs) if projs else []
-        for d in NPM_REFUSED:
-            owned_path(d, "project")              # writes the refusal to the ledger
-            npm_done.append(f"{d}: not touched. The project list points outside your home and workspace folders")
+    if args.upgrade or args.upgrade_projects:
+        left = load_json(state_path("upgrade_left.json"), {}) or {}
+        py_done = upgrade_python(ups) if args.upgrade and ups else []
+        npm_done = []
+        if args.upgrade_projects:                 # the owner's own projects: only with their own yes, never under --upgrade
+            npm_done = upgrade_npm(projs) if projs else []
+            for d in NPM_REFUSED:
+                owned_path(d, "project")          # writes the refusal to the ledger
+                npm_done.append(f"{d}: not touched. The project list points outside your home and workspace folders")
         done += py_done + npm_done
-        save_json(state_path("upgrade_left.json"), {"at": now(), "npm": any("left" in x or "put it back" in x or not re.search(r"→ 0\.", x) for x in npm_done),
-                                                    "pip": [u["name"] for u in ups if not any(x.startswith(f"Upgraded {u['name']} ") and "put" not in x for x in py_done)]})
+        save_json(state_path("upgrade_left.json"), {"at": now(),
+                                                    "npm": any("left" in x or "put it back" in x or not re.search(r"→ 0\.", x) for x in npm_done) if args.upgrade_projects else left.get("npm", False),
+                                                    "pip": [u["name"] for u in ups if not any(x.startswith(f"Upgraded {u['name']} ") and "put" not in x for x in py_done)] if args.upgrade else left.get("pip", [])})
     if args.revet:
         only = {x.strip() for x in (getattr(args, "only", None) or "").split(",") if x.strip()}
         picked = sorted(d for d in ch_skills if not only or skill_name(d) in only)
@@ -5364,7 +5370,8 @@ def main_inner(argv=None):
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
     fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
-    fx.add_argument("--upgrade", action="store_true"); fx.add_argument("--accept"); fx.add_argument("--reason")
+    fx.add_argument("--upgrade", action="store_true", help="upgrade the Python packages in the preview (not the owner's projects)"); fx.add_argument("--accept"); fx.add_argument("--reason")
+    fx.add_argument("--upgrade-projects", action="store_true", help="run npm's lockfile fix in the owner's own projects: needs its own yes, never part of the one-yes fix")
     fx.add_argument("--keep-open", help="names or paths to leave open even though their rule is in --accept (comma-separated)")
     fx.add_argument("--revet", action="store_true", help="re-scan changed skills with every engine and re-approve the clean ones")
     fx.add_argument("--only", help="with --revet: re-approve only these skills (names, comma-separated); every other changed skill stays open")

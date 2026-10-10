@@ -1268,7 +1268,7 @@ class MainBoxLessons(Box):
         wt.upgrade_npm = lambda projs: seen.extend(projs) or []
         wt.python_upgrades = lambda: []
         self.addCleanup(lambda: (setattr(wt, "upgrade_npm", real[0]), setattr(wt, "python_upgrades", real[1])))
-        code, o, _ = self.run_cmd("fix", "--upgrade", "--roots", self.ws)
+        code, o, _ = self.run_cmd("fix", "--upgrade-projects", "--roots", self.ws)
         self.assertEqual(seen, [inside])                                                     # npm audit fix only where a project belongs
         self.assertEqual(sum("not touched" in d for d in json.loads(o)["done"]), 2)
         self.assertEqual(len(self.refusals()), 2)

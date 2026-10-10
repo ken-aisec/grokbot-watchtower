@@ -228,3 +228,41 @@ class RandomDecoys(Base):
                 if fn.endswith(".md") and fn != "CHANGELOG.md":
                     text = open(os.path.join(dirpath, fn), encoding="utf-8").read()
                     self.assertFalse([n for n in names if n in text], os.path.join(dirpath, fn))
+
+
+class SeparateYeses(Base):
+    def setUp(self):
+        super().setUp()
+        self.proj = os.path.join(self.tmp, "proj"); os.makedirs(self.proj)
+        open(os.path.join(self.proj, "package-lock.json"), "w").write("{}")
+        wt.save_json(wt.state_path("osv_projects.json"), {"at": wt.now(), "projects": [self.proj]})
+        self.npm, self.py = [], []
+        real = (wt.upgrade_npm, wt.python_upgrades, wt.upgrade_python)
+        wt.upgrade_npm = lambda projs: self.npm.extend(projs) or []
+        wt.python_upgrades = lambda: [{"name": "wheel", "have": "0.1", "want": "0.2"}]
+        wt.upgrade_python = lambda ups, py=None: self.py.extend(ups) or []
+        self.addCleanup(lambda: (setattr(wt, "upgrade_npm", real[0]), setattr(wt, "python_upgrades", real[1]), setattr(wt, "upgrade_python", real[2])))
+
+    def test_the_one_yes_upgrade_never_touches_the_owners_projects(self):
+        code, o, _ = self.run_wt("fix", "--upgrade", "--roots", self.tmp)
+        self.assertEqual(self.npm, []); self.assertEqual(len(self.py), 1)
+
+    def test_projects_are_upgraded_only_with_their_own_flag(self):
+        code, o, _ = self.run_wt("fix", "--upgrade-projects", "--roots", self.tmp)
+        self.assertEqual(self.npm, [self.proj]); self.assertEqual(self.py, [])
+
+    def test_the_preview_asks_about_projects_separately(self):
+        code, o, _ = self.run_wt("fix", "--roots", self.tmp)
+        r = json.loads(o)
+        self.assertNotIn("projects", r["upgrades"])
+        self.assertEqual(r["project_upgrades"]["projects"], ["proj"])
+        self.assertNotIn("--upgrade-projects", r["next"])
+        skill = open(os.path.join(ROOT, "skills", "watchtower-fix", "SKILL.md")).read()
+        self.assertIn("never part of the one yes", skill)
+
+    def test_a_report_send_asks_every_time_unless_setup_fixed_the_destination(self):
+        report = open(os.path.join(ROOT, "skills", "watchtower-report", "SKILL.md")).read()
+        self.assertIn("needs the owner's approval every time", report); self.assertNotIn("the first time", report)
+        self.assertIn("confirmed during setup", report)
+        self.assertIn("Report destination", open(os.path.join(ROOT, "skills", "watchtower-setup", "SKILL.md")).read())
+        self.assertIn("every time", open(os.path.join(ROOT, "routines", "weekly-audit.md")).read())

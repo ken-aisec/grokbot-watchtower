@@ -16,7 +16,7 @@ Watchtower is a security officer for that setup. It is read-only until you say y
 | `watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
 | `watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
 | `watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
-| `watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages and npm lockfiles (each upgrade is backed up and undone automatically if it breaks something), moves your own dangerous skills into a quarantine folder (nothing is deleted, and each can be restored), and accepts findings that are fine on purpose, after asking you a single question |
+| `watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages, and npm lockfiles in your own projects only after a separate yes (each upgrade is backed up and undone automatically if it breaks something), moves your own dangerous skills into a quarantine folder (nothing is deleted, and each can be restored), and accepts findings that are fine on purpose, after asking you a single question |
 | `watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
 | `watchtower-uninstall` | Removes Watchtower and everything it created (routines, decoys, scanners, caches, its folder) after one yes |
 
@@ -79,6 +79,7 @@ wt.py rollcall --owner-said-yes  analyze roll-call replies, keep masked findings
 wt.py prepublish PATH         check a Bot before sharing it as a template
 wt.py fix                      preview: the cleanup list (path, file count, whose) and everything else
 wt.py fix --apply --owner-said-yes [--skip N,..] --upgrade --revet --accept RULES   everything in one pass (after your yes)
+wt.py fix --upgrade-projects   npm lockfile fixes in your own projects (its own yes)
 wt.py diff SKILL               what changed in a skill since you approved it
 wt.py exception add SKILL --reason "..."   keep one named security-tool skill that two scanners flag (30 days)
 wt.py accept RULE WHERE --reason "..."   accept one risk on purpose (90 days)
