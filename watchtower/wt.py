@@ -3130,13 +3130,54 @@ LOOSENING = re.compile(r"(?i)\b(without (asking|approval|confirmation|checking)|
 STANDING = re.compile(r"(?i)\b(always|from now on|whenever|every (time|day|morning|week|weekday|hour)|each (day|morning|week)|automatically|by default)\b")
 
 
-def memory_loosens(t, rules):
-    """Flag a memory only when it loosens permissions or has the Bot act without approval: a loosening phrase that isn't
-    itself negated ("never skip the approval"), or a standing order to do an outside action with no approval line."""
+def memory_loosens(t, rules=None):
+    """A memory that loosens permissions: a loosening phrase that isn't itself negated ("never skip the approval").
+    Since Ken's call of Oct 10 a plain standing order ("every morning send the digest") is not enough on its own."""
     for m in LOOSENING.finditer(t):
         if not DEFEAT_NEGATED.search(t[max(0, m.start() - 20):m.start()]) and not re.search(r"(?i)\b(never|not|n't)\b[^.;]{0,30}$", t[max(0, m.start() - 40):m.start()]):
             return True
-    return bool(STANDING.search(t) and first_action(t, rules["write_verbs"]) and not has_approval(t, rules))
+    return False
+
+
+# Outside content: a memory carrying a link or address, a quoted message, an injection phrase, or words that it came from somewhere else.
+OUTSIDE_MEMORY = re.compile(r"(?i)(https?://|www\.|\b[\w.+-]+@[\w-]+\.[\w.]+|\b\d{1,3}(\.\d{1,3}){3}\b|^\s*(from|subject|to|reply-to)\s*:|"
+                            r"\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|earlier|your|the\s+above)\s+(instructions|rules)|"
+                            r"\bnew\s+instructions\b|^\s*(system|assistant)\s*:|\bon\s+behalf\s+of\b|"
+                            r"\b(per|according\s+to|from|as\s+(stated|requested)\s+in)\s+(the|an?|this|that)\s+(e-?mail|message|dm|website|web\s*page|page|post|tweet|doc|document|pdf|comment|issue|ticket|invite|attachment)\b|"
+                            r"\b(the|an?|this|that)\s+(e-?mail|message|website|page|post|tweet|doc|document|pdf|comment|issue)\s+(says|said|asks|asked|instructs|wants|told)\b|"
+                            r"@\w+\s+(says|said|wants|asked|told))", re.M)
+# Owner setup notes: a dated log line "(2026-09-10) ...", "2026-09-10: ...", a tag "[log]" / "[setup]" / "[pref]", a label
+# "Owner:", "Setup:", "Profile:", "Preference:", "Note:", a "<Name> 2026-09-25:" line, a first-person note ("I prefer ...", "My ..."),
+# or a memory record whose source says the owner or setup wrote it.
+OWNER_NOTE = re.compile(r"^\s*(\(?\d{4}-\d{2}-\d{2}\)?\s*[:\-–]?|\[(log|setup|note|pref\w*|profile|owner)\]|"
+                        r"(owner|setup|profile|preferences?|notes?|context)\s*:|[A-Z][a-z]+\s+\d{4}-\d{2}-\d{2}\s*:|(I|I'm|I am|My|We|Our)\s)", re.I)
+OWNER_SOURCES = {"owner", "user", "setup", "me", "manual"}
+OUTSIDE_SOURCES = {"email", "web", "website", "tool", "message", "dm", "document", "import", "external"}
+
+
+def owner_note(m):
+    if isinstance(m, dict):
+        src = str(m.get("source") or m.get("origin") or m.get("written_by") or "").strip().lower()
+        if src in OWNER_SOURCES:
+            return True
+        if src in OUTSIDE_SOURCES:
+            return False
+        m = str(m.get("text") or m.get("content") or m.get("memory") or "")
+    return bool(OWNER_NOTE.match(m or ""))
+
+
+def memory_flag(m, rules=None):
+    """Why a memory is a standing order worth a flag, or None. Only two reasons: it loosens permissions, or it looks like outside
+    content. A setup note the owner wrote is never flagged for looking like outside content (a link in your own note is fine).
+    A loosening line is flagged even in note form: the note marker is plain text anyone can copy."""
+    t = m if isinstance(m, str) else json.dumps(m)
+    if memory_loosens(t):
+        return "loosens permissions"
+    if not owner_note(m):
+        src = str(m.get("source") or m.get("origin") or "").strip().lower() if isinstance(m, dict) else ""
+        if src in OUTSIDE_SOURCES or OUTSIDE_MEMORY.search(t):
+            return "looks like it came from outside content"
+    return None
 
 
 def rollcall_findings(rdir):
@@ -3165,8 +3206,9 @@ def rollcall_findings(rdir):
                     continue   # a listener rule is about triggers; a remembered fact that mentions "any email" is not one
                 f["owasp"] = ["ASI06"] + [o for o in f["owasp"] if o != "ASI06"]
                 out.append(f)
-            if memory_loosens(t, rules):
-                out.append(finding("WT-M010", "Memory acts as a standing instruction", "medium", ["ASI06"], f"{where}:memory{i}", t[:150],
+            why = memory_flag(m, rules)
+            if why:
+                out.append(finding("WT-M010", "Memory acts as a standing instruction", "medium", ["ASI06"], f"{where}:memory{i}", f"{why}: {t[:130]}",
                                    "Memories steer every future run, and Auto Review doesn't check memory writes. "
                                    "If you didn't put this there on purpose, remove it in that Bot's memory settings."))
         for r in d.get("routines") or []:
