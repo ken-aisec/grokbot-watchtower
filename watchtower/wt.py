@@ -402,27 +402,105 @@ def dedupe(findings):
     return out
 
 
-SCORE_ERA = "s2"   # bump when the formula changes; older history is then hidden instead of compared
+SCORE_ERA = "s3"   # bump when the formula changes; older history is then hidden instead of compared
 SCORE_BASE = {"critical": 12, "high": 5, "medium": 1.5, "low": 0.3}   # per kind of risk
 SCORE_CAP = {"critical": 50, "high": 25, "medium": 12, "low": 3}      # per severity tier
+
+
+# v0.6.8: a false alarm is never scary. "Evidence" rules report a fact Watchtower saw (a decoy was read, an approved skill
+# changed, a provider said a key works, two engines agree, a setting is on). "Pattern" rules match wording or a key-shaped
+# string, or are one engine alone: often right, sometimes fine. A pattern finding is at most medium unless something backs it up.
+EVIDENCE_RULES = frozenset((
+    "WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C002", "WT-C003", "WT-C004", "WT-C005",
+    "WT-D001", "WT-D002", "WT-I001", "WT-I002", "WT-I003", "WT-I004",
+    "WT-K001", "WT-K002", "WT-K003", "WT-K004", "WT-K005", "WT-K006", "WT-L001", "WT-M001", "WT-P001", "WT-R010",
+    "WT-S003", "WT-S004", "WT-W001", "WT-W002", "WT-X003", "WT-X004"))
+HISTORY_SHRANK = "Shell history shrank since last check"
+CONFIRMED, MAYBE_FINE = "Confirmed", "Worth a look (might be fine)"
+PATTERN_WEIGHT = 0.2   # a pattern finding moves the score a fifth as much as the same severity of evidence
+
+
+def is_evidence(f):
+    """A key TruffleHog's provider check says works is a fact, whatever rule found the string."""
+    return (f["rule"] in EVIDENCE_RULES or (f["rule"] in ("WT-S001", "WT-S002") and f.get("title") == KEY_LIVE)
+            or (f["rule"] == "WT-H006" and f.get("title") == HISTORY_SHRANK))
+
+
+def _place(f):
+    """The file or folder a finding is about. A path loses its ":line"; a label like "rollcall:Bot:routine:name:1" keeps
+    everything but the line, so two different Bots or routines are never the same place."""
+    w = f.get("where") or ""
+    if w.startswith("/"):
+        return os.path.normpath(w.split(":")[0])
+    return re.sub(r":\d+$", "", w)
+
+
+def _covers(a, b):
+    return bool(a) and bool(b) and (a == b or b.startswith(a.rstrip("/") + "/") or a.startswith(b.rstrip("/") + "/"))
+
+
+def _skill_of(f):
+    p = _place(f)
+    return (skill_root(p) if p.startswith("/") and os.path.exists(p) else None) or p
+
+
+def corroborated(f, findings):
+    """A pattern finding is backed up when, at the same file or skill folder (one inside the other), there is
+    - an evidence finding, or
+    - a finding from a different engine (gitleaks and Watchtower's own key rule, SkillSpector and husk...), or
+    - a second, different high-or-critical pattern rule in the same skill (hidden Unicode plus an override order plus a
+      long encoded blob is not one unlucky wording match; one hit of one rule is)."""
+    here, src, skill = _place(f), f.get("source", "watchtower"), _skill_of(f)
+    loud = lambda g: (g.get("severity_was") or g["severity"]) in ("critical", "high")
+    for g in findings:
+        if g is f:
+            continue
+        if _covers(here, _place(g)) and (is_evidence(g) or g.get("source", "watchtower") != src):
+            return True
+        if loud(f) and loud(g) and g["rule"] != f["rule"] and not is_evidence(g) and _covers(skill, _skill_of(g)):
+            return True
+    return False
+
+
+def label_findings(findings):
+    """Label every finding and cap unbacked pattern findings at medium. Evidence findings are never changed."""
+    out = []
+    for f in findings:
+        f = dict(f)
+        if is_evidence(f):
+            f["class"], f["label"] = "evidence", CONFIRMED
+        elif corroborated(f, findings):
+            f["class"], f["label"] = "corroborated", CONFIRMED
+        else:
+            f["class"], f["label"] = "pattern", MAYBE_FINE
+            if f["severity"] in ("critical", "high"):
+                f["severity_was"], f["severity"] = f["severity"], "medium"
+        out.append(f)
+    return out
+
+
+def label_of(f):
+    return f.get("label") or (CONFIRMED if is_evidence(f) else MAYBE_FINE)
 
 
 def score(findings):
     """Score the kinds of risk, not the number of files. Each rule counts once at its worst severity, a little
     more when it appears many times (up to x1.5), so one finding appearing or vanishing moves the score by at most
     12 points, not 20. 300 skills with the same style issue cost about 2; one live key about 12."""
-    worst, count = {}, {}
+    worst, count, pattern_only = {}, {}, {}
     for f in findings:
         sev = f["severity"]
         if sev not in SCORE_BASE:
             continue
         r = f["rule"]
+        pattern_only[r] = pattern_only.get(r, True) and f.get("class") == "pattern"   # unlabelled findings count in full
         count[r] = count.get(r, 0) + 1
         if r not in worst or SEV_ORDER.index(sev) < SEV_ORDER.index(worst[r]):
             worst[r] = sev
     tiers = {k: 0.0 for k in SCORE_BASE}
     for r, sev in worst.items():
-        tiers[sev] += SCORE_BASE[sev] * (1 + 0.5 * min(1.0, math.log10(count[r])))
+        w = PATTERN_WEIGHT if pattern_only.get(r) else 1.0
+        tiers[sev] += w * SCORE_BASE[sev] * (1 + 0.5 * min(1.0, math.log10(count[r])))
     penalty = sum(min(SCORE_CAP[k], v) for k, v in tiers.items())
     s = max(0, 100 - round(penalty))
     grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 65 else "D" if s >= 50 else "F"
@@ -2083,6 +2161,7 @@ def run_audit_locked(args, quick):
             f["scope"] = "builtin"
         elif in_pending_plugin(f["where"]) and f["rule"] in ("WT-X001", "WT-X002", "WT-T006k") and f["severity"] == "low":
             f["severity"] = "medium"   # one scanner flagging a skill in a plugin nobody has reviewed yet is worth a look
+    fs = sort_findings(label_findings(fs))
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys, cur_keys = keys_of(prev.get("findings", [])), keys_of(live)
@@ -2145,7 +2224,7 @@ SLOW_RULES = ("WT-X001", "WT-X002", "WT-X003", "WT-S002", "WT-D001", "WT-D002")
 
 
 def compact(f):
-    return {k: f[k] for k in ("rule", "severity", "title", "where", "evidence", "fix", "owasp")}
+    return dict({k: f[k] for k in ("rule", "severity", "title", "where", "evidence", "fix", "owasp")}, label=label_of(f))
 
 
 def cmd_audit(args):
@@ -2268,7 +2347,7 @@ def cmd_show(args):
         return 2
     rows = [f for f in snap["findings"] if f["rule"] == args.rule][: args.limit]
     for f in rows:
-        print(f"{f['severity']} {f['rule']} {f['where']}\n  evidence: {f['evidence']}")
+        print(f"{f['severity']} {f['rule']} [{label_of(f)}] {f['where']}\n  evidence: {f['evidence']}")
         path, _, ln = f["where"].rpartition(":")
         if args.rule in ("WT-T011", "WT-S001", "WT-S002", "WT-S003") or not ln.isdigit():
             continue
@@ -2330,14 +2409,16 @@ def render_md(snap, hist, tag):
              f"{c['critical']} critical, {c['high']} high, {c['medium']} medium, {c['low']} low.", "",
              "## Top fixes", ""]
     for i, f in enumerate(fs[:3], 1):
-        lines.append(f"{i}. **{f['title']}** ({f['severity']}, {', '.join(f['owasp'])}) at `{f['where']}`. {f['fix']}")
+        lines.append(f"{i}. **{f['title']}** ({label_of(f)}; {f['severity']}, {', '.join(f['owasp'])}) at `{f['where']}`. {f['fix']}")
     if not fs:
         lines.append("Nothing to fix this week.")
     lines += ["", "## All open findings", "", "| Severity | Rule | Finding | Where | Evidence | OWASP |", "| --- | --- | --- | --- | --- | --- |"]
+    lines.insert(-3, f"Confirmed: something Watchtower saw happen, or two checks agree. {MAYBE_FINE}: a wording or pattern match that is often harmless.")
+    lines.insert(-3, "")
     lows = [f for f in fs if f["severity"] in ("low", "info")]
     for f in [f for f in fs if f["severity"] not in ("low", "info")]:
         ev = f["evidence"].replace("|", "\\|")
-        lines.append(f"| {f['severity']} | {f['rule']} | {f['title']} | `{f['where']}` | {ev} | {', '.join(f['owasp'])} |")
+        lines.append(f"| {f['severity']} | {f['rule']} | {label_of(f)}: {f['title']} | `{f['where']}` | {ev} | {', '.join(f['owasp'])} |")
     if lows:
         by_rule = {}
         for f in lows:
@@ -2377,7 +2458,7 @@ def render_html(snap, hist, tag):
     colors = {"critical": "#c0392b", "high": "#d35400", "medium": "#b7950b", "low": "#2e86c1", "info": "#7f8c8d"}
     rows = "".join(
         f"<tr><td><span class='sev' style='background:{colors[f['severity']]}'>{f['severity']}</span></td>"
-        f"<td>{html.escape(f['title'])}</td><td><code>{html.escape(f['where'])}</code></td>"
+        f"<td><small>{html.escape(label_of(f))}</small><br>{html.escape(f['title'])}</td><td><code>{html.escape(f['where'])}</code></td>"
         f"<td>{html.escape(', '.join(f['owasp']))}</td><td>{html.escape(f['fix'])}</td></tr>" for f in [x for x in fs if x["severity"] not in ("low", "info")][:60])
     tiles = "".join(f"<div class='tile'><b style='color:{colors[s]}'>{c[s]}</b><span>{s}</span></div>" for s in SEV_ORDER[:4])
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -2451,7 +2532,7 @@ def history_findings(rules):
         start = offsets.get(p, 0)
         if start > size:  # truncated or rotated
             start = 0
-            out.append(finding("WT-H006", "Shell history shrank since last check", "medium", ["ASI10"], p,
+            out.append(finding("WT-H006", HISTORY_SHRANK, "medium", ["ASI10"], p,
                                f"{offsets.get(p)} → {size} bytes", "Something cleared or rotated the history. Confirm it was you."))
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             f.seek(start)
@@ -3581,7 +3662,7 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
 
     def todo_item(i, t):
         links = "".join(f"<a class='btn' href='{safe(u)}' target='_blank' rel='noopener'>Turn off {e(n)} keys</a>" for n, u in t.get("links", []))
-        return (f"<li class='sev-{t['severity']}'><div class='tt'><b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}"
+        return (f"<li class='sev-{t['severity']}'><div class='tt'><small>{e(t.get('label', ''))}</small> <b>{e(t['title'])}</b>{(' <span class=n>×' + str(t['count']) + '</span>') if t['count'] > 1 else ''}"
                 f"<span class='hd h-{t.get('handled', 'Only you').split()[0].lower()}'>{e(t.get('handled', ''))}</span></div>"
                 f"<p>{e(t['why'])} <span class='how'>{e(t['how'])}</span></p>{('<div class=links>' + links + '</div>') if links else ''}{rows_table(t)}</li>")
 
@@ -3810,8 +3891,8 @@ PLAIN_BY_TITLE = {
 def plain(f):
     t = PLAIN_BY_TITLE.get(f["title"]) or PLAIN.get(f["rule"])
     if t:
-        return {"title": t[0], "why": t[1], "how": t[2], "who": t[3]}
-    return {"title": f["title"], "why": "", "how": f["fix"], "who": "you"}
+        return {"title": t[0], "why": t[1], "how": t[2], "who": t[3], "label": label_of(f)}
+    return {"title": f["title"], "why": "", "how": f["fix"], "who": "you", "label": label_of(f)}
 
 
 def revoke_targets(findings):
@@ -4033,6 +4114,7 @@ def needs_you(findings, limit=None):
     for g in items:
         cls = {fix_class(f) for f in g["findings"]}
         g["handled"] = "Only you" if "only_you" in cls else ("One yes" if cls & {"decision", "revet"} else "Fix handles it")
+        g["label"] = CONFIRMED if any(label_of(f) == CONFIRMED for f in g["findings"]) else MAYBE_FINE
         g["rules"] = sorted(g["rules"])
         g["rows"] = [item_row(f, key_files) for f in sorted(g.pop("findings"), key=lambda f: SEV_ORDER.index(f["severity"]))]
         if g["title"] == "Keys that still work are sitting in files" and live:
