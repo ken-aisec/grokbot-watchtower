@@ -846,6 +846,19 @@ class MainBoxLessons(Box):
         self.assertEqual([t for t in clean if flagged(t)], [])
         self.assertEqual([t for t in bad if not flagged(t)], [])
 
+    def test_an_action_word_late_in_a_negated_list_is_negated(self):
+        """Second account's roll-call: the last item of a "never ..." list was read as an order. Also "Don't"/"Don\u2019t" lists."""
+        rules = wt.load_rules()
+        high = lambda t: [f for f in wt.scan_text(t, "r", rules, kind="routine") if f["rule"] == "WT-T013" and f["severity"] == "high"]
+        for t in ("Never change calendar, RSVP, or send; offer drafts", "Do not change the calendar, RSVP or send anything",
+                  "Don't change the calendar, RSVP, or send anything", "Don\u2019t change the calendar, RSVP or send anything"):
+            self.assertEqual(high(t), [], t)
+        self.assertTrue(wt.has_approval("Never send, change calendar or RSVP", rules))
+        self.assertEqual(high("Never send, change calendar or RSVP"), [])
+        for t in ("Never change calendar, RSVP, or send; then send the digest to the client.",
+                  "Never change the calendar. Send the digest to the client every morning.", "Send the digest to the client every morning."):
+            self.assertTrue(high(t), t)                                         # a send outside the negated list is still judged on its own
+
     def own_rooms(self, *names):
         d = os.path.join(os.environ["WATCHTOWER_HOME"], "exports"); os.makedirs(d, exist_ok=True)
         open(os.path.join(d, "rooms.txt"), "w").write("".join(f"{n} room\n" for n in names))

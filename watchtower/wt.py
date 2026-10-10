@@ -270,8 +270,8 @@ STRONG_VERBS = re.compile(r"(?i)\b(send|sends|sending|publish|publishes|purchase
 NEGATION = re.compile(r"(?i)(don'?t|do\s+not|never|no\s+need\s+to|without|\bno)\s+$")
 
 
-NEGATED_VERB = re.compile(r"(?i)\b((never|not|n't|cannot|without|no\s+longer|nor)\s+(\w+\s+){0,2}|no\s+(\w+\s+)?)$")   # "No sends", "no outbound sends"
-NEGATED_LIST = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor)\s+\w+(\s*,\s*\w+){0,6}\s*,?\s*(or|and|nor)?\s+$")
+NEGATED_VERB = re.compile(r"(?i)\b((never|not|\w+n't|cannot|without|no\s+longer|nor)\s+(\w+\s+){0,2}|no\s+(\w+\s+)?)$")   # "No sends", "no outbound sends"
+NEGATED_LIST = re.compile(r"(?i)\b(never|not|\w+n't|cannot|without|nor)\s+\w+(\s*,\s*\w+){0,6}\s*,?\s*(or|and|nor)?\s+$")
 # "X posts", "the top posts", "3 invites": the thing, not the act.
 NOUN_BEFORE = re.compile(r"(?i)\b(x|twitter|linkedin|blog|social|forum|reddit|outreach|draft|drafts|drafted|of|the|a|an|each|every|this|that|"
                          r"these|those|their|your|my|new|top|recent|latest|all|any|\d+)\s+$")
@@ -317,7 +317,7 @@ def approval_defeated(text, start):
     m = APPROVAL_DEFEATED.search(before)
     return bool(m) and not DEFEAT_NEGATED.search(before[:m.start()])
 SCOPE_BREAK = re.compile(r"(?i)\b(and|but|then|instead|except|unless|so|just)\b")
-NEGATOR = re.compile(r"(?i)\b(never|not|n't|cannot|without|nor|no)\b")
+NEGATOR = re.compile(r"(?i)\b(never|not|\w+n't|cannot|without|nor|no)\b")
 
 
 def in_negated_list(before, after):
@@ -352,7 +352,7 @@ def first_action(text, rx):
     for m in rx.finditer(text):
         if text[m.end():m.end() + 1] == "-" or text[max(0, m.start() - 1):m.start()] == "-":
             continue                                                                                        # "post-call", "re-send" as a label
-        before = re.sub(r"[*_`]", "", re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1])   # **never** is still never
+        before = re.sub(r"[*_`]", "", re.split(r"[.;:!?\n]", text[max(0, m.start() - 80):m.start()])[-1]).replace("\u2019", "'")   # **never** is still never; Don’t is don't
         after = text[m.end():m.end() + 80]
         bare = re.match(r"(?i)^(\s+\w+)?\s*(,|\bor\b|\bnor\b|\band\b|[.;:!?)\n]|$)", after)   # "post, or publish anything." but not "send it now"
         if NEGATED_VERB.search(before) or (NEGATED_LIST.search(before) and bare) or OWNER_BEFORE.search(before) or in_negated_list(before, after):
