@@ -413,7 +413,9 @@ SCORE_CAP = {"critical": 50, "high": 25, "medium": 12, "low": 3}      # per seve
 EVIDENCE_RULES = frozenset((
     "WT-A001", "WT-A002", "WT-A003", "WT-A004", "WT-A005", "WT-C001", "WT-C002", "WT-C003", "WT-C004", "WT-C005",
     "WT-D001", "WT-D002", "WT-I001", "WT-I002", "WT-I003", "WT-I004",
-    "WT-K001", "WT-K002", "WT-K003", "WT-K004", "WT-K005", "WT-K006", "WT-L001", "WT-M001", "WT-P001", "WT-R010",
+    # Shell history: commands that actually ran on this computer, not wording (Ken, 2026-10-10). H007 is a file-mode fact.
+    "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H007", "WT-H008", "WT-H009",
+    "WT-K001", "WT-K002", "WT-K003", "WT-K004", "WT-K005", "WT-K006", "WT-M001", "WT-P001", "WT-R010",
     "WT-S003", "WT-S004", "WT-W001", "WT-W002", "WT-X003", "WT-X004"))
 HISTORY_SHRANK = "Shell history shrank since last check"
 CONFIRMED, MAYBE_FINE = "Confirmed", "Worth a look (might be fine)"
@@ -422,8 +424,7 @@ PATTERN_WEIGHT = 0.2   # a pattern finding moves the score a fifth as much as th
 
 def is_evidence(f):
     """A key TruffleHog's provider check says works is a fact, whatever rule found the string."""
-    return (f["rule"] in EVIDENCE_RULES or (f["rule"] in ("WT-S001", "WT-S002") and f.get("title") == KEY_LIVE)
-            or (f["rule"] == "WT-H006" and f.get("title") == HISTORY_SHRANK))
+    return f["rule"] in EVIDENCE_RULES or (f["rule"] in ("WT-S001", "WT-S002") and f.get("title") == KEY_LIVE)
 
 
 def _place(f):

@@ -31,6 +31,16 @@ class QuietFalseAlarms(unittest.TestCase):
                    [F("WT-X003", "critical", self.skill), F("WT-C003", "high", "settings")]):
             self.assertEqual(wt.score(wt.label_findings(fs)), wt.score(fs))   # unlabelled findings count in full, as before v0.6.8
 
+    def test_ken_calls_of_oct_10(self):
+        """Shell-history hits are commands that ran: evidence, so a reverse shell stays critical. H007 is evidence; L001 is pattern."""
+        for r in ("WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H007", "WT-H008", "WT-H009"):
+            self.assertIn(r, wt.EVIDENCE_RULES, r)
+        out = wt.label_findings([F("WT-H003", "critical", "/home/box/.bash_history:12"), F("WT-H002", "critical", "/home/box/.bash_history:40")])
+        self.assertEqual([(f["severity"], f["label"]) for f in out], [("critical", wt.CONFIRMED)] * 2)
+        self.assertNotIn("WT-L001", wt.EVIDENCE_RULES)
+        l1 = wt.label_findings([F("WT-L001", "high", "rollcall:Harbor")])[0]
+        self.assertEqual((l1["severity"], l1["label"]), ("medium", wt.MAYBE_FINE))
+
     def test_a_lone_pattern_finding_is_capped_at_medium(self):
         out = wt.label_findings([F("WT-T013", "high", "rollcall:Bot:routine:x"), F("WT-T005", "critical", f"{self.md}:3"),
                                  F("WT-S002", "high", "/ws/notes.txt", source="gitleaks"), F("WT-X001", "high", "/ws/other", source="skillspector")])
@@ -58,7 +68,7 @@ class QuietFalseAlarms(unittest.TestCase):
     def test_roll_call_findings_only_back_up_their_own_bot_line(self):
         out = wt.label_findings([F("WT-T013", "high", "rollcall:Alpha:routine:Brief:1"), F("WT-L001", "high", "rollcall:Alpha"),
                                  F("WT-M010", "medium", "rollcall:Bravo:memory1"), F("WT-T013", "high", "rollcall:Bravo:routine:Digest:1")])
-        self.assertEqual([f["class"] for f in out], ["pattern", "evidence", "pattern", "pattern"])
+        self.assertEqual([f["class"] for f in out], ["pattern", "pattern", "pattern", "pattern"])   # L001 is a pattern since Ken's call of Oct 10
         self.assertEqual(out[0]["severity"], "medium")
 
     def test_pattern_findings_weigh_a_fifth(self):
