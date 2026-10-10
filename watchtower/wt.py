@@ -514,6 +514,20 @@ def label_findings(findings, covered=None):
     return out
 
 
+def open_counts(fs):
+    """Worth-a-look and Tip counts, shown next to the score everywhere so a perfect score never hides open items."""
+    fs = fs or []
+    return sum(1 for f in fs if f.get("class") == "pattern"), sum(1 for f in fs if f.get("class") == "tip")
+
+
+def score_line(snap):
+    """'100 · 7 worth a look · 3 tips'"""
+    if not snap or snap.get("score") is None:
+        return "–"
+    look, tips = open_counts(snap.get("findings"))
+    return f"{snap['score']} · {look} worth a look · {tips} tip{'' if tips == 1 else 's'}"
+
+
 def label_of(f):
     return f.get("label") or (CONFIRMED if is_evidence(f) else MAYBE_FINE)
 
@@ -2266,7 +2280,7 @@ def cmd_audit(args):
     except Busy:
         print("ERROR another Watchtower run has been going for 15 minutes; try again when it finishes (`wt.py status`)", file=sys.stderr)
         return 2
-    out = {"score": snap["score"], "grade": snap["grade"], "new": [compact(f) for f in new][:20],
+    out = {"score": snap["score"], "score_line": score_line(snap), "grade": snap["grade"], "new": [compact(f) for f in new][:20],
            "fixed": [compact(f) for f in fixed][:10], "open_by_severity": by_sev(snap["findings"]),
            "top_fixes": [compact(f) for f in snap["findings"][:3]], "notes": snap["notes"], "inventory": snap["inventory"]}
     out.update(score_change(snap, new))
@@ -2330,7 +2344,7 @@ def cmd_daily(args):
     if not new and not fixed:
         print("NO_CHANGES")
         return 0
-    out = {"score": snap["score"]}
+    out = {"score": snap["score"], "score_line": score_line(snap)}
     out.update(score_change(snap, new))
     decoys = [compact(f) for f in new if f["rule"].startswith("WT-K")]
     if decoys:
@@ -2384,6 +2398,7 @@ def cmd_show(args):
     if not snap:
         print("ERROR no audit yet", file=sys.stderr)
         return 2
+    print(f"score {score_line(snap)}")
     rows = [f for f in snap["findings"] if f["rule"] == args.rule][: args.limit]
     for f in rows:
         print(f"{f['severity']} {f['rule']} [{label_of(f)}] {f['where']}\n  evidence: {f['evidence']}")
@@ -2444,7 +2459,7 @@ def render_md(snap, hist, tag):
     fs = snap["findings"]
     c = by_sev(fs)
     lines = [f"# Watchtower report {tag}", "",
-             f"Score {snap['score']}/100 (grade {snap['grade']}), {trend(hist)}. Open findings: "
+             f"Score {score_line(snap)} (grade {snap['grade']}), {trend(hist)}. Open findings: "
              f"{c['critical']} critical, {c['high']} high, {c['medium']} medium, {c['low']} low.", "",
              "## Top fixes", ""]
     for i, f in enumerate(fs[:3], 1):
@@ -2531,7 +2546,7 @@ h1{{font-size:20px;margin:0 0 4px}}.mut{{color:var(--mut)}}.row{{display:flex;ga
 table{{border-collapse:collapse;width:100%;font-size:13px}}td,th{{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}}
 .sev{{color:#fff;border-radius:4px;padding:2px 6px;font-size:11px;text-transform:uppercase}}.wrap{{overflow-x:auto}}code{{font-size:12px}}
 </style></head><body><h1>Watchtower · {tag}</h1><div class='mut'>Generated {html.escape(snap['at'])} · read-only audit of this Grok Bot computer</div>
-<div class='row'><div class='card'><div class='mut'>Posture score</div><div class='big'>{snap['score']}<span class='mut' style='font-size:18px'>/100 · {snap['grade']}</span></div><div class='mut'>{trend(hist)}</div></div>
+<div class='row'><div class='card'><div class='mut'>Posture score</div><div class='big'>{snap['score']}<span class='mut' style='font-size:18px'>/100 · {snap['grade']}</span></div><div class='mut'>{html.escape(score_line(snap))}</div><div class='mut'>{trend(hist)}</div></div>
 <div class='card'><div class='mut'>Score, last {len(pts)} runs</div><svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' role='img' aria-label='score trend'><polyline fill='none' stroke='#2e86c1' stroke-width='2' points='{poly}'/></svg></div>
 {tiles}</div><h2 style='font-size:16px'>Open findings</h2><div class='wrap'><table><tr><th>Severity</th><th>Finding</th><th>Where</th><th>OWASP</th><th>Fix</th></tr>{rows or "<tr><td colspan=5>Nothing open.</td></tr>"}</table></div>
 {extra_sections(fs)}
@@ -3835,7 +3850,7 @@ def render_brief(b, snap, pkg, hist, tag, analyst_note=None, notes=None):
         cls = "q" if why_changed else ("up" if delta > 0 else "down")
         delta_txt = f"<span class='{cls}'>{'▲' if delta > 0 else '▼'} {abs(delta)} since last check{e(why_changed)}</span>"
     dots = "".join(f"<i class='{'on' if i <= lvl_i else ''} l{lvl_i}'></i>" for i in range(5))
-    metrics = (f"<div class='m'><span class='k'>Security score</span><b>{e(str(score)) if score is not None else '–'}</b><span class='s'>{e(grade)} {delta_txt}</span></div>"
+    metrics = (f"<div class='m'><span class='k'>Security score</span><b>{e(str(score)) if score is not None else '–'}</b><span class='s'>{e(grade)} {delta_txt}</span><span class='s'>{e(score_line(snap))}</span></div>"
                f"<div class='m'><span class='k'>Threat level</span><b class='lv l{lvl_i}'>{e(lvl)}</b><span class='dots'>{dots}</span></div>"
                f"<div class='m'><span class='k'>Needs you</span><b>{len(urgent)}</b><span class='s'>{len(todo) - len(urgent)} smaller {'item' if len(todo) - len(urgent) == 1 else 'items'}</span></div>"
                f"<div class='m'><span class='k'>Handled this week</span><b>{fixed + cleaned}</b><span class='s'>fixed or cleaned up</span></div>")
@@ -3999,7 +4014,7 @@ def cmd_brief(args):
     save_json(state_path("last_brief.json"), dict(b, tag=tag, path=path))
     ledger({"event": "brief", "week": tag, "research": len(b["research"]), "kev": len(b["kev"])})
     top, _ = split_stories(b)
-    print(fit({"brief": path, "threat_level": threat_level(b, snap, top)[1],
+    print(fit({"brief": path, "threat_level": threat_level(b, snap, top)[1], "score_line": score_line(snap),
                "top_stories": [{"id": r["id"], "tier": r["tier"], "category": r["category_label"], "title": r["title"],
                                 "cves": r.get("cves", []), "source": r["source"]} for r in top],
                "kev_relevant": [f"{k['cve']} {k['vendor']} {k['product']}" for k in b["kev"] if k["relevant"]][:6],
@@ -5318,7 +5333,7 @@ def cmd_doctor(args):
            "tools": {t: bool(shutil.which(t)) for t in ("git", "curl", "npm", "pip3")},
            "state_files": {fn: state_of(fn) for fn in STATE_FILES},
            "run_in_progress": bool(lock),
-           "last_run": {"at": snap.get("at"), "version": snap.get("version"), "score": snap.get("score"), "open_by_severity": by_sev(snap.get("findings", [])) if snap else None,
+           "last_run": {"at": snap.get("at"), "version": snap.get("version"), "score": snap.get("score"), "score_line": score_line(snap), "open_by_severity": by_sev(snap.get("findings", [])) if snap else None,
                         "inventory": snap.get("inventory"), "scanners_missing": snap.get("scanners_missing"), "stages_skipped": snap.get("stages_skipped"),
                         "notes": [re.sub(r"(/[\w.@~-]+){2,}", "<path>", n)[:160] for n in snap.get("notes", [])][:12]},
            "seconds_per_stage": load_json(state_path("stage_times.json"), None), "last_engine_run": load_json(state_path("engines.json"), None),

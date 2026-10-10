@@ -72,3 +72,23 @@ class AskFirstCovers(Base):
         post = F("WT-T013", "high", "export:routine-y.md:1", ev="publish")
         self.assertEqual(wt.label_findings([post, gaps], wt.ask_first_covered([gaps]))[0]["class"], "tip")
         self.assertEqual(wt.ask_first_covered([F("WT-A003", "medium", "x", ev=", ".join(sorted(ALL_AREAS)))]), set())
+
+
+class ScoreShowsCounts(Base):
+    def test_the_score_always_carries_the_worth_a_look_and_tip_counts(self):
+        fs = wt.label_findings([F("WT-T013", "high", "rollcall:B:routine:r:1"), F("WT-T005", "critical", "/ws/a/SKILL.md:3"),
+                                F("WT-R002", "medium", "export:routine-a.md")])
+        snap = {"score": 100, "grade": "A", "findings": fs, "at": "2026-10-10T07:00:00", "previous_score": None, "version": wt.VERSION}
+        self.assertEqual(wt.score(fs)[0], 100)
+        self.assertEqual(wt.score_line(snap), "100 · 2 worth a look · 1 tip")
+        self.assertIn("Score 100 · 2 worth a look · 1 tip", wt.render_md(snap, [], "t"))
+        self.assertIn("100 · 2 worth a look · 1 tip", wt.render_html(snap, [], "t"))
+        os.makedirs(os.path.join(os.environ["WATCHTOWER_HOME"], "state"), exist_ok=True)
+        wt.save_json(wt.state_path("last_findings.json"), snap)
+        code, out, _ = self.run_wt("show", "WT-T013")
+        self.assertIn("score 100 · 2 worth a look · 1 tip", out)
+        src = open(wt.__file__).read()
+        for where in ('"score_line": score_line(snap), "grade"', '{"score": snap["score"], "score_line": score_line(snap)}',
+                      '"brief": path, "threat_level": threat_level(b, snap, top)[1], "score_line"', "{e(score_line(snap))}",
+                      '"score": snap.get("score"), "score_line": score_line(snap)'):
+            self.assertIn(where, src)   # audit, daily, brief (chat and page), doctor
