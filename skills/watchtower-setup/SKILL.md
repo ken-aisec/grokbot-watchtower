@@ -10,13 +10,13 @@ The owner's first yes covers everything in sections 1 to 4: the install, the six
 Say once, up front: "Setup only writes inside /workspace/watchtower, plus three decoy files in /tmp and /var/tmp."
 
 ## 1. Install the pinned release
-Skip this section if `/workspace/watchtower/app/watchtower/wt.py` already exists and `wt.py --version` prints 0.6.7.
+Skip this section if `/workspace/watchtower/app/watchtower/wt.py` already exists and `wt.py --version` prints 0.6.8.
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
-curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.7/scripts/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ken-aisec/grokbot-watchtower/v0.6.8/scripts/install.sh
 head -30 install.sh
 ```
-Show the user those 30 lines (they are everything that runs), then run `bash install.sh v0.6.7`, adding the commit ID if your Setup check memory gives one. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED or COMMIT CHECK FAILED, stop and report it.
+Show the user those 30 lines (they are everything that runs), then run `bash install.sh v0.6.8`, adding the commit ID if your Setup check memory gives one. Watchtower never pipes a script into a shell, and neither should anything it vets. If it prints MANIFEST CHECK FAILED or COMMIT CHECK FAILED, stop and report it.
 
 Your skills are the SKILL.md files under `/workspace/watchtower/app/skills/`. Don't copy them anywhere; read them from there, so they always match the installed release. They are not slash commands: the owner asks in plain words.
 

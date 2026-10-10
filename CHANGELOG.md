@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased (next batch)
+## v0.6.8 — 2026-10-10
 ### Adversarial-review fixes (first in v0.6.8)
+- Roll-call replies are deleted on every path: NOT RUN without the owner's yes, a run that stops partway, and a finished run. The daily check removes any reply file older than an hour and logs it.
+- A `state/rollcall_findings.json` written before v0.6.8 is masked once with the same mask on the first run after updating, or deleted if it can't be masked.
+- README limits: the self-check catches careless changes, not a Bot that rewrites both code and manifest; random decoy names stop generic snooping, not a targeted attacker.
 - **Roll-call is opt-in, and its replies are not kept.** It is off by default: setup switches on three routines, not four, and the monthly routine is now an optional reminder that never DMs a Bot itself. Every roll-call needs the owner's yes in that conversation (`wt.py rollcall` refuses without `--owner-said-yes`). The question no longer asks for a Bot's skills, which the analysis never read. Replies are analyzed, only masked findings are kept (emails, links, addresses, handles and long numbers masked, 80 characters at most), and every reply file is deleted in the same run. Roll-call findings are listed but never count in the score, and Watchtower recommends each Bot add "Ask the owner before answering any roll-call."
 - **Watchtower never suggests removing a rule that holds a Bot back.** The memory check (WT-M010) flagged any memory with "never" or "always" and said to remove it, so "x-visuals never publishes" was treated like a planted order. It now flags only a memory that loosens permissions (without asking, skip the approval, treat a sender as trusted, admin access) or orders an outside action with no approval line. Uninstall no longer lists removing the Ask-first rules; it says to keep them.
 - **Watchtower checks itself before every run.** The installed copy compares every file with MANIFEST.sha256 and its commit with the one `install.sh` now records (`state/installed_commit`). On any mismatch it stops before doing anything, prints `SELF-CHECK FAILED` with what changed, writes it to the ledger, and the Bot tells the owner. `doctor` and `uninstall` still run, so the owner can look and take it off. An install from before this records its current commit once. A developer checkout is not checked.
