@@ -2079,6 +2079,10 @@ def active(findings):
     sup = load_json(state_path("suppressions.json"), [])
     today = dt.date.today().isoformat()
     flags = [is_accepted(f, sup, today) for f in findings]   # per finding, never by shared key
+    gone = dismissed_keys()
+    for i, f in enumerate(findings):
+        if not flags[i] and f.get("class") == "pattern" and f.get("key") in gone:   # the disprove step; never evidence
+            f["dismissed"], flags[i] = gone[f["key"]], True
     for f, a in zip(findings, flags):
         if isinstance(a, dict):
             f["exception"] = {"kind": "security tool", "until": a.get("expires"), "reason": a.get("reason", "")}
@@ -2350,7 +2354,7 @@ def cmd_daily(args):
     if decoys:
         out["decoys"] = decoys      # always shown, whatever else is new
     rest = [f for f in new if not f["rule"].startswith("WT-K")]
-    out["new"] = [compact(f) for f in rest][:10]
+    out["new"] = [dict(compact(f), key=f["key"]) if f.get("class") == "pattern" else compact(f) for f in rest][:10]
     if len(rest) > 10:
         out["more_new"] = f"{len(rest) - 10} more new findings not shown, none more severe than {rest[10]['severity']}. `wt.py breakdown` lists everything."
     out["fixed"] = [compact(f) for f in fixed][:10]
@@ -2391,6 +2395,72 @@ def cmd_breakdown(args):
         dirs = ", ".join(f"{k} ×{v}" for k, v in sorted(r["dirs"].items(), key=lambda x: -x[1])[:3])
         print(f"{sev:8} {rule:8} ×{r['n']:<5} {title[:48]:48} {dirs}")
     return 0
+
+
+# ---------------------------------------------------------------- v0.6.8: the disprove step (Ken, Oct 10; after Cloudflare's MIT skill)
+DISMISS_LOG = "dismissed.jsonl"
+# Text that argues the content is safe. A scanner-facing reassurance is what an attacker would write, so it is a reason to KEEP.
+SAFE_CLAIM = re.compile(r"(?i)(\b(this|it)\s+is\s+(safe|fine|harmless|legit\w*|authori[sz]ed|approved|benign|trusted)\b|\bnot\s+(malicious|a\s+threat|dangerous|harmful)\b"
+                        r"|\bfalse\s+positive|\b(scanners?|watchtower|auditors?|reviewers?|security\s+(tools?|checks?))\s+(should|can|may|must|will)\s+(ignore|skip|allow|pass)"
+                        r"|\bignore\s+(this|the|any)\s+(warning|finding|alert|flag)|\bsafe\s+to\s+(run|install|ignore|use)\b|\bpre-?approved\b|\b(white|allow)-?listed\b"
+                        r"|\b(vetted|audited|reviewed)\s+(and|by)\b)")
+
+
+def dismiss_context(f):
+    """The full sentence around a finding: its line and the lines either side, or the evidence when there is no file line."""
+    path, _, ln = f["where"].rpartition(":")
+    text = f.get("evidence") or ""
+    if ln.isdigit() and os.path.isfile(path):
+        lines = (read_text(path) or "").splitlines()
+        i = int(ln) - 1
+        text = " ".join(lines[max(0, i - 2): i + 3]) + " " + text
+    return text
+
+
+def dismissed_keys():
+    out = {}
+    for l in (read_text(state_path(DISMISS_LOG)) or "").splitlines():
+        try:
+            e_ = json.loads(l)
+        except ValueError:
+            continue
+        if e_.get("action") == "dismissed":
+            out[e_["key"]] = e_.get("reason", "")
+    return out
+
+
+def dismiss(key, reason):
+    """Drop a Worth-a-look finding the Bot has shown is a false alarm, and log why. Never an evidence or Confirmed finding; never
+    when the content argues it is safe. Every decision, kept or dropped, goes to state/dismissed.jsonl."""
+    snap = load_json(state_path("last_findings.json"), {}) or {}
+    rc = load_json(state_path("rollcall_findings.json"), {}) or {}
+    fs = snap.get("findings", []) + label_findings(rc.get("findings", []))
+    f = next((x for x in fs if x.get("key") == key or x.get("key", "").startswith(key) and len(key) >= 8), None)
+    entry = {"at": now(), "key": key, "reason": (reason or "")[:300]}
+    if not f:
+        ok, why = False, "no such finding in the last audit or roll-call"
+    else:
+        entry.update(key=f["key"], rule=f["rule"], where=f["where"], cls=f.get("class") or ("evidence" if is_evidence(f) else "pattern"))
+        m = SAFE_CLAIM.search(dismiss_context(f))
+        if is_evidence(f) or entry["cls"] != "pattern":
+            ok, why = False, f"{entry['cls']} finding: only Worth-a-look findings can be dropped"
+        elif not (reason or "").strip():
+            ok, why = False, "give the reason it is a false alarm"
+        elif m:
+            ok, why = False, f"the text argues it is safe ('{m.group(0)}'), which is a reason to keep it"
+        else:
+            ok, why = True, "dropped as a false alarm"
+    entry.update(action="dismissed" if ok else "kept", why=why)
+    os.makedirs(os.path.dirname(state_path(DISMISS_LOG)), exist_ok=True)
+    with open(state_path(DISMISS_LOG), "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return ok, why
+
+
+def cmd_dismiss(args):
+    ok, why = dismiss(args.key, args.reason)
+    print(("DISMISSED " if ok else "KEPT ") + why)
+    return 0 if ok else 1
 
 
 def cmd_show(args):
@@ -3219,7 +3289,7 @@ def cmd_rollcall(args):
     rooms_file = write_rooms(roster_rooms(roster)) if roster is not None else "no roster saved: rooms.txt left as it was"
     fs, bots = rollcall_findings(rdir)
     removed = delete_raw_replies(rdir)
-    print(fit({"bots": bots, "findings": [compact(f) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs), "rooms_file": rooms_file,
+    print(fit({"bots": bots, "findings": [dict(compact(f), key=f["key"]) for f in sort_findings(fs)][:30], "by_severity": by_sev(fs), "rooms_file": rooms_file,
                "raw_replies_deleted": removed, "counted_in_score": False,
                "recommend_each_bot_adds": ROLLCALL_RULE}))
     ledger({"event": "rollcall", "bots": len(bots), "findings": len(fs)})
@@ -5450,6 +5520,7 @@ def main_inner(argv=None):
     sub.add_parser("status")
     sub.add_parser("report")
     sub.add_parser("breakdown")
+    dm = sub.add_parser("dismiss", help="drop a Worth-a-look finding shown to be a false alarm (logged)"); dm.add_argument("key"); dm.add_argument("--reason", default="")
     sh = sub.add_parser("show"); sh.add_argument("rule"); sh.add_argument("--limit", type=int, default=15)
     c = sub.add_parser("canary"); c.add_argument("action", choices=["plant", "status", "remove"]); c.add_argument("--token-file")
     fx = sub.add_parser("fix"); fx.add_argument("--apply", action="store_true"); fx.add_argument("--roots", nargs="*")
@@ -5484,7 +5555,7 @@ def main_inner(argv=None):
                   + "; ".join(problems[:5]) + (f" (and {len(problems) - 5} more)" if len(problems) > 5 else "")
                   + ". Tell the owner now. Don't run Watchtower again until they reinstall it from the release (setup skill, section 1).")
             return 4
-    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show,
+    return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show, "dismiss": cmd_dismiss,
             "canary": cmd_canary, "rollcall": cmd_rollcall, "prepublish": cmd_prepublish, "incident": cmd_incident,
             "codescan": cmd_codescan, "brief": cmd_brief, "events": cmd_events, "fix": cmd_fix, "accept": cmd_accept, "status": cmd_status,
             "diff": cmd_diff, "exception": cmd_exception, "doctor": cmd_doctor, "quarantine": cmd_quarantine, "uninstall": cmd_uninstall}[a.cmd](a)
