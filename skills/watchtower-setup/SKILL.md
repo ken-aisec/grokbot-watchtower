@@ -1,11 +1,11 @@
 ---
 name: watchtower-setup
-description: First-run setup for Watchtower. After the owner's one yes it installs the pinned, checksummed scripts and scanners into /workspace/watchtower, takes a baseline, plants three decoy files, runs the first audit, switches on the four routines and builds the first report. Use once after adding the template, when the scripts are missing, or to update Watchtower.
+description: First-run setup for Watchtower. After the owner's one yes it installs the pinned, checksummed scripts and scanners into /workspace/watchtower, takes a baseline, plants three decoy files, runs the first audit, switches on the three routines and builds the first report. Use once after adding the template, when the scripts are missing, or to update Watchtower.
 ---
 
 # Watchtower setup (about 7 minutes, one yes)
 
-The owner's first yes covers everything in sections 1 to 4: the install, the six scanners, the three decoys and the four routines. Your first message listed all of it. Do not ask again for any of those; work through them and post a short progress line every minute or two. If the owner left something out ("no decoys", "no routines"), skip that part and say so at the end.
+The owner's first yes covers everything in sections 1 to 4: the install, the six scanners, the three decoys and the three routines. Your first message listed all of it. Do not ask again for any of those; work through them and post a short progress line every minute or two. If the owner left something out ("no decoys", "no routines"), skip that part and say so at the end.
 
 Say once, up front: "Setup only writes inside /workspace/watchtower, plus the three decoy files I named."
 
@@ -29,7 +29,7 @@ Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`. Each tool in
 3. `wt.py audit`. Summarize in five lines: score, counts by severity, the top three fixes.
 
 ## 4. Routines
-The four routines usually arrive with the template, paused: daily watch (06:00), weekly audit and report (Sunday 05:00), weekly tidy (Sunday 06:00), monthly roll-call (the 1st, 05:30), in the account's time zone. Don't ask about the time zone. Switch all four on, or tell the user to flip the four switches under your Details tab if you can't. If a routine is missing, create it from the matching file in `/workspace/watchtower/app/routines/`.
+The routines usually arrive with the template, paused: daily watch (06:00), weekly audit and report (Sunday 05:00), weekly tidy (Sunday 06:00), in the account's time zone. Don't ask about the time zone. Switch those three on, or tell the user to flip the three switches under your Details tab if you can't. The monthly roll-call reminder stays off: roll-call is opt-in, and it is switched on only if the owner asks for it. If a routine is missing, create it from the matching file in `/workspace/watchtower/app/routines/`.
 
 ## 5. Tune it (the second and last question)
 A first audit always includes things the user installed on purpose. Read `/workspace/watchtower/app/skills/watchtower-fix/SKILL.md` and follow it exactly: one message, one yes. After the yes, give the tuned score and say this is the starting line the weekly report compares against.
@@ -47,7 +47,7 @@ Once they say the rules are in, save the same three lines, each starting with `A
 2. `wt.py report` (builds `/workspace/watchtower/reports/dashboard.html`).
 3. Run the Validate checks below. Setup is not finished until they pass; if one fails, say which.
 
-End with one message: what is on, the score, how many minutes it took, and the one or two things only the owner can do (usually the Ask-first rules and signing out of sites in the Bot browser; say plainly that the score stays where it is until they do). Then offer once: "Want a roll-call? It sends each of your other Bots one fixed question about its routines and memories."
+End with one message: what is on, the score, how many minutes it took, and the one or two things only the owner can do (usually the Ask-first rules and signing out of sites in the Bot browser; say plainly that the score stays where it is until they do). Then offer once: "Want a roll-call? It sends each of your other Bots one fixed question about its routines and memories. The replies are analyzed and deleted, and it doesn't change the score." Run it only on their yes, following the roll-call skill.
 
 ## If anything goes wrong
 Watchtower prints one plain line starting with ERROR, never a stack trace. Run `wt.py doctor --save` and tell the user where the file is: it has no file contents, keys or skill names, and they can send it to the template's author.

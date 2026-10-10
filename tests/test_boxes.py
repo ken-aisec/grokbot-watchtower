@@ -1177,8 +1177,9 @@ class MainBoxLessons(Box):
         json.dump({"name": "Kestrel", "description": "Outreach drafts.", "routines": [{"name": "Growth after-action", "schedule": "daily",
                    "instructions": "Post to Growth room only when material; escalate to Harbor only for real lessons/blockers; otherwise soft-quiet and log to memory."}],
                    "connectors": [], "memories": []}, open(os.path.join(rdir, "kestrel.json"), "w"))
+        reply = open(os.path.join(rdir, "kestrel.json")).read()                  # a roll-call deletes the replies it read, so keep a copy to send again
         flagged = lambda: [f for f in self.snap_rollcall() if f["rule"] == "WT-T013"]
-        code, o, _ = self.run_cmd("rollcall")
+        code, o, _ = self.run_cmd("rollcall", "--owner-said-yes")
         self.assertIn("left as it was", json.loads(o)["rooms_file"])
         self.assertEqual(len(flagged()), 1)                                       # no roster, no room list: the post is flagged (fails closed)
         rooms = os.path.join(os.environ["WATCHTOWER_HOME"], "exports", "rooms.txt")
@@ -1187,7 +1188,8 @@ class MainBoxLessons(Box):
                    {"name": "Crew room", "kind": "group chat"}, {"name": "Partners", "members": ["Harbor", "Kestrel"]},
                    {"name": "Sam", "kind": "person"}, {"name": "Unclear"}, "Customers room"],
                   open(os.path.join(os.environ["WATCHTOWER_HOME"], "exports", "roster.json"), "w"))
-        code, o, _ = self.run_cmd("rollcall")
+        open(os.path.join(rdir, "kestrel.json"), "w").write(reply)
+        code, o, _ = self.run_cmd("rollcall", "--owner-said-yes")
         self.assertEqual(json.loads(o)["rooms_file"], {"rooms": 3, "kept_manual": 1})
         self.assertEqual(wt.known_rooms(), {"growth", "crew", "partners", "board"})  # rooms only; the hand-marked line kept, "Old room" replaced
         self.assertIn("Board room  # manual", open(rooms).read())

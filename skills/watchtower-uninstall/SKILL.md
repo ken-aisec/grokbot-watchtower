@@ -7,7 +7,7 @@ description: Remove Watchtower and everything it put on this computer, after one
 
 1. Run `python3 /workspace/watchtower/app/watchtower/wt.py uninstall`. It is a preview and removes nothing. Its JSON lists what will go and what only the owner can do.
 2. Post ONE message, at most 10 lines:
-   - **I'll remove:** my four routines, the three decoy files (and their folders if empty), my installer and scratch files in /tmp, my scanner cache, and /workspace/watchtower with the scanners, reports and state.
+   - **I'll remove:** my routines (three, plus the roll-call reminder if it was switched on), the three decoy files (and their folders if empty), my installer and scratch files in /tmp, my scanner cache, and /workspace/watchtower with the scanners, reports and state.
    - **In quarantine:** if `quarantined_skills` has names, list them and ask whether to put any back first. Whatever stays in quarantine is deleted with the folder.
    - **Only you:** the `only_the_owner_can` lines, in plain words. Say the Ask-first rules are worth keeping.
    - **Not touched:** your other Bots, your own skills, and anything I didn't create.
