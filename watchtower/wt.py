@@ -402,7 +402,7 @@ def dedupe(findings):
     return out
 
 
-SCORE_ERA = "s3"   # bump when the formula changes; older history is then hidden instead of compared
+SCORE_ERA = "s4"   # bump when the formula changes; older history is then hidden instead of compared
 SCORE_BASE = {"critical": 12, "high": 5, "medium": 1.5, "low": 0.3}   # per kind of risk
 SCORE_CAP = {"critical": 50, "high": 25, "medium": 12, "low": 3}      # per severity tier
 
@@ -419,7 +419,14 @@ EVIDENCE_RULES = frozenset((
     "WT-S003", "WT-S004", "WT-W001", "WT-W002", "WT-X003", "WT-X004"))
 HISTORY_SHRANK = "Shell history shrank since last check"
 CONFIRMED, MAYBE_FINE = "Confirmed", "Worth a look (might be fine)"
-PATTERN_WEIGHT = 0.2   # a pattern finding moves the score a fifth as much as the same severity of evidence
+# v0.6.8 (Ken, Oct 10, after Cloudflare's MIT-licensed security-audit skill): a "Worth a look" finding carries no severity and
+# never moves the score; best-practice checks are Tips, also without severity or score.
+TIP_RULES = frozenset(("WT-R002", "WT-R003"))   # pattern-class best practice only; no evidence rule is moved
+TIP = "Tip"
+VERB_AREA = (("sending email or messages", r"(?i)^(send|sends|sending|email|emails|message|messages|reply|replies|dm)$"),
+             ("publishing or posting", r"(?i)^(post|posts|publish|publishes|tweet|tweets)$"),
+             ("purchases or payments", r"(?i)^(buy|buys|pay|pays|purchase|purchases|transfer|transfers|submit|submits)$"),
+             ("deleting data", r"(?i)^(delete|deletes|remove|removes)$"))
 
 
 def is_evidence(f):
@@ -463,19 +470,46 @@ def corroborated(f, findings):
     return False
 
 
-def label_findings(findings):
-    """Label every finding and cap unbacked pattern findings at medium. Evidence findings are never changed."""
+def ask_first_covered(findings):
+    """The Ask-first areas the account's own rules cover, judged from a full run's findings: every area a WT-A003 doesn't name
+    as missing. Only a full audit can say this (it always reports WT-A003 when rules are missing or unseen)."""
+    a3 = [f for f in findings if f["rule"] == "WT-A003"]
+    gaps = " ".join(f.get("evidence", "") for f in a3).lower()
+    return {w for w, _ in ASK_AREAS if w not in gaps}
+
+
+def covered_by_ask_first(f, covered):
+    """A missing approval line (WT-T013, WT-PP07) is a tip, not a finding, when the account's Ask-first rules already make every
+    Bot ask before that kind of action."""
+    if f["rule"] not in ("WT-T013",) or not covered:
+        return False
+    verb = (f.get("evidence") or "").strip().split(" ")[0]
+    area = next((w for w, rx in VERB_AREA if re.match(rx, verb)), None)
+    return bool(area) and area in covered
+
+
+def _no_severity(f, cls, label):
+    f["class"], f["label"] = cls, label
+    if f["severity"] != "info":
+        f["severity_was"], f["severity"] = f["severity"], "info"   # shown without a severity, never scored
+
+
+def label_findings(findings, covered=None):
+    """Label every finding. Evidence and corroborated findings are Confirmed and keep their severity. Best-practice checks are Tips
+    and an approval line the Ask-first rules already cover is a Tip; pattern findings nothing backs up are "Worth a look". Tips and
+    Worth-a-look carry no severity and never move the score. `covered`: the Ask-first areas known to be covered (none assumed)."""
+    covered = covered or set()
     out = []
     for f in findings:
         f = dict(f)
-        if is_evidence(f):
+        if f["rule"] in TIP_RULES or covered_by_ask_first(f, covered):
+            _no_severity(f, "tip", TIP)
+        elif is_evidence(f):
             f["class"], f["label"] = "evidence", CONFIRMED
         elif corroborated(f, findings):
             f["class"], f["label"] = "corroborated", CONFIRMED
         else:
-            f["class"], f["label"] = "pattern", MAYBE_FINE
-            if f["severity"] in ("critical", "high"):
-                f["severity_was"], f["severity"] = f["severity"], "medium"
+            _no_severity(f, "pattern", MAYBE_FINE)
         out.append(f)
     return out
 
@@ -488,20 +522,18 @@ def score(findings):
     """Score the kinds of risk, not the number of files. Each rule counts once at its worst severity, a little
     more when it appears many times (up to x1.5), so one finding appearing or vanishing moves the score by at most
     12 points, not 20. 300 skills with the same style issue cost about 2; one live key about 12."""
-    worst, count, pattern_only = {}, {}, {}
+    worst, count = {}, {}
     for f in findings:
         sev = f["severity"]
         if sev not in SCORE_BASE:
             continue
         r = f["rule"]
-        pattern_only[r] = pattern_only.get(r, True) and f.get("class") == "pattern"   # unlabelled findings count in full
         count[r] = count.get(r, 0) + 1
         if r not in worst or SEV_ORDER.index(sev) < SEV_ORDER.index(worst[r]):
             worst[r] = sev
     tiers = {k: 0.0 for k in SCORE_BASE}
     for r, sev in worst.items():
-        w = PATTERN_WEIGHT if pattern_only.get(r) else 1.0
-        tiers[sev] += w * SCORE_BASE[sev] * (1 + 0.5 * min(1.0, math.log10(count[r])))
+        tiers[sev] += SCORE_BASE[sev] * (1 + 0.5 * min(1.0, math.log10(count[r])))
     penalty = sum(min(SCORE_CAP[k], v) for k, v in tiers.items())
     s = max(0, 100 - round(penalty))
     grade = "A" if s >= 90 else "B" if s >= 80 else "C" if s >= 65 else "D" if s >= 50 else "F"
@@ -2162,11 +2194,11 @@ def run_audit_locked(args, quick):
             f["scope"] = "builtin"
         elif in_pending_plugin(f["where"]) and f["rule"] in ("WT-X001", "WT-X002", "WT-T006k") and f["severity"] == "low":
             f["severity"] = "medium"   # one scanner flagging a skill in a plugin nobody has reviewed yet is worth a look
-    fs = sort_findings(label_findings(fs))
+    fs = sort_findings(label_findings(fs, ask_first_covered(fs)))
     live, suppressed = active(fs)
     prev = load_json(state_path("last_findings.json"), {"findings": []})
     prev_keys, cur_keys = keys_of(prev.get("findings", [])), keys_of(live)
-    new = [f for f in live if not known(f, prev_keys) and f["severity"] != "info"]
+    new = [f for f in live if not known(f, prev_keys) and (f["severity"] != "info" or f.get("class") == "pattern")]
     fixed = [f for f in prev.get("findings", []) if not known(f, cur_keys)]
     s, g = score(scored(live))
     if not load_json(state_path("baseline.json"), {}):
@@ -2246,6 +2278,12 @@ def cmd_audit(args):
     if snap.get("stages_skipped"):
         out["stages_skipped"] = snap["stages_skipped"]
     out["not_counted_builtin"] = sum(1 for f in snap["findings"] if not counts(f))
+    look = [f for f in snap["findings"] if f.get("class") == "pattern"]
+    if look:   # no severity, not scored: read each in full and try to show it's a false alarm before showing it (wt.py dismiss)
+        out["worth_a_look"] = [dict(compact(f), key=f["key"]) for f in look][:15]
+    tips = [f for f in snap["findings"] if f.get("class") == "tip"]
+    if tips:
+        out["tips"] = [compact(f) for f in tips][:10]
     print(fit(out))
     return 0
 
@@ -2420,6 +2458,15 @@ def render_md(snap, hist, tag):
     for f in [f for f in fs if f["severity"] not in ("low", "info")]:
         ev = f["evidence"].replace("|", "\\|")
         lines.append(f"| {f['severity']} | {f['rule']} | {label_of(f)}: {f['title']} | `{f['where']}` | {ev} | {', '.join(f['owasp'])} |")
+    look = [f for f in fs if f.get("class") == "pattern"]
+    tips = [f for f in fs if f.get("class") == "tip"]
+    lows = [f for f in lows if f.get("class") not in ("pattern", "tip")]
+    if look:
+        lines += ["", f"## {MAYBE_FINE}", "", "Pattern matches nothing else backs up. No severity, not in the score."]
+        lines += [f"- {f['rule']} {f['title']} at `{f['where']}`: {f['evidence']}" for f in look[:40]]
+    if tips:
+        lines += ["", "## Tips", "", "Best practice, not problems. No severity, not in the score."]
+        lines += [f"- {f['title']} at `{f['where']}`. {f['fix']}" for f in tips[:40]]
     if lows:
         by_rule = {}
         for f in lows:
@@ -2449,6 +2496,18 @@ def render_md(snap, hist, tag):
     return "\n".join(lines)
 
 
+def extra_sections(fs):
+    """Worth a look and Tips: listed below the findings, with no severity."""
+    out = ""
+    for cls, head, note in (("pattern", MAYBE_FINE, "Pattern matches nothing else backs up. No severity, not in the score."),
+                            ("tip", "Tips", "Best practice, not problems. No severity, not in the score.")):
+        items = [f for f in fs if f.get("class") == cls][:40]
+        if items:
+            out += (f"<details><summary>{html.escape(head)} ({len(items)})</summary><p class='mut'>{note}</p><ul>"
+                    + "".join(f"<li>{html.escape(f['title'])} <code>{html.escape(f['where'])}</code></li>" for f in items) + "</ul></details>")
+    return out
+
+
 def render_html(snap, hist, tag):
     fs = snap["findings"]
     c = by_sev(fs)
@@ -2475,6 +2534,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}td,th{{border-bottom:
 <div class='row'><div class='card'><div class='mut'>Posture score</div><div class='big'>{snap['score']}<span class='mut' style='font-size:18px'>/100 · {snap['grade']}</span></div><div class='mut'>{trend(hist)}</div></div>
 <div class='card'><div class='mut'>Score, last {len(pts)} runs</div><svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' role='img' aria-label='score trend'><polyline fill='none' stroke='#2e86c1' stroke-width='2' points='{poly}'/></svg></div>
 {tiles}</div><h2 style='font-size:16px'>Open findings</h2><div class='wrap'><table><tr><th>Severity</th><th>Finding</th><th>Where</th><th>OWASP</th><th>Fix</th></tr>{rows or "<tr><td colspan=5>Nothing open.</td></tr>"}</table></div>
+{extra_sections(fs)}
 <p style='margin-top:16px'>{f"<a href='threat-brief-{tag}.html'>Open this week's threat brief →</a>" if os.path.exists(os.path.join(home(), "reports", f"threat-brief-{tag}.html")) else ""}</p>
 <p class='mut' style='margin-top:20px'>Watchtower {VERSION}. Scanners can be bypassed; this is evidence, not proof.</p></body></html>"""
 
@@ -4549,8 +4609,8 @@ def accept_current(rules, reason, days=90, skip=()):
         if (skill_root(w) or w) in bad_roots:
             skipped.append(f"{skill_name(skill_root(w) or w)}: has a critical finding, so nothing in it is accepted")
             continue
-        if f["severity"] not in ("critical", "high", "medium"):
-            continue   # the owner is only shown the medium-and-up decisions, so a low line is never swept in with them
+        if f["severity"] not in ("critical", "high", "medium") and f.get("class") != "pattern":
+            continue   # Worth-a-look lines are shown too (no severity); otherwise the owner is only shown the medium-and-up decisions, so a low line is never swept in with them
         if any(x and x.lower() in f"{f['where']} {f['title']}".lower() for x in skip):
             continue   # the owner said to leave this one open
         if f["rule"] == "WT-I004":

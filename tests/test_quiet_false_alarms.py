@@ -39,16 +39,17 @@ class QuietFalseAlarms(unittest.TestCase):
         self.assertEqual([(f["severity"], f["label"]) for f in out], [("critical", wt.CONFIRMED)] * 2)
         self.assertNotIn("WT-L001", wt.EVIDENCE_RULES)
         l1 = wt.label_findings([F("WT-L001", "high", "rollcall:Harbor")])[0]
-        self.assertEqual((l1["severity"], l1["label"]), ("medium", wt.MAYBE_FINE))
+        self.assertEqual((l1["severity"], l1["label"]), ("info", wt.MAYBE_FINE))
 
-    def test_a_lone_pattern_finding_is_capped_at_medium(self):
+    def test_a_lone_pattern_finding_carries_no_severity(self):
+        """Since Ken's refinement of Oct 10: not capped at medium but shown with no severity ("info") and never scored."""
         out = wt.label_findings([F("WT-T013", "high", "rollcall:Bot:routine:x"), F("WT-T005", "critical", f"{self.md}:3"),
                                  F("WT-S002", "high", "/ws/notes.txt", source="gitleaks"), F("WT-X001", "high", "/ws/other", source="skillspector")])
-        self.assertEqual([f["severity"] for f in out], ["medium"] * 4)
+        self.assertEqual([f["severity"] for f in out], ["info"] * 4)
         self.assertEqual([f["severity_was"] for f in out], ["high", "critical", "high", "high"])
         self.assertTrue(all(f["label"] == wt.MAYBE_FINE for f in out))
         low = wt.label_findings([F("WT-T016", "low", f"{self.md}:2")])[0]
-        self.assertEqual((low["severity"], low["label"]), ("low", wt.MAYBE_FINE))                  # never raised
+        self.assertEqual((low["severity"], low["label"]), ("info", wt.MAYBE_FINE))                 # never raised, and no severity
 
     def test_corroboration_keeps_a_pattern_finding_loud(self):
         # a second engine on the same file
@@ -63,20 +64,22 @@ class QuietFalseAlarms(unittest.TestCase):
         # the same rule twice, or a finding somewhere else, is not a second opinion
         out = wt.label_findings([F("WT-T005", "critical", f"{self.md}:3"), F("WT-T005", "critical", f"{self.md}:9"),
                                  F("WT-S002", "high", "/elsewhere/x", source="gitleaks")])
-        self.assertEqual([f["severity"] for f in out], ["medium"] * 3)
+        self.assertEqual([f["severity"] for f in out], ["info"] * 3)
 
     def test_roll_call_findings_only_back_up_their_own_bot_line(self):
         out = wt.label_findings([F("WT-T013", "high", "rollcall:Alpha:routine:Brief:1"), F("WT-L001", "high", "rollcall:Alpha"),
                                  F("WT-M010", "medium", "rollcall:Bravo:memory1"), F("WT-T013", "high", "rollcall:Bravo:routine:Digest:1")])
         self.assertEqual([f["class"] for f in out], ["pattern", "pattern", "pattern", "pattern"])   # L001 is a pattern since Ken's call of Oct 10
-        self.assertEqual(out[0]["severity"], "medium")
+        self.assertEqual(out[0]["severity"], "info")
 
-    def test_pattern_findings_weigh_a_fifth(self):
+    def test_worth_a_look_findings_never_move_the_score(self):
+        """Replaced the 0.2 weight (Ken, Oct 10): an uncorroborated pattern finding counts for nothing."""
         p = wt.label_findings([F("WT-T013", "medium", "rollcall:B:routine:r")])
         e = wt.label_findings([F("WT-A003", "medium", "rules")])
         self.assertEqual(p[0]["class"], "pattern")
         self.assertEqual(wt.score(e)[0], 100 - round(wt.SCORE_BASE["medium"]))
-        self.assertEqual(wt.score(p)[0], 100 - round(wt.PATTERN_WEIGHT * wt.SCORE_BASE["medium"]))
+        self.assertEqual(wt.score(p), (100, "A"))
+        self.assertEqual(wt.score(wt.label_findings([F(f"WT-T00{i}", "critical", f"/ws/s{i}/SKILL.md:1") for i in range(1, 9)])), (100, "A"))
         many = wt.label_findings([F(f"WT-T00{i}", "critical", f"/ws/s{i}/SKILL.md:1") for i in range(1, 9)])
         self.assertGreater(wt.score(many)[0], wt.score([F(f"WT-T00{i}", "critical", f"/ws/s{i}/SKILL.md:1") for i in range(1, 9)])[0])
 

@@ -339,7 +339,7 @@ class FactoryBox(Box):
         self.assertEqual(r["inventory"]["skills"], 49)                                # the linked folder is not counted twice
         fyi = [f for f in snap["findings"] if not wt.counts(f)]
         self.assertEqual(sum(1 for f in fyi if f["where"].startswith("system python package ")), 4)
-        self.assertTrue(any("gateway.json" in f["where"] and f["severity"] == "low" for f in fyi), [f["where"] for f in fyi])
+        self.assertTrue(any("gateway.json" in f["where"] and f.get("severity_was", f["severity"]) == "low" for f in fyi), [f["where"] for f in fyi])
         code, o, _ = self.run_cmd("fix", "--roots", *self.roots)
         prev = json.loads(o)
         self.assertEqual(prev["upgrades"]["python"], [])                               # never offers to upgrade the computer's own packages
@@ -481,7 +481,7 @@ class FreshAccountLessons(Box):
         self.run_cmd("fix", "--accept", "WT-I004", "--reason", "I installed it")
         self.audit(); fs = self.snap()["findings"]
         self.assertFalse([f for f in fs if f["rule"] == "WT-I004"])
-        self.assertEqual([f["severity"] for f in fs if f["rule"] == "WT-X001"], ["low"])          # kept: now an ordinary plugin
+        self.assertEqual([f.get("severity_was", f["severity"]) for f in fs if f["rule"] == "WT-X001"], ["low"])          # kept: now an ordinary plugin
         os.rename(os.path.join(self.home, "sand-data", "plugins", "pstack-2.0"), os.path.join(self.home, "sand-data", "plugins", "pstack-2.1-9c1e"))
         self.audit()
         self.assertFalse([f for f in self.snap()["findings"] if f["rule"] == "WT-I004"])          # a restart or an update is not a new plugin
@@ -720,7 +720,7 @@ class MainBoxLessons(Box):
                                             f'open(a[a.index("--report-path") + 1], "w").write(open({report!r}).read() if a[a.index("--source") + 1] == {self.home!r} else "[]")')
         self.scanners(gitleaks=stub, **({"trufflehog": trufflehog} if trufflehog else {}))
         self.audit()
-        return {f["where"].split("/")[-2]: f["severity"] for f in self.snap()["findings"] if f["rule"] == "WT-S002"}
+        return {f["where"].split("/")[-2]: f.get("severity_was", f["severity"]) for f in self.snap()["findings"] if f["rule"] == "WT-S002"}
 
     def test_a_key_in_a_built_in_site_playbook_is_low_when_only_gitleaks_sees_it(self):
         """Fresh v0.6.7 account (DQ-012 batch): every first run raised these two platform lines as medium "looks like a key"."""
