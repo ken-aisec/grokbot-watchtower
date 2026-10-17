@@ -15,7 +15,7 @@ Watchtower is a security officer for that setup. It is read-only until you say y
 | `watchtower-rollcall` | DMs every Bot one fixed question that asks only for counts, names and yes/no answers (never memory text: Bots can't verify who sends a roll-call), then flags risky memories, routines that send without asking and the lethal trifecta (private data + untrusted input + a way out) |
 | `watchtower-prepublish` | PASS/FAIL before you share a Bot as a template: secrets, emails, phone numbers, private doc links, internal hosts, local paths, and a missing approval boundary |
 | `watchtower-incident` | Evidence pack first (findings, canaries, changed files, history, processes, connections, jobs), then containment one approved step at a time |
-| `watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep if installed |
+| `watchtower-codescan` | OWASP Top 10 (2021) review of code your Bots write, plus semgrep only if it is in Watchtower's checked scanner folder |
 | `watchtower-fix` | The one-yes fix: cleans up, upgrades outdated Python packages, and npm lockfiles in your own projects only after a separate yes (each upgrade is backed up and undone automatically if it breaks something), moves your own dangerous skills into a quarantine folder (nothing is deleted, and each can be restored), and accepts findings that are fine on purpose, after asking you a single question |
 | `watchtower-setup` | Pinned, checksummed install; scanners; canaries; first audit and report; routines |
 | `watchtower-uninstall` | Removes Watchtower and everything it created (routines, decoys, scanners, caches, its folder) after one yes |
@@ -33,7 +33,7 @@ Every finding carries a rule ID, severity, file and line (secrets masked), the f
 
 ## Three engines, one verdict
 
-Skills are checked by Watchtower's own rules, [NVIDIA SkillSpector](https://github.com/nvidia/skillspector) and [husk](https://github.com/ctrl-adam/Husk). A skill flagged by one engine is a lead. A skill flagged by two is a corroborated critical. Your own skills, and any skill that's new or changed, get all three every day; marketplace and first-party skills are checked for malicious indicators, not style. gitleaks finds keys left in files and TruffleHog checks which of them still work, so you only revoke the live ones. pip-audit and OSV-Scanner cover known holes in installed software and project dependencies. The weekly report says which scanners checked your setup.
+Skills are checked by Watchtower's own rules, [NVIDIA SkillSpector](https://github.com/nvidia/skillspector) and [husk](https://github.com/ctrl-adam/Husk). A skill flagged by one engine is a lead. Two engines agreeing on one of your own skills is Confirmed. On Grok Bot's own skills they count only when they describe something dangerous (reading keys, sending data out, running downloaded code) or Watchtower's rules agree; otherwise the skill is listed under Platform. Your own skills, and any skill that's new or changed, get all three every day; marketplace and first-party skills are checked for malicious indicators, not style. gitleaks finds keys left in files and TruffleHog checks which of them still work, so you only revoke the live ones. pip-audit and OSV-Scanner cover known holes in installed software and project dependencies. The weekly report says which scanners checked your setup.
 
 ## Tripwires
 
@@ -73,38 +73,57 @@ Every computer is different, so Watchtower assumes things will go wrong and is t
 
 - The audit has a hard time limit. Every scanner gets only the time that is left.
 - A stage that fails is skipped with one line saying so, and its last results are kept. A failure never moves the score and never reports old findings as fixed.
-- Only what you own counts toward the score. Built-in plugins and platform updates are listed for information; they count only when two scanners agree one is dangerous.
+- Only what you own counts toward the score. Grok Bot's own files never move it (a key there still does). Plugins you installed count when a finding on them is critical or high. Grok Bot's own updates are one Platform line, accepted at the next full audit when nothing flags them.
+- Watchtower runs only its own scanners, from its own folder, and only when each program file matches the checksum in `scripts/scanner-bins.lock`. For the Python scanners (SkillSpector, husk, pip-audit) that file is the small entry point pip writes; their package code was checked against `scripts/scanners.lock` when it was installed and isn't checked again on each run. It runs a sealed in-memory copy of the bytes it checked, and Python scanners only with the computer's own root-owned Python. A scanner whose copy isn't the one the lock lists is not run, its last results are kept, and that is a high alert; one the lock doesn't list for this computer yet is not run either, and that is a plain note.
 - One run at a time. No stack traces: one plain line, and `wt.py doctor --save` writes a snapshot you can send to the author.
 - Watchtower holds its own tools to the same standard: scanners install from a lock file with a checksum for every package (`scripts/scanners.lock`), nothing is unpacked unless its checksum passes, and the audit checks Watchtower's own scanner packages for known holes.
 
 ## CLI
 
 ```
-wt.py vet FILE|-              vet before installing (exit 1 = Do not install)
+wt.py --version               the version, after the self-check (a changed copy exits 4 and prints no version)
+wt.py vet FILE|-|LINK [--json] [--deep] [--page-only]   vet before installing (exit 1 = Do not install); --page-only when
+                                         the text was copied from a marketplace page and the skill bodies weren't visible
 wt.py audit | daily           full or quick audit (compact JSON for the Bot)
+      [--roots DIR..] [--exports DIR] [--budget SECONDS] [--everything | --live-only]
+                                         --budget: scanner time for this run; --everything also checks archives, clones and
+                                         other projects, --live-only goes back to what the platform loads (both remembered)
 wt.py report                  weekly report + dashboard.html
-wt.py brief [--summary F]     weekly threat brief (HTML)
+wt.py brief [--summary F] [--notes F] [--offline F]   weekly threat brief (HTML)
+wt.py rollcall --question     print the one fixed roll-call question to send, unchanged
 wt.py rollcall --save <Bot>      save one reply (stdin) as a 0600 file in the private 0700 roll-call folder
-wt.py rollcall --owner-said-yes  analyze roll-call replies, keep masked findings, delete the replies
-wt.py prepublish PATH         check a Bot before sharing it as a template
-wt.py fix                      preview: the cleanup list (path, file count, whose) and everything else
-wt.py fix --apply --owner-said-yes [--skip N,..] --upgrade --revet --accept RULES   everything in one pass (after your yes)
-wt.py fix --upgrade-projects   npm lockfile fixes in your own projects (its own yes)
-wt.py diff SKILL               what changed in a skill since you approved it
+wt.py rollcall --owner-said-yes [--dir DIR]  analyze roll-call replies, keep masked findings, delete the replies
+wt.py prepublish PATH [--json]   check a Bot before sharing it as a template
+wt.py fix [--roots DIR..]      preview: the cleanup list (path, file count, whose) and everything else
+wt.py fix --apply --owner-said-yes [--skip N,..] --upgrade --revet --accept RULES [--keep-open NAMES] [--reason "..."]
+                                         everything in one pass (after your yes); --keep-open leaves those open
+wt.py fix --revet [--only NAMES]   re-scan changed skills with every scanner and re-approve the clean ones
+wt.py fix --exception NAMES    keep skills the owner confirmed as security tools (30 days)
+wt.py fix --quarantine NAMES   move the owner's own skills out of use into Watchtower's quarantine folder
+wt.py fix --upgrade-projects   npm and Rust lockfile fixes in your own projects (its own yes)
+wt.py quarantine [NAMES] [--restore NAME] [--reason "..."]   list, quarantine or restore the owner's own skills
+wt.py diff SKILL [--lines N]   what changed in a skill since you approved it
 wt.py exception add SKILL --reason "..."   keep one named security-tool skill that two scanners flag (30 days)
-wt.py accept RULE WHERE --reason "..."   accept one risk on purpose (90 days); WHERE is a whole name (the place, skill
-                                         folder name, or "package version"); decoy alarms and Confirmed findings are refused
+wt.py exception list | exception remove SKILL
+wt.py accept RULE WHERE --reason "..." [--days N]   accept one risk on purpose (90 days unless --days); WHERE is a whole
+                                         name (the place, skill folder name, or "package version"); decoy alarms and
+                                         Confirmed findings are refused
+wt.py accept --list | accept RULE WHERE --remove
 wt.py accept --all-current RULES         accept everything currently open for those rules
-wt.py events list|clear        one-time detections
-wt.py canary plant|status      plant the decoys; see what touched them
+wt.py dismiss KEY --reason "..."   drop a Worth-a-look finding shown to be a false alarm (logged)
+wt.py dismiss --list [--since DATE]   what was dismissed (last 24 hours unless --since)
+wt.py events list|clear [--rule RULE] [--owner-said-yes]   one-time detections
+wt.py canary plant|status [--token-file F]   plant the decoys; see what touched them
 wt.py canary remove --owner-said-yes   remove the decoys (only after the owner's yes)
-wt.py auto-allow [keep IDS --owner-said-yes]   list Allow-automatically lines on consequential actions; keep exact ones after the owner's yes
+wt.py auto-allow [keep IDS --owner-said-yes --reason "..."]   list Allow-automatically lines on consequential actions;
+                                         keep exact ones after the owner's yes
 wt.py incident --note "..."   evidence pack + containment checklist
 wt.py codescan PATH           OWASP Top 10 code review
 wt.py status                  what a running audit is doing and how long each stage took
-wt.py breakdown | show RULE   findings by rule; evidence with context
+wt.py breakdown | show RULE [--limit N]   findings by rule; evidence with context
 wt.py baseline [--owner-said-yes]   accept current skills as reviewed (the first one on a computer needs no flag)
 wt.py doctor [--save]         a support snapshot of this computer, safe to share (no file contents, keys or skill names)
+wt.py uninstall [--apply] [--remove-folder]   preview, then remove what Watchtower created (after the owner's yes)
 ```
 
 State lives in `$WATCHTOWER_HOME` (default `/workspace/watchtower`). `state/ledger.jsonl` is an append-only record of every run: the audit trail non-Enterprise accounts don't get.
@@ -124,7 +143,7 @@ Release drill, dev dry-run (precision plan item 8): before each release the dev 
 
 ## Tests
 
-`make test` runs 220 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
+`make test` runs more than 700 tests: seeded malicious skills must be caught, clean and defensive text must not be flagged, hostile feed content must not execute in the brief, and every feature has its own test.
 
 ## License
 

@@ -64,10 +64,11 @@ class Box(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def scanners(self):
-        b = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(b, exist_ok=True)
+        b = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"); os.makedirs(b, exist_ok=True)   # batch 3: the checked folder
         for name, body in SCANNERS.items():
             p = os.path.join(b, name)
             open(p, "w").write(body); os.chmod(p, 0o755)
+            wt.SCANNER_LOCK_EXTRA[name] = wt.scanner_digest(p)
 
     def run_cmd(self, *argv):
         out, err = io.StringIO(), io.StringIO()

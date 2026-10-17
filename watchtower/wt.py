@@ -2,7 +2,9 @@
 """Watchtower: read-only security watch for a Grok Bot cloud computer.
 
 Scripts find, the model judges, the human approves. Stdlib only; optional
-external scanners (skillspector, husk, gitleaks, pip-audit) are used when on PATH.
+external scanners (skillspector, husk, gitleaks, trufflehog, osv-scanner, pip-audit)
+run only from Watchtower's own scanners/bin folder, and only when each program's
+sha256 is in scripts/scanner-bins.lock. A scanner on PATH is never run.
 
 Commands
   vet FILE|-            score a template, skill, or routine text before install
@@ -21,7 +23,7 @@ import sys
 if sys.version_info < (3, 8):   # degrade with one plain line, not a traceback (v0.6.9 old-Python profile)
     print("Watchtower needs Python 3.8 or newer; this computer has " + ".".join(map(str, sys.version_info[:3])) + ". Nothing was run.")
     sys.exit(3)
-import argparse, concurrent.futures, datetime as dt, difflib, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, time, traceback
+import argparse, builtins, concurrent.futures, datetime as dt, difflib, errno, gzip, hashlib, html, json, math, os, platform, re, shutil, stat, subprocess, sys, tempfile, threading, time, traceback
 
 VERSION = "0.7.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -847,7 +849,8 @@ EVIDENCE_RULES = frozenset((
     # Shell history: commands that actually ran on this computer, not wording (Ken, 2026-10-10). H007 is a file-mode fact.
     "WT-H001", "WT-H002", "WT-H003", "WT-H004", "WT-H005", "WT-H006", "WT-H007", "WT-H008", "WT-H009",
     "WT-K001", "WT-K002", "WT-K003", "WT-K004", "WT-K005", "WT-K006", "WT-M001", "WT-P001", "WT-R010",
-    "WT-S003", "WT-S004", "WT-S005", "WT-W001", "WT-W002", "WT-X003", "WT-X004"))
+    "WT-S003", "WT-S004", "WT-S005", "WT-W001", "WT-W002", "WT-X003", "WT-X004",
+    "WT-X005"))   # batch 3 (R7): Watchtower's copy of a scanner isn't the one it installed
 HISTORY_SHRANK = "Shell history shrank since last check"
 NEW_SIGN_IN = "New sign-in in the shared browser"
 CONFIRMED, MAYBE_FINE = "Confirmed", "Worth a look (might be fine)"
@@ -1501,13 +1504,41 @@ def time_left(default=10 ** 6):
 
 def run(cmd, timeout=120, cwd=None):
     timeout = max(1, min(timeout, time_left()))
+    # Codex, batch 3 round 2: the program gets what is left of its time after the sealed copy was made. Final review: one
+    # absolute deadline for the whole launch. Waiting for another launch (_LAUNCH, taken twice), hashing and copying the
+    # program, and running it all come out of this one timeout; the lock waits had no limit and the copy had its own
+    # (SCANNER_HASH_SECONDS), so a 2-second call could take a minute while the other engine's copy was made.
+    deadline = time.monotonic() + timeout
+    timed_out = (124, "", f"timed out after {int(timeout)}s")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
-        return r.returncode, r.stdout, r.stderr
-    except subprocess.TimeoutExpired as e:
-        return 124, "", f"timed out after {int(timeout)}s"
+        launch = scanner_launch(cmd, deadline)   # batch 3: a program in Watchtower's scanner folder runs only from its checked, sealed copy
+    except LaunchTimedOut:
+        return timed_out
+    except ScannerUnusable as e:
+        return 126, "", f"not run: {e}"
+    argv, exe, fds = launch or (cmd, None, ())
+    try:
+        if not _launch_lock(deadline):
+            return timed_out
+        try:
+            if time.monotonic() >= deadline:
+                return timed_out
+            p = subprocess.Popen(argv, executable=exe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, pass_fds=fds)
+        finally:
+            _LAUNCH.release()
+        with p:
+            try:
+                out, err = p.communicate(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+                return timed_out
+        return p.returncode, out, err
     except OSError as e:
         return 127, "", str(e)
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def persistence_snapshot():
@@ -2017,6 +2048,7 @@ def audit(roots, exports, quick=False):
     fs, notes = [], []
     INCOMPLETE_SKILLS.clear()
     _RUNS_CODE.clear()
+    reset_scanner_checks()
     inv = collect_inventory(roots)
     manifest = {}
     # DQ-022/023, v0.7.1 item 1: SKILL.md outside loadable locations — one "Not scanned" line (a Tip), never scored as installed
@@ -2251,16 +2283,21 @@ def audit(roots, exports, quick=False):
         ks = load_json(state_path("key_status.json"), {}) or {}
         fs = apply_key_status(fs, ks.get("files", {}), ran=bool(ks.get("ran")))
     prev_used = load_json(state_path("engines_used.json"), {}) or {}
-    before = prev_used.get("expected") or prev_used.get("engines", [])
-    save_json(state_path("engines_used.json"), {"at": now(), "engines": ["Watchtower rules"] + [n for n, t in (
+    prev_used = prev_used if isinstance(prev_used, dict) else {}
+    # Codex, batch 3 round 1: `expected` was only last run's expectation while one scanner was missing, so a scanner that first
+    # ran during that time was forgotten the second run after it went missing, and its findings read as fixed. Expected is now
+    # every scanner expected before plus every one that ran, until all of them are back.
+    before = list(dict.fromkeys(n for k in ("expected", "engines") for n in (prev_used.get(k) if isinstance(prev_used.get(k), list) else [])
+                                if isinstance(n, str)))
+    used_now = ["Watchtower rules"] + [n for n, t in (
         ("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"), ("TruffleHog", "trufflehog"),
-        ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner")) if tool(t)]})
-
-    gone = [n for n in before if n not in load_json(state_path("engines_used.json"), {})["engines"]]
+        ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner")) if scanner_used(t)]   # Claude review 2 (3)
+    gone = [n for n in before if n not in used_now]
+    save_json(state_path("engines_used.json"), {"at": now(), "engines": used_now, **({"expected": list(dict.fromkeys(before + used_now))} if gone else {})})
     if gone:
-        notes.insert(0, f"SCANNERS MISSING: {', '.join(gone)} ran last time and are not installed now, so this is a partial scan and the score "
-                        "is not comparable with the last one. Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, then audit again.")
-        save_json(state_path("engines_used.json"), {"at": now(), "engines": load_json(state_path("engines_used.json"), {})["engines"], "expected": before})
+        notes.insert(0, f"SCANNERS MISSING: {', '.join(gone)} ran last time and didn't run now (not installed, or not the copy Watchtower installed), "
+                        "so this is a partial scan and their last results are kept. Run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, then audit again.")
+    fs += scanner_x005()   # batch 3 (R7): every scanner was looked at just above, in audit and daily alike
     fs = sort_findings(dedupe(fs))
     meta = {"inventory": {k: len(v) for k, v in inv.items() if k != "non_live_skills"}, "notes": notes, "manifest": manifest, "persistence": snap, "scanners_missing": gone,
             "skill_dirs": [os.path.dirname(x) for x in inv["skills"]], "baseline_status": base_status}
@@ -2562,12 +2599,697 @@ def lint_settings(s, where):
     return out
 
 
-def tool(name):
-    """Find a scanner on PATH or in Watchtower's own venv/bin (where install.sh --scanners puts them)."""
-    for cand in (shutil.which(name), os.path.join(home(), "scanners", "bin", name), os.path.join(home(), ".venv", "bin", name), os.path.join(home(), "bin", name)):
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
+# Hardening batch 3 (R7, Oct 16): tool() looked on PATH first, so any program a Bot named skillspector there was Watchtower's
+# second engine, and a copy in Watchtower's folder ran whatever it contained. Now the only candidate is Watchtower's own
+# scanners/bin/<name>, and only when its sha256 is in scripts/scanner-bins.lock for this computer's architecture.
+SCANNER_LOCK = os.path.join(HERE, "..", "scripts", "scanner-bins.lock")
+SCANNER_NAMES = {"skillspector": "SkillSpector", "husk": "husk", "gitleaks": "gitleaks", "trufflehog": "TruffleHog",
+                 "osv-scanner": "OSV-Scanner", "pip-audit": "pip-audit"}
+SCANNER_LOCK_EXTRA = {}   # tests only: name -> digest (or a set of them). An in-process dict, never fed by a file or the environment.
+SCANNER_PROBLEMS = {}     # name -> (kind, why) for this run: "changed", "unreadable", "unlisted" or "old-folder"; (kind, why, "launch") when refused at launch
+_SCANNER_OK = {}          # (path, size, mtime_ns, ctime_ns, inode) -> (digest, venv Python named on its first line or None)
+_SCANNER_LOCK_CACHE = {}
+# Codex, batch 3 round 1: hashing read the whole file into memory, so a huge or sparse "program" could exhaust memory or stall
+# the run outside every subprocess timeout. A program is now read in chunks, at most this much and for at most this long.
+SCANNER_MAX_BYTES = 512 * 1024 * 1024
+SCANNER_HASH_SECONDS = 60
+_LAUNCH = threading.Lock()   # a sealed copy is made, and every program started, one at a time (see scanner_launch)
+
+
+class ScannerUnusable(OSError):
+    """A scanner program Watchtower may not run; the message says why in plain words."""
+
+
+class ScannerUnreadable(ScannerUnusable):
+    """Claude review 1 (4): the program couldn't be read or copied right now (too slow, out of memory or file descriptors,
+    sealing refused, no /proc). Not run and its last results are kept, but this is no verdict on its contents, so no WT-X005."""
+
+
+class SealUnavailable(ScannerUnreadable):
+    """Claude review 2 (1): the sealed copy couldn't be made (memfd, sealing, writing the copy or /proc). Nothing runs, but the
+    program file itself is still hashed once for a verdict, so a swapped copy is a WT-X005 even then."""
+
+
+# Claude review 2 (1): every OSError was "unreadable", so a swapped copy chmod 0111 (or a link swapped in after the lstat) gave
+# EACCES or ELOOP at open, no WT-X005, every run. Only these say the computer is short of something; any other failure to open
+# or read the program file comes from the file itself, so it isn't the copy Watchtower installed.
+_PRESSURE_ERRNOS = {errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.EINTR}
+
+
+def _program_error(e):
+    """The ScannerUnusable for an error opening, reading or hashing a program file: ScannerUnreadable (no verdict) for memory
+    or file-descriptor pressure, otherwise the file itself is the problem."""
+    if isinstance(e, ScannerUnusable):
+        return e
+    if isinstance(e, MemoryError) or getattr(e, "errno", None) in _PRESSURE_ERRNOS:
+        return ScannerUnreadable(f"its program file can't be read right now ({errno.errorcode.get(getattr(e, 'errno', None), 'out of memory')})")
+    return ScannerUnusable(f"its program file can't be opened or read ({errno.errorcode.get(getattr(e, 'errno', None), type(e).__name__)})")
+
+
+def _problem_of(e):
+    """(kind, why) for an error from _program_error's family."""
+    e = _program_error(e)
+    return ("unreadable" if isinstance(e, ScannerUnreadable) else "changed"), str(e)
+
+
+class LaunchTimedOut(Exception):
+    """run()'s deadline passed before the program could start (waiting for another launch, or making its sealed copy). A time
+    out, as if it had run too long; not a verdict on the program, which is judged again at its next launch."""
+
+
+def _launch_lock(deadline):
+    """Take _LAUNCH, waiting until the deadline at most (None: as long as it takes). False when the deadline came first."""
+    if deadline is None:
+        return _LAUNCH.acquire()
+    return _LAUNCH.acquire(timeout=max(0, deadline - time.monotonic()))
+
+
+def scanner_arch():
+    m = platform.machine().lower()
+    return {"arm64": "aarch64", "amd64": "x86_64"}.get(m, m)
+
+
+def scanner_bin():
+    return os.path.join(home(), "scanners", "bin")
+
+
+def _venv_shebang(line):
+    """True when this first line names this install's venv Python (scanners/bin/python, python3, python3.12...)."""
+    for b in dict.fromkeys((scanner_bin(), os.path.join(os.path.realpath(home()), "scanners", "bin"))):
+        if re.fullmatch(re.escape(b) + r"/python[0-9.]*", line):
+            return True
+    return False
+
+
+def _read_program(fd, sink=None):
+    """(sha256, venv Python or None) of the open program file fd, read in chunks; sink(chunk) gets every byte as it is read.
+    A pip entry point's first line names the venv's Python by its full path, so it is hashed as "#!python": the lock's
+    checksum then doesn't depend on where Watchtower is installed. Raises ScannerUnusable for anything that isn't a plain
+    file, is over SCANNER_MAX_BYTES (checked before reading, so a sparse file costs nothing) or takes too long to read."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise ScannerUnusable("it isn't a plain program file")
+    if st.st_size > SCANNER_MAX_BYTES:
+        raise ScannerUnusable(f"its program file is too large to be a scanner ({st.st_size} bytes)")
+    deadline = time.monotonic() + max(1, min(SCANNER_HASH_SECONDS, time_left()))
+    head = b""
+    while len(head) <= 4096 and b"\n" not in head:
+        chunk = os.read(fd, 4097 - len(head))
+        if not chunk:
+            break
+        head += chunk
+    first, nl, rest = head.partition(b"\n")
+    shebang = first[2:].decode("utf-8", "replace").strip() if first.startswith(b"#!") else ""
+    # Claude review 1 (1): a file whose first line really is "#!python" hashed the same as a pip entry point, wasn't a venv
+    # entry point (so no interpreter check), and the kernel then ran "python" from the folder Watchtower was started in. A
+    # first line that names its program without a full path is never run, so the "#!python" form can't be met by a real file.
+    if first.startswith(b"#!") and not shebang.startswith("/"):
+        raise ScannerUnusable("its first line names the program it runs with without a full path")
+    venv = shebang if shebang and _venv_shebang(shebang) else None
+    h = hashlib.sha256(b"#!python" + nl + rest if venv else head)
+    total = len(head)
+    if sink:
+        sink(head)
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > SCANNER_MAX_BYTES:
+            raise ScannerUnusable(f"its program file is too large to be a scanner (over {SCANNER_MAX_BYTES} bytes)")
+        if time.monotonic() > deadline:
+            raise ScannerUnreadable("its program file took too long to read")
+        h.update(chunk)
+        if sink:
+            sink(chunk)
+    return h.hexdigest(), venv
+
+
+def _open_program(path):
+    # O_NONBLOCK: a FIFO swapped in after the lstat must not hang the run; _read_program then refuses it (not a plain file)
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+
+
+def _in_hash_time(fn, cleanup=None, deadline=None):
+    """fn() run in a worker thread, waited for at most SCANNER_HASH_SECONDS (or the run's time left). Codex, batch 3 round 2:
+    the deadline in _read_program was checked only between reads, and a read of a regular file can't be interrupted, so one
+    slow read (then EOF) took as long as it liked. The worker owns every fd it opens; when it is given up on, its result is
+    never used and cleanup(result) releases it whenever it does finish. Raises ScannerUnusable on time out, or LaunchTimedOut
+    when run()'s deadline (final review) comes before that limit and is what ran out."""
+    limit = max(1, min(SCANNER_HASH_SECONDS, time_left()))
+    launch_bound = deadline is not None and deadline - time.monotonic() < limit
+    if launch_bound:
+        limit = deadline - time.monotonic()
+        if limit <= 0:
+            raise LaunchTimedOut()
+    box, lock, done = {}, threading.Lock(), threading.Event()
+
+    def work():
+        try:
+            res, err = fn(), None
+        except BaseException as e:   # noqa: BLE001 - handed to the caller
+            res, err = None, e
+        with lock:
+            if box.get("abandoned"):
+                if cleanup and err is None:
+                    cleanup(res)
+                return
+            box.update(res=res, err=err)
+            done.set()
+    threading.Thread(target=work, name="watchtower-hash", daemon=True).start()
+    done.wait(limit)
+    with lock:
+        if not done.is_set():
+            box["abandoned"] = True
+            if launch_bound:
+                raise LaunchTimedOut()
+            raise ScannerUnreadable("its program file took too long to read")
+    if box["err"] is not None:
+        raise box["err"]
+    return box["res"]
+
+
+def _read_program_at(path):
+    try:
+        fd = _open_program(path)
+    except OSError as e:
+        raise _program_error(e)
+    try:
+        return _read_program(fd)
+    except OSError as e:
+        raise _program_error(e)
+    finally:
+        os.close(fd)
+
+
+def scanner_digest(path):
+    """sha256 of a scanner's program file, as the lock lists it (see _read_program), read within the hashing time limit."""
+    return _in_hash_time(lambda: _read_program_at(path))[0]
+
+
+def _sealed_copy(path, deadline=None):
+    """_seal_copy within the hashing time limit and run()'s deadline (see _in_hash_time); a copy finished after either is
+    closed unused."""
+    return _in_hash_time(lambda: _seal_copy(path), cleanup=lambda r: os.close(r[0]), deadline=deadline)
+
+
+def _seal_copy(path):
+    """(fd, sha256, venv Python or None) for the program at path. Its bytes are copied into a sealed in-memory file while they
+    are hashed, and the fd is read-only: nobody, this user included, can change what it holds. Running the program from this
+    fd runs exactly the bytes that were checked (Codex, batch 3 round 1: checking a path and then running the path let a
+    program swapped in between run unchecked)."""
+    import fcntl
+    try:
+        src = _open_program(path)
+    except OSError as e:
+        raise _program_error(e)
+    mfd = None
+    try:
+        # Claude review 2 (1): a failure of the copy (not of the program file) is SealUnavailable, never a verdict on the program.
+        # No memfd or sealing on this computer: nothing is run from a copy that could still change.
+        try:
+            mfd = os.memfd_create("watchtower-scanner", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        except (AttributeError, OSError):
+            raise SealUnavailable("this computer can't keep a sealed copy of it to run")
+
+        def sink(b):
+            view = memoryview(b)
+            try:
+                while view:
+                    view = view[os.write(mfd, view):]
+            except OSError:
+                raise SealUnavailable("its sealed copy couldn't be written right now")
+        try:
+            digest, venv = _read_program(src, sink)
+        except OSError as e:
+            raise _program_error(e)
+        try:
+            fcntl.fcntl(mfd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+            ro = os.open(f"/proc/self/fd/{mfd}", os.O_RDONLY | os.O_CLOEXEC)   # the writable fd is closed before anything runs
+        except (AttributeError, OSError):
+            raise SealUnavailable("this computer can't keep a sealed copy of it to run")
+    finally:
+        os.close(src)
+        if mfd is not None:
+            os.close(mfd)
+    return ro, digest, venv
+
+
+LOCK_READER_REL = "scripts/scanner_lock.py"
+SCANNER_LOCK_REL = "scripts/scanner-bins.lock"
+LOCK_READER_MAX_BYTES = 256 * 1024
+
+
+_RELEASE = {}   # the MANIFEST.sha256 this process checked itself against: {"root": ..., "files": {rel: sha256}}
+
+
+def remember_manifest(root, text):
+    """Keep the manifest self_check is checking (or, when it didn't run, the first one read) for the rest of this process."""
+    files = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            files.setdefault(parts[1].lstrip("*").strip(), parts[0])
+    _RELEASE.clear()
+    _RELEASE.update(root=root, files=files, at=(SELF_ROOT, os.path.join(home(), "app")))
+
+
+def release_manifest():
+    """{rel: sha256} for an installed copy (the folder self_check checks), None in a developer checkout. Claude review 1 (2):
+    this was read from disk again at each use, so a MANIFEST.sha256 rewritten after the self-check vouched for whatever it
+    listed. It is now the one self_check checked, read once per process.
+
+    Claude review 2 (2): it was read again whenever the real folder behind `app` changed, so `mv app app.real; ln -s evil app`
+    after the self-check had the Bot's manifest vouch for its own lock reader, which then ran inside Watchtower. Once one is
+    remembered it is never read again, and a different folder behind the same name lists nothing (the lock then reads as
+    changed: scanner_lock)."""
+    root = os.path.realpath(SELF_ROOT)
+    if _RELEASE.get("at") == (SELF_ROOT, os.path.join(home(), "app")):
+        return _RELEASE["files"] if root == _RELEASE["root"] else {}
+    if root != os.path.realpath(os.path.join(home(), "app")):
+        return None
+    remember_manifest(root, read_text(os.path.join(root, "MANIFEST.sha256")))
+    return _RELEASE["files"]
+
+
+def release_digest(rel):
+    """The sha256 MANIFEST.sha256 lists for rel when this is an installed copy, "" when an installed copy's manifest doesn't
+    list it, and None in a developer checkout (no manifest to hold it to)."""
+    files = release_manifest()
+    return None if files is None else files.get(rel, "")
+
+
+def _lock_reader():
+    """scripts/scanner_lock.py as a namespace, run from its source bytes. Codex, batch 3 round 2: importing it let Python load a
+    bytecode cache (scripts/__pycache__/scanner_lock.*.pyc) instead, which self_check never looks at, so a planted cache
+    replaced the scanner allowlist. Now the source is read once (a plain file, never a link), held to its MANIFEST.sha256 line
+    in an installed copy, compiled from those bytes and run; no cache is read or written. None when it can't be used."""
+    try:
+        src = _reader_source()
+        want = release_digest(LOCK_READER_REL)
+        if want is not None and hashlib.sha256(src).hexdigest() != want:
+            return None
+        return _reader_namespace(src)
+    except Exception:   # noqa: BLE001 - a reader that can't be read or run means no program is listed, never every program
+        return None
+
+
+def _reader_source():
+    """The bytes of scripts/scanner_lock.py: a plain file, never a link, at most LOCK_READER_MAX_BYTES. Raises OSError when it
+    can't be read, ValueError when it isn't a plain file or is too large."""
+    fd = os.open(os.path.join(HERE, "..", LOCK_READER_REL), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a plain file")
+        src = b""
+        while len(src) <= LOCK_READER_MAX_BYTES:
+            chunk = os.read(fd, LOCK_READER_MAX_BYTES + 1 - len(src))
+            if not chunk:
+                break
+            src += chunk
+    finally:
+        os.close(fd)
+    if len(src) > LOCK_READER_MAX_BYTES:
+        raise ValueError("too large")
+    return src
+
+
+def _reader_namespace(src):
+    path = os.path.join(HERE, "..", LOCK_READER_REL)
+    ns = {"__name__": "watchtower_scanner_lock", "__file__": path, "__builtins__": builtins}
+    exec(compile(src, path, "exec", dont_inherit=True), ns)   # noqa: S102 - Watchtower's own checked file, from its bytes
+    return ns
+
+
+def scanner_lock():
+    """{(name, arch): {sha256, ...}} from scripts/scanner-bins.lock, read by scripts/scanner_lock.py, the same reader publish.sh
+    uses (Codex, batch 3 round 1), with its file limits too (round 2). A line it doesn't accept is never used; if the reader
+    itself can't be loaded, or the lock can't be used whole, nothing is.
+
+    Claude review 1 (2): the lock was read at the first scanner, minutes after the self-check, and again whenever its size or
+    time changed, and never held to MANIFEST.sha256, so a line added during a run (and removed after) made any program a
+    verified scanner. In an installed copy the lock and its reader are now read once per process and used only when both
+    match the manifest the self-check checked. Claude review 2 (6): one that doesn't match lists nothing, as before, and is
+    remembered as changed (scanner_list_changed), never read as the "not listed yet" of an empty lock."""
+    want = release_digest(SCANNER_LOCK_REL)
+    if want is not None:
+        if _SCANNER_LOCK_CACHE.get("installed") is None:
+            lock = _installed_lock(want)
+            _SCANNER_LOCK_CACHE.update(installed=lock or {}, changed=lock is None)
+        return _SCANNER_LOCK_CACHE["installed"]
+    try:
+        st = os.stat(SCANNER_LOCK)
+        rst = os.stat(os.path.join(HERE, "..", LOCK_READER_REL))
+        key = (SCANNER_LOCK, st.st_size, st.st_mtime_ns, st.st_ino, HERE, rst.st_size, rst.st_mtime_ns, rst.st_ctime_ns, rst.st_ino)
+    except OSError:
+        return {}
+    if _SCANNER_LOCK_CACHE.get("key") != key:
+        out = {}
+        reader = _lock_reader()
+        try:
+            if reader:
+                text, why = reader["read_lock"](SCANNER_LOCK)
+                out = {} if why else reader["parse"](text)[0]
+        except Exception:   # noqa: BLE001
+            out = {}
+        _SCANNER_LOCK_CACHE.update(key=key, lock=out if isinstance(out, dict) else {})
+    return _SCANNER_LOCK_CACHE["lock"]
+
+
+def _installed_lock(want):
+    """The installed copy's lock, read once, when its bytes and its reader's both match the remembered manifest. None when
+    either isn't the file that manifest lists (changed, gone, a link, unreadable by permission, or no longer in the folder the
+    self-check checked); {} when it can't be read right now (no memory or file descriptors) or can't be used."""
+    reader_want = release_digest(LOCK_READER_REL)
+    if not want or not reader_want:
+        return None
+    try:
+        src = _reader_source()
+    except ValueError:
+        return None
+    except OSError as e:
+        return {} if e.errno in _PRESSURE_ERRNOS else None
+    if hashlib.sha256(src).hexdigest() != reader_want:
+        return None
+    try:
+        reader = _reader_namespace(src)
+        text, why = reader["read_lock"](SCANNER_LOCK)
+        if why:   # read_lock names the error type: a plain OSError on a plain file is pressure (EMFILE, ENOMEM), not a change
+            try:
+                plain = stat.S_ISREG(os.lstat(SCANNER_LOCK).st_mode)
+            except OSError:
+                plain = False
+            return {} if plain and why.endswith("(OSError)") else None
+        if not isinstance(text, str) or hashlib.sha256(text.encode("utf-8")).hexdigest() != want:
+            return None
+        out = reader["parse"](text)[0]
+        return out if isinstance(out, dict) else {}
+    except Exception:   # noqa: BLE001
+        return {}
+
+
+def scanner_list_changed():
+    """True when this installed copy's lock or its reader isn't what the self-check checked (scanner_lock read it so)."""
+    return bool(_SCANNER_LOCK_CACHE.get("changed")) and release_digest(SCANNER_LOCK_REL) is not None
+
+
+def _scanner_extra(name):
+    extra = SCANNER_LOCK_EXTRA.get(name)
+    return {extra} if isinstance(extra, str) else set(extra) if isinstance(extra, (set, frozenset, list, tuple)) else set()
+
+
+def _scanner_listed(name):
+    lock = scanner_lock()
+    return lock.get((name, scanner_arch()), set()) | lock.get((name, "any"), set())
+
+
+def _digest_problem(name, digest):
+    """None when this sha256 may run as `name`, else (kind, why)."""
+    if digest in _scanner_extra(name):
+        return None
+    want = _scanner_listed(name)
+    if not want and scanner_list_changed():
+        return "changed", "Watchtower's scanner list (scripts/scanner-bins.lock or its reader) changed after the self-check, during this run"
+    if not want:
+        return "unlisted", f"its checksum isn't in Watchtower's list for this computer ({scanner_arch()}) yet"
+    if digest not in want:
+        return "changed", "its program file isn't the one Watchtower installed"
     return None
+
+
+def running_interpreter():
+    """(path, (dev, inode)) of the program this process is running, from /proc/self/exe; None when that can't be read or no
+    longer names the same file. Codex, batch 3 round 2: realpath(sys.executable) follows the launcher name Watchtower was
+    started through, and a writable venv link retargeted after start made another program (perl) the "pinned" Python."""
+    try:
+        st = os.stat("/proc/self/exe")
+        path = os.readlink("/proc/self/exe")
+        here = os.stat(path)
+    except OSError:
+        return None
+    if not path.startswith("/") or (here.st_dev, here.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(st.st_mode):
+        return None
+    return path, (st.st_dev, st.st_ino)
+
+
+def trusted_interpreter(path):
+    """The running interpreter's real path, when `path` (a venv Python link) leads to that very file (same device and inode as
+    /proc/self/exe, never a name) and that file and every folder above it belong to root with no group or other write; else
+    None. Codex, batch 3 round 1: a Python the Bot owned passed the old check once it was chmod 0555 (the Bot can chmod it
+    back), and so did one under a folder the Bot can write (it can be replaced). Round 2: pinned to /proc/self/exe."""
+    try:
+        me = running_interpreter()
+        st = os.stat(path)
+        if not me or (st.st_dev, st.st_ino) != me[1]:
+            return None
+        real = p = me[0]
+        while True:
+            st = os.lstat(p)
+            if st.st_uid != 0 or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+                return None
+            up = os.path.dirname(p)
+            if up == p:
+                return real
+            p = up
+    except OSError:
+        return None
+
+
+def scanner_verdict(name):
+    """(path, None) for Watchtower's own checked copy, else (None, (kind, why)); kind None means simply not there."""
+    path = os.path.join(scanner_bin(), name)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        if os.path.lexists(os.path.join(home(), "bin", name)):
+            return None, ("old-folder", "it is in Watchtower's old scanner folder")
+        return None, (None, "")
+    if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
+        return None, ("changed", "it isn't a plain program file")
+    if not st.st_mode & stat.S_IRUSR:   # Claude review 2 (1): Watchtower's own copy is always readable by its owner
+        return None, ("changed", "its program file can't be read (no read permission)")
+    if not _scanner_extra(name) and not _scanner_listed(name):   # nothing it could match: not read at all (Codex, round 1)
+        return None, _digest_problem(name, "")
+    key = (path, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    if key not in _SCANNER_OK:
+        try:
+            _SCANNER_OK[key] = _in_hash_time(lambda: _read_program_at(path))
+        except (OSError, MemoryError) as e:   # Claude review 2 (1): by errno; only memory or fd pressure is "unreadable"
+            return None, _problem_of(e)
+    digest, venv = _SCANNER_OK[key]
+    problem = _digest_problem(name, digest)
+    if problem:
+        return None, problem
+    if venv and not trusted_interpreter(venv):
+        return None, _interpreter_problem()
+    return path, None
+
+
+def _interpreter_problem():
+    """(kind, why) for a venv Python trusted_interpreter refused: "unreadable" when this computer can't say which Python
+    Watchtower runs (no /proc; Claude review 1, finding 4), else "changed"."""
+    if running_interpreter() is None:
+        return "unreadable", "this computer doesn't say which Python Watchtower runs with (/proc/self/exe)"
+    return "changed", "the Python it runs with isn't the computer's own"
+
+
+def _refuse(name, kind, why):
+    """A program in the scanner folder that may not run right now: remembered for the rest of this run (so swapping the
+    checked copy back afterwards hides nothing), its stage marked not checked, and nothing is started."""
+    SCANNER_PROBLEMS[name] = (kind, why, "launch")
+    SCANNERS_HELD.add(name)
+    STAGE_FAILS.append(f"{SCANNER_NAMES.get(name, name)} NOT run: {why}")
+    raise ScannerUnusable(why)
+
+
+def scanner_launch(cmd, deadline=None):
+    """How run() starts cmd when cmd[0] is in Watchtower's scanner folder: (argv, executable, fds), else None for any other
+    program. The program is checked again at launch from a sealed copy of its bytes and run from that copy; a venv Python
+    (an entry point's first line, or scanners/bin/python itself) is run as the pinned trusted_interpreter, never through the
+    link, which keeps only its name as argv[0] so the venv is found. Raises ScannerUnusable when it may not run, and
+    LaunchTimedOut when run()'s deadline passes while it waits for another launch or its copy is made."""
+    if not cmd or not isinstance(cmd[0], str):
+        return None
+    p = os.path.normpath(os.path.abspath(cmd[0]))
+    if os.path.dirname(p) not in {os.path.normpath(scanner_bin()), os.path.realpath(scanner_bin())}:
+        return None
+    name = os.path.basename(p)
+    if re.fullmatch(r"python[0-9.]*", name):
+        interp = trusted_interpreter(p)
+        if not interp:
+            kind, why = _interpreter_problem()
+            _refuse("python", kind, "Watchtower's scanner Python isn't the computer's own" if kind == "changed" else why)
+        return [p, "-I"] + list(cmd[1:]), interp, ()
+    try:
+        st = os.lstat(p)
+    except OSError:
+        _refuse(name, None, "it isn't there")
+    if not stat.S_ISREG(st.st_mode) or not os.access(p, os.X_OK):
+        _refuse(name, "changed", "it isn't a plain program file")
+    if not st.st_mode & stat.S_IRUSR:
+        _refuse(name, "changed", "its program file can't be read (no read permission)")
+    if not _scanner_extra(name) and not _scanner_listed(name):
+        _refuse(name, *_digest_problem(name, ""))
+    if not _launch_lock(deadline):
+        raise LaunchTimedOut()
+    no_copy = None
+    try:
+        fd, digest, venv = _sealed_copy(p, deadline)
+    except (SealUnavailable, MemoryError) as e:
+        no_copy = _program_error(e)
+    except OSError as e:   # Claude review 2 (1): by errno; out of memory or file descriptors is no verdict on the program
+        _refuse(name, *_problem_of(e))
+    finally:
+        _LAUNCH.release()
+    if no_copy:
+        # Claude review 2 (1): no sealed copy to run from, so nothing runs; the file is still hashed once (no copy) for a verdict
+        try:
+            digest = _in_hash_time(lambda: _read_program_at(p), deadline=deadline)[0]
+        except (OSError, MemoryError) as e:
+            _refuse(name, *_problem_of(e))
+        _refuse(name, *(_digest_problem(name, digest) or ("unreadable", str(no_copy))))
+    problem = _digest_problem(name, digest)
+    interp = trusted_interpreter(venv) if venv and not problem else None
+    if venv and not problem and not interp:
+        problem = _interpreter_problem()
+    if problem:
+        os.close(fd)
+        _refuse(name, *problem)
+    if venv:
+        return [venv, "-I", f"/proc/self/fd/{fd}"] + list(cmd[1:]), interp, (fd,)
+    return [p] + list(cmd[1:]), f"/proc/self/fd/{fd}", (fd,)
+
+
+def tool(name):
+    """Watchtower's own copy of a scanner (scanners/bin/<name>, where install.sh --scanners puts it), only when it is the
+    program the lock lists. Never PATH, .venv or the old bin folder. Why one isn't used is kept in SCANNER_PROBLEMS. One that
+    was refused at launch this run stays refused for the rest of it, whatever its file holds now. What runs is decided again
+    at launch (run(), scanner_launch).
+
+    Claude review 2 (3): only a refusal at launch was kept, so a swapped copy whose stage was skipped, put back before the end
+    of the run, read as verified at the last check: no WT-X005, and it counted as used. A copy found changed now stays changed
+    for the rest of the run too, and any scanner with a problem this run is in SCANNERS_HELD (not counted as used)."""
+    held = SCANNER_PROBLEMS.get(name, ())
+    if len(held) == 3 or held[:1] == ("changed",):
+        return None
+    path, problem = scanner_verdict(name)
+    if problem and problem[0]:
+        SCANNER_PROBLEMS[name] = problem
+        SCANNERS_HELD.add(name)
+    else:
+        SCANNER_PROBLEMS.pop(name, None)
+    return path
+
+
+SCANNERS_HELD = set()   # scanners that had a problem at some point this run (found by tool() or refused at launch)
+
+
+def scanner_used(name):
+    """Whether `name` counts as a scanner this run used: Watchtower's checked copy now, with no problem at any point this run."""
+    return bool(tool(name)) and name not in SCANNERS_HELD
+
+
+def reset_scanner_checks():
+    SCANNER_PROBLEMS.clear()
+    SCANNERS_HELD.clear()
+    _SCANNER_OK.clear()
+
+
+def scanner_ran_before(label):
+    used = load_json(state_path("engines_used.json"), {}) or {}
+    return any(label in (used.get(k) or []) for k in ("expected", "engines")) if isinstance(used, dict) else False
+
+
+def scanner_unavailable(name):
+    """(keep_last_results, plain line) for a scanner tool() didn't return. A copy that isn't the one installed, one not
+    listed yet, or one that ran last time and is gone now means "not checked", never "clean"; one that was never installed
+    is a plain note, as before. (False, None) means nothing to add beyond the caller's own note."""
+    label = SCANNER_NAMES.get(name, name)
+    kind, why = SCANNER_PROBLEMS.get(name, (None, ""))[:2]
+    ran = scanner_ran_before(label)
+    if kind == "changed":
+        line = f"{label} NOT run: {why}, so its checks weren't done this time and its last results are kept (WT-X005)."
+    elif kind == "unreadable":   # Claude review 1 (4): not checked, so kept and revet is blocked, but no verdict on the copy
+        line = f"{label} NOT run: {why}, so its checks weren't done this time and its last results are kept."
+    elif kind == "unlisted":
+        line = f"{label} not run: this copy is not listed in Watchtower's scanner checksums ({why}), so its last results are kept."
+    elif kind == "old-folder":
+        line = f"{label} is in Watchtower's old scanner folder; run install.sh --scanners once to move it."
+    elif ran:
+        line = f"{label} ran last time and is gone now, so its last results are kept. Run install.sh --scanners to put it back."
+    else:
+        line = None
+    return kind in ("changed", "unreadable", "unlisted") or ran, line
+
+
+def scanner_absent(notes, name, plain):
+    keep, line = scanner_unavailable(name)
+    if keep:
+        fail_note(notes, line)
+    elif line or plain:
+        notes.append(line or plain)
+
+
+def engines_blocked():
+    """Why SkillSpector and husk can't give a trusted answer this run (either changed, not listed, or gone after it ran), or None."""
+    whys = []
+    for name in ("skillspector", "husk"):
+        if not tool(name):
+            keep, line = scanner_unavailable(name)
+            if keep:
+                whys.append(line)
+    return " ".join(whys) or None
+
+
+# Codex, batch 3 final review: codescan's optional semgrep, refused at launch (exit 126) or changed, still said "semgrep
+# found and used too" and raised nothing, because only SCANNER_NAMES could be a WT-X005. It is X005-eligible too.
+X005_OPTIONAL = {"semgrep": "semgrep"}
+
+
+def scanner_x005():
+    """WT-X005, once per scanner whose copy isn't the one Watchtower installed."""
+    out = []
+    for name, problem in sorted(SCANNER_PROBLEMS.items()):
+        kind, why = problem[:2]
+        if kind != "changed" or name not in SCANNER_NAMES and name not in X005_OPTIONAL:
+            continue
+        label = SCANNER_NAMES.get(name) or X005_OPTIONAL[name]
+        put_back = (f"Put it back with `bash {home()}/app/scripts/install.sh --scanners`." if name in SCANNER_NAMES else
+                    f"install.sh doesn't install {label}: put back the copy scripts/scanner-bins.lock lists, or remove it from {scanner_bin()}.")
+        out.append(finding("WT-X005", f"Watchtower's copy of {label} isn't the one it installed", "high", ["ASI04", "AST02"],
+                           os.path.join(scanner_bin(), name), why,
+                           f"Watchtower didn't run {label}: its program file isn't the one Watchtower installed, so its checks weren't "
+                           f"done this time and its last results are kept. {put_back} "
+                           "If this comes back, something on this computer is changing Watchtower's files: tell the owner.",
+                           source="watchtower", ident=name))
+    return out
+
+
+def scanner_check():
+    """For `wt.py doctor`: what Watchtower makes of each scanner's copy, with the full sha256 to fill the lock from."""
+    out = {}
+    for name in SCANNER_NAMES:
+        path, problem = scanner_verdict(name)
+        p = os.path.join(scanner_bin(), name)
+
+        def digest():
+            try:
+                return scanner_digest(p)
+            except OSError:   # too large, too slow to read, a link or not readable (ScannerUnusable included)
+                return "unreadable"
+        if path:
+            out[name] = "verified"
+        elif problem[0] == "old-folder":
+            out[name] = "in the old folder"
+        elif problem[0] == "unlisted":
+            out[name] = f"not listed (sha256 {digest()})"
+        elif problem[0] == "unreadable":
+            out[name] = f"can't be checked now ({problem[1]})"
+        elif problem[0] == "changed":
+            out[name] = f"not the release's copy (sha256 {digest()})" if os.path.isfile(p) and not os.path.islink(p) else "not the release's copy (not a plain file)"
+        else:
+            out[name] = "missing"
+    return out
 
 
 ENGINE_BUDGET = int(os.environ.get("WT_ENGINE_BUDGET", "420"))   # seconds of engine time per run; the rest resumes next run
@@ -2813,10 +3535,15 @@ def engine_findings(skill_dirs, wt_findings, notes, user_root_dirs=(), budget=No
     budget = ENGINE_BUDGET if budget is None else budget
     ENGINE_CURRENT.clear()
     ss_exe, hk_exe = tool("skillspector"), tool("husk")
+    blocked = engines_blocked()
+    if blocked:   # batch 3 (R7): not checked is not clean. The stage is marked failed, so last run's scanner lines are kept whole
+        fail_note(notes, blocked + " SkillSpector and husk were not run this time.")
+        ENGINE_CURRENT.clear()
+        return []
     if not ss_exe:
-        notes.append("SkillSpector not installed: run install.sh --scanners for a second engine.")
+        scanner_absent(notes, "skillspector", "SkillSpector not installed: run install.sh --scanners for a second engine.")
     if not hk_exe:
-        notes.append("husk not installed: run install.sh --scanners for an obfuscation-focused engine.")
+        scanner_absent(notes, "husk", "husk not installed: run install.sh --scanners for an obfuscation-focused engine.")
     targets = []
     for d in skill_dirs:
         d = os.path.normpath(d)
@@ -3075,7 +3802,7 @@ def group_dir(fpath):
 def gitleaks_findings(roots, notes):
     exe = tool("gitleaks")
     if not exe:
-        notes.append("gitleaks not installed: secrets checked with Watchtower's rules only.")
+        scanner_absent(notes, "gitleaks", "gitleaks not installed: secrets checked with Watchtower's rules only.")
         return []
     out = []
     cfg = state_path("gitleaks.toml")
@@ -3175,7 +3902,7 @@ def user_python_packages():
 def package_findings(notes):
     exe = tool("pip-audit")
     if not exe:
-        notes.append("pip-audit not installed: installed Python packages not checked for known vulnerabilities.")
+        scanner_absent(notes, "pip-audit", "pip-audit not installed: installed Python packages not checked for known vulnerabilities.")
         return []
     pkgs = installed_python_packages()
     if not pkgs:
@@ -3214,11 +3941,10 @@ def package_findings(notes):
 
 
 def scanners_python():
-    for d in ("scanners", ".venv"):
-        py = os.path.join(home(), d, "bin", "python")
-        if os.path.isfile(py):
-            return py
-    return None
+    """Watchtower's scanner venv Python (scanners/bin/python), only when it leads to the pinned, root-owned interpreter
+    (trusted_interpreter). run() starts it as that interpreter, never through the link."""
+    py = os.path.join(scanner_bin(), "python")
+    return py if os.path.lexists(py) and trusted_interpreter(py) else None
 
 
 def self_findings(notes):
@@ -3227,11 +3953,19 @@ def self_findings(notes):
     py, exe, out = scanners_python(), tool("pip-audit"), []
     update_notes(notes)
     if not py:
+        # Codex, batch 3 round 1: a missing or refused scanner Python returned here with the stage marked finished, so last
+        # run's WT-W001 lines read as fixed. When there is a Python that isn't trusted, or there were W001 results to keep,
+        # this is "not checked", never "clean". A computer that never had the scanners stays a plain skip, as before.
+        if os.path.lexists(os.path.join(scanner_bin(), "python")) or carry(("WT-W001",)):
+            fail_note(notes, "Watchtower's own tools were NOT checked for known holes this run (its scanner Python is missing or "
+                             "isn't the computer's own); the last results are kept.")
         return out
     if not os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(py)), "LOCKED")):
         out.append(finding("WT-W002", "Watchtower's scanners were installed without the checksum lock", "low", ["ASI04", "AST02"], "watchtower scanners",
                            "no LOCKED marker", "Run `bash /workspace/watchtower/app/scripts/install.sh --scanners` again; it installs only from the lock, and stops and says why if this computer's Python doesn't fit it."))
     if not exe:
+        if scanner_unavailable("pip-audit")[0]:   # batch 3: pip-audit's own line says why; this stage's last results are kept too
+            fail_note(notes, "Watchtower's own tools were NOT checked for known holes this run (pip-audit didn't run); the last results are kept.")
         return out
     code, out_s, _ = run([py, "-m", "pip", "list", "--format", "json", "--disable-pip-version-check"], 60)
     try:
@@ -3858,6 +4592,8 @@ def roll_builtin(fs, meta, notes):
         return fs
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     installed = [n for n, t in (("SkillSpector", "skillspector"), ("husk", "husk")) if tool(t)]
+    if engines_blocked():   # batch 3 (R7): an engine that's swapped, not listed or gone never lets a change roll in on rules alone
+        return fs
     flagged = set()
     for f in fs:
         if f["rule"].startswith("WT-I") or f["severity"] not in ("critical", "high", "medium"):
@@ -4195,8 +4931,18 @@ def cmd_audit(args):
     plat = [f for f in snap["findings"] if f.get("scope") == "platform" and not f.get("guarded")]
     if plat:   # v0.7.1 item 4: Grok Bot's own files, one line each, never scored
         out["platform"] = [f"{f['rule']} {label_of(f)}: {f['title']} at {f['where']}" for f in plat][:8]
-    print(fit(out))
+    alerts = scanner_alerts(snap)
+    if alerts:
+        out["scanner_alerts"] = alerts
+    print(fit(out, keep=("scanner_alerts",)))
     return 0
+
+
+def scanner_alerts(snap):
+    """Claude review 2 (5): every open WT-X005 in its own list, which fit() never trims (like daily's decoys). Findings sort by
+    severity, then rule, so ten new critical or high findings pushed a swapped scanner's high X005 out of `new` and `top_fixes`;
+    from the next day it wasn't new, and daily never showed it again."""
+    return [compact(f) for f in snap.get("findings", []) if f.get("rule") == "WT-X005"]
 
 
 def score_change(snap, new):
@@ -4215,11 +4961,12 @@ def score_change(snap, new):
             + (f" and {len(names) - 6} more" if len(names) > 6 else "") + ". Dealing with those brings the score back."}
 
 
-def fit(obj, limit=4096):
-    """Keep the model handoff under `limit` bytes by trimming the longest list, never by cutting JSON."""
+def fit(obj, limit=4096, keep=()):
+    """Keep the model handoff under `limit` bytes by trimming the longest list, never by cutting JSON. Lists named in `keep`
+    are never trimmed."""
     obj = json.loads(json.dumps(obj))
     while len(json.dumps(obj, indent=1)) > limit:
-        lists = [(len(v), k) for k, v in obj.items() if isinstance(v, list) and v]
+        lists = [(len(v), k) for k, v in obj.items() if isinstance(v, list) and v and k not in keep]
         if not lists:
             break
         _, k = max(lists)
@@ -4236,7 +4983,7 @@ def cmd_daily(args):
     except Busy:
         print("BUSY another Watchtower run is in progress; this daily check was skipped")
         return 0
-    if snap.get("scanners_missing"):
+    if snap.get("scanners_missing") and not new and not fixed:
         print("SCANNERS_MISSING " + ", ".join(snap["scanners_missing"]) + ": run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, then `wt.py daily` again")
         return 0
     gap = list(snap.get("stages_skipped") or [])
@@ -4246,6 +4993,8 @@ def cmd_daily(args):
         return 0
     out = {"score": snap["score"], "score_line": score_line(snap)}
     out["status"] = snap_status(snap)
+    if snap.get("scanners_missing"):   # batch 3 (R7): said, but never in place of what is new (a decoy alarm included)
+        out["scanners_missing"] = snap["scanners_missing"]
     if gap:
         out["not_checked_this_run"] = gap
     out.update(score_change(snap, new))
@@ -4257,7 +5006,10 @@ def cmd_daily(args):
     if len(rest) > 10:
         out["more_new"] = f"{len(rest) - 10} more new findings not shown, none more severe than {rest[10]['severity']}. `wt.py breakdown` lists everything."
     out["fixed"] = [compact(f) for f in fixed][:10]
-    print(fit(out, limit=6000))
+    alerts = scanner_alerts(snap)
+    if alerts:
+        out["scanner_alerts"] = alerts
+    print(fit(out, limit=6000, keep=("decoys", "scanner_alerts")))
     return 0
 
 
@@ -6117,18 +6869,57 @@ def cmd_codescan(args):
                 out.append(finding("WT-WA07s", "OWASP A07:2021 Hard-coded secret", "critical", ["A07:2021"], f"{p}:{line_of(t, m.start())}",
                                    mask(m.group(0)), "Move it to an environment variable or secret store and revoke the exposed one."))
     semgrep = tool("semgrep")
-    note = "semgrep found and used too" if semgrep else "Watchtower patterns only; install semgrep for deeper analysis"
+    note = "Watchtower patterns only (semgrep isn't one of Watchtower's checked scanners)"
+    # Codex, batch 3 final review: a semgrep refused at launch (exit 126), failed (non-zero exit, time out) or with no results
+    # in its output still said "semgrep found and used too". It is "used" only after a clean exit with a results list;
+    # anything else is "not checked" (its findings, if any, are still listed) and a refused or changed copy is a WT-X005.
+    gap = f"semgrep NOT run: {SCANNER_PROBLEMS['semgrep'][1]}" if SCANNER_PROBLEMS.get("semgrep", (None,))[0] in ("changed", "unreadable") else None
     if semgrep:
-        code, so, _ = run([semgrep, "--config", "p/owasp-top-ten", "--json", "--quiet", args.path], 900)
+        # Claude review 1 (7): semgrep sends usage metrics by default when its rules come from its registry; EGRESS says none.
+        # Claude review 2 (7): and it checks semgrep.dev for a newer version by default; --disable-version-check stops that.
+        code, so, _ = run([semgrep, "--config", "p/owasp-top-ten", "--metrics=off", "--disable-version-check", "--json", "--quiet", args.path], 900)
         try:
-            for r in json.loads(so).get("results", []):
+            res = json.loads(so)
+        except ValueError:
+            res = None
+        results = res.get("results") if isinstance(res, dict) else None
+        # Claude review 1 (5): files semgrep couldn't parse or that timed out are listed in "errors", with exit 0: not a full run
+        errors = res.get("errors") if isinstance(res, dict) else None
+        # Claude review 2 (8): semgrep lists warn-level partial parses there too, routine on real code; only the rest (error
+        # level, or no level given) mean it didn't finish. Partial parses are said in half a line.
+        partial = []
+        if isinstance(errors, list):
+            partial = [e for e in errors if isinstance(e, dict) and str(e.get("level", "")).lower() in ("warn", "warning", "info")]
+            errors = [e for e in errors if not any(e is w for w in partial)]
+        for r in results if isinstance(results, list) else []:
+            if isinstance(r, dict):
                 out.append(finding("WT-WSG", f"semgrep: {r.get('check_id', '').split('.')[-1]}", (r.get("extra", {}).get("severity") or "medium").lower().replace("error", "high").replace("warning", "medium").replace("info", "low"),
                                    ["OWASP"], f"{r.get('path')}:{r.get('start', {}).get('line')}", r.get("extra", {}).get("message", "")[:120],
                                    "See the semgrep rule for the fix.", source="semgrep"))
-        except ValueError:
-            pass
-    out = sort_findings(dedupe(out))
-    print(fit({"files": len(files), "engine": note, "by_severity": by_sev(out), "findings": [compact(f) for f in out][:40]}))
+        refused = SCANNER_PROBLEMS.get("semgrep", ())
+        if len(refused) == 3:
+            gap = f"semgrep NOT run: {refused[1]}"
+        elif code == 124:
+            gap = "semgrep did NOT finish: it timed out"
+        elif code != 0 or not isinstance(results, list):
+            gap = f"semgrep did NOT finish (exit {code}" + ("" if isinstance(results, list) else ", no results") + ")"
+        elif errors:
+            gap = (f"semgrep did NOT finish ({len(errors)} errors: files it couldn't read, parse or finish in time)" if isinstance(errors, list)
+                   else "semgrep did NOT finish (it reported errors)")
+        else:
+            note = "semgrep found and used too"
+            if partial:
+                n = len({str(e.get("path") or i) for i, e in enumerate(partial)})
+                note += f" ({n} file{'s' if n != 1 else ''} only partly parsed)"
+    if gap:
+        note = f"Watchtower patterns only: {gap}, so its checks weren't done this time"
+    x005 = scanner_x005()
+    out = sort_findings(dedupe(out + x005))
+    # Claude review 1 (5): criticals sort first and fit() trims the findings list, so a swapped semgrep's WT-X005 could be cut
+    # from the handoff. It is also given in its own list, which is never trimmed (like daily's decoys).
+    print(fit({"files": len(files), "engine": note, **({"not_checked_this_run": [gap]} if gap else {}),
+               **({"scanner_alerts": [compact(f) for f in x005]} if x005 else {}),
+               "by_severity": by_sev(out), "findings": [compact(f) for f in out][:40]}, keep=("scanner_alerts",)))
     ledger({"event": "codescan", "path": args.path, "findings": len(out)})
     return 0
 
@@ -6812,6 +7603,8 @@ PLAIN = {
     "WT-X003": ("Two scanners agree a skill is dangerous", "This is rarely a false alarm.", "Tell Watchtower \"fix it\": one yes moves it out of use, and nothing is deleted. If it is a security tool of yours, the fix can keep it for 30 days.", "you"),
     "WT-W001": ("Watchtower's own tools need an update", "They live only in Watchtower's folder.", "Tell Watchtower \"update yourself\".", "auto"),
     "WT-X004": ("A scanner couldn't get through a skill", "Watchtower's own rules still checked it.", "Nothing to do; Watchtower retries it in a week.", "auto"),
+    "WT-X005": ("One of Watchtower's scanners was swapped", "Watchtower didn't run it, so its checks weren't done.",
+                "Reinstall the scanners (install.sh --scanners). If it comes back, tell the owner: something is changing Watchtower's files.", "you"),
     "WT-I004": ("A new plugin was installed", "It brought its own skills, and nothing could vet them before it arrived.",
                 "Tell Watchtower \"fix it\": one yes keeps it. If you didn't want it, remove it in the app.", "you"),
     "WT-I001": ("A skill you approved has changed", "Someone or something edited it.", "Tell Watchtower \"fix it\": it re-scans it with every engine and re-approves it if clean.", "you"),
@@ -7101,7 +7894,7 @@ def trufflehog_status(paths, notes):
     already flagged. Raw key values are dropped the moment they're read; only detector, file and status are kept."""
     exe = tool("trufflehog")
     if not exe:
-        notes.append("TruffleHog not installed: can't tell live keys from dead ones (install.sh --scanners).")
+        scanner_absent(notes, "trufflehog", "TruffleHog not installed: can't tell live keys from dead ones (install.sh --scanners).")
         return {}
     targets = sorted({p for p in paths if p and os.path.exists(p)})[:200]
     if not targets:
@@ -7215,7 +8008,7 @@ def osv_findings(roots, notes):
     a project actually uses the bad code path. High only when the worst advisory scores 7 or more."""
     exe = tool("osv-scanner")
     if not exe:
-        notes.append("OSV-Scanner not installed: Node, Go and other project dependencies not checked (install.sh --scanners).")
+        scanner_absent(notes, "osv-scanner", "OSV-Scanner not installed: Node, Go and other project dependencies not checked (install.sh --scanners).")
         return []
     pkgs, crates = {}, {}
     for r in roots:
@@ -7660,6 +8453,7 @@ def revet(dirs, approve=False):
     With approve=True a clean skill is re-approved: its fingerprints go into the baseline and a fresh copy is kept."""
     rules = load_rules()
     dirs = [os.path.normpath(d) for d in dirs]
+    reset_scanner_checks()
     per, all_fs = {}, []
     for d in dirs:
         fs = []
@@ -7674,13 +8468,16 @@ def revet(dirs, approve=False):
     eng = engine_findings(dirs, all_fs, notes) if dirs else []
     cache = load_json(state_path("engine_cache.json"), {}) or {}
     installed = [n for n, t in (("SkillSpector", "skillspector"), ("husk", "husk")) if tool(t)]
+    blocked = engines_blocked()   # batch 3 (R7): never installed re-approves on the rules alone, as before; swapped or gone never does
     base, base_status, _ = load_baseline()
     out = []
     for d in dirs:
         h = skill_dir_hash(d)
         diff = skill_diff(d)
         r = {"name": skill_name(d), "path": d, "changed": diff["summary"], "checked_by": ["Watchtower rules"] + installed}
-        if base_status == "reset":   # R4: a one-skill baseline would turn every other changed skill into a "new file"
+        if blocked:
+            r.update(result="not finished", why=blocked)
+        elif base_status == "reset":   # R4: a one-skill baseline would turn every other changed skill into a "new file"
             r.update(result="not finished", why="Watchtower's memory of approved skills was reset; nothing is re-approved until the owner starts a new baseline")
         elif os.path.normpath(d) in INCOMPLETE_SKILLS:
             r.update(result="not finished", why=f"only {INCOMPLETE_SKILLS[os.path.normpath(d)][0]} of {INCOMPLETE_SKILLS[os.path.normpath(d)][1]} files can be checked, so it can't be re-approved automatically")
@@ -8306,6 +9103,7 @@ def cmd_doctor(args):
            "workspace_exists": os.path.isdir("/workspace"), "folders": folders,
            "scanners": {n: bool(tool(t)) for n, t in (("SkillSpector", "skillspector"), ("husk", "husk"), ("gitleaks", "gitleaks"),
                                                        ("TruffleHog", "trufflehog"), ("pip-audit", "pip-audit"), ("OSV-Scanner", "osv-scanner"))},
+           "scanner_check": scanner_check(),
            "scanners_from_checksum_lock": bool(scanners_python()) and os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(scanners_python())), "LOCKED")),
            "tools": {t: bool(shutil.which(t)) for t in ("git", "curl", "npm", "pip3")},
            "state_files": {fn: state_of(fn) for fn in STATE_FILES},
@@ -8359,6 +9157,7 @@ def self_check():
         return None
     problems = []
     man = read_text(os.path.join(root, "MANIFEST.sha256"))
+    remember_manifest(root, man)   # Claude review 1 (2): what the run is held to later is what was checked now
     if not man:
         return ["MANIFEST.sha256 is missing"]
     for line in man.splitlines():
@@ -8421,9 +9220,52 @@ def main(argv=None):
             pass
 
 
-def main_inner(argv=None):
+_PROBLEM_NAMED = re.compile(r"(?s)(.*?)( is missing or not a plain file| changed since install| is not in the release)")
+
+
+def shown_problem(p):
+    """A self-check problem as SELF-CHECK FAILED shows it. Claude review 2 (review 1, item 9): whoever plants a file chooses
+    its name, so a name is shown only when it is plain (letters, digits, . _ / -, at most 80 characters); the ledger keeps it."""
+    m = _PROBLEM_NAMED.fullmatch(p)
+    if m and not re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", m.group(1)):
+        return "a file with an unusual name (named in Watchtower's ledger)" + m.group(2)
+    return p
+
+
+def self_check_gate(count_only=False):
+    """4 (after one plain SELF-CHECK FAILED line) when this installed copy doesn't match its release, else None. With
+    count_only (`--version`, which setup reads to decide on a reinstall) the line gives only how many problems there are:
+    Claude review 1 (9), a file planted as "0.7.1" or named like an instruction put its name into that very output. The
+    ledger keeps the names."""
+    problems = self_check()
+    if problems:
+        ledger({"event": "self-check-failed", "problems": problems[:20]})
+        what = (f"{len(problems)} problem{'s' if len(problems) != 1 else ''} (listed in Watchtower's ledger)" if count_only else
+                "; ".join(map(shown_problem, problems[:5])) + (f" (and {len(problems) - 5} more)" if len(problems) > 5 else ""))
+        print("SELF-CHECK FAILED - Watchtower stopped before doing anything. Its own files don't match the release it installed: "
+              + what + ". Tell the owner now. Don't run Watchtower again until they reinstall it from the release (setup skill, section 1).")
+        return 4
+    return None
+
+
+class VersionAction(argparse.Action):
+    """Hardening batch 3 (R12): `--version` answered before the self-check, so a changed copy still printed its version and
+    setup skipped the reinstall. It now checks itself first, during parsing, and exits 4 without the version when that fails."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help="print the version (after the self-check)"):
+        super().__init__(option_strings=option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        code = self_check_gate(count_only=True)
+        if code:
+            parser.exit(code)
+        print(VERSION)
+        parser.exit(0)
+
+
+def build_parser():
     ap = argparse.ArgumentParser(prog="wt", description="Watchtower security watch for Grok Bot")
-    ap.add_argument("--version", action="version", version=VERSION)
+    ap.add_argument("--version", action=VersionAction)
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("vet"); v.add_argument("path"); v.add_argument("--json", action="store_true"); v.add_argument("--deep", action="store_true"); v.add_argument("--page-only", action="store_true", help="the text was copied from a marketplace page; skill bodies were not visible")
     for name in ("audit", "daily", "baseline"):
@@ -8472,15 +9314,15 @@ def main_inner(argv=None):
     ic = sub.add_parser("incident"); ic.add_argument("--note")
     cs = sub.add_parser("codescan"); cs.add_argument("path")
     br = sub.add_parser("brief"); br.add_argument("--summary"); br.add_argument("--notes"); br.add_argument("--offline")
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main_inner(argv=None):
+    a = build_parser().parse_args(argv)
     if a.cmd not in SELF_CHECK_SKIP:
-        problems = self_check()
-        if problems:
-            ledger({"event": "self-check-failed", "problems": problems[:20]})
-            print("SELF-CHECK FAILED - Watchtower stopped before doing anything. Its own files don't match the release it installed: "
-                  + "; ".join(problems[:5]) + (f" (and {len(problems) - 5} more)" if len(problems) > 5 else "")
-                  + ". Tell the owner now. Don't run Watchtower again until they reinstall it from the release (setup skill, section 1).")
-            return 4
+        code = self_check_gate()
+        if code:
+            return code
     if a.cmd not in SELF_CHECK_SKIP:
         migrate_rollcall_state()
     return {"vet": cmd_vet, "audit": cmd_audit, "daily": cmd_daily, "baseline": cmd_baseline, "report": cmd_report, "breakdown": cmd_breakdown, "show": cmd_show, "dismiss": cmd_dismiss,

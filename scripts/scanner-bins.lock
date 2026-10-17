@@ -1,0 +1,25 @@
+# Watchtower's scanner program checksums (hardening batch 3, R7).
+#
+# Watchtower runs a scanner only from its own folder ($WATCHTOWER_HOME/scanners/bin/<name>, where `install.sh --scanners`
+# puts it) and only when the sha256 of that program file is listed here for this computer's architecture. Anything else
+# is not run, and its last results are kept: a program whose name has lines here but none that match is a high WT-X005
+# ("Watchtower's copy of <scanner> isn't the one it installed"); a name with no line for this architecture is "not listed"
+# (a plain note, no alarm). A scanner found on PATH or in any other folder is never run.
+#
+# One line per program:   <sha256>  <name>  <arch>  <note>   (fields separated by exactly two spaces)
+# scripts/scanner_lock.py is the one reader of this file, for Watchtower and publish.sh alike: a line it doesn't accept is
+# never used, and publish.sh refuses to publish with one, or without an x86_64 (or any) line for every scanner.
+#   name   skillspector, husk, gitleaks, trufflehog, osv-scanner or pip-audit (every release lists these), or semgrep
+#          (optional: codescan runs it only with a line here)
+#   arch   x86_64, aarch64, or any (used for the pip entry points, whose first line is hashed as "#!python" so the
+#          install folder doesn't change the checksum)
+#   note   free text: the version and where it came from
+#
+# How to fill it (before a release; scripts/publish.sh refuses to publish until every name has a line):
+#   1. On the main box, run a fresh `bash /workspace/watchtower/app/scripts/install.sh --scanners`.
+#   2. From the dev checkout: `WATCHTOWER_HOME=/workspace/watchtower python3 watchtower/wt.py doctor`.
+#   3. Its scanner_check gives each program's full sha256 ("not listed (sha256 ...)"). Check each against the release
+#      it was installed from, then add one line per program here and commit.
+#
+# Known gap: for the Python scanners only the entry-point file is checked here; the package code in site-packages comes
+# from scripts/scanners.lock (pip --require-hashes) at install time and is not re-checked on each run.

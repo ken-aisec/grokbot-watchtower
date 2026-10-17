@@ -36,6 +36,11 @@ CRASH = "#!/bin/sh\necho 'Segmentation fault' >&2\nexit 139\n"
 GARBAGE = "#!/bin/sh\necho '<html>502 Bad Gateway</html>'\nexit 0\n"
 
 
+def clear_scanner_checks():
+    for d in (wt.SCANNER_LOCK_EXTRA, wt.SCANNER_PROBLEMS, wt._SCANNER_OK):
+        d.clear()
+
+
 class Box(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -47,8 +52,10 @@ class Box(unittest.TestCase):
         self.ws = os.path.join(self.tmp, "workspace"); os.makedirs(self.ws, exist_ok=True)
         self.roots = [self.home, self.ws]
         self.saved = (wt.RUN_LIMIT, wt.DAILY_LIMIT, wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT)
+        clear_scanner_checks()
 
     def tearDown(self):
+        clear_scanner_checks()
         wt.RUN_LIMIT, wt.DAILY_LIMIT, wt.ENGINE_BUDGET, wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = self.saved
         for k, v in self.env.items():
             if v is None:
@@ -69,7 +76,9 @@ class Box(unittest.TestCase):
         return out
 
     def scanners(self, **override):
-        b = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(b, exist_ok=True)
+        # Batch 3: Watchtower runs only its own checked copies (scanners/bin, listed in the lock); the fakes are registered
+        # in this process only.
+        b = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"); os.makedirs(b, exist_ok=True)
         for name, body in SCANNERS.items():
             body = override.get(name.replace("-", "_"), override.get("all", body))
             p = os.path.join(b, name)
@@ -78,6 +87,7 @@ class Box(unittest.TestCase):
                     os.remove(p)
                 continue
             open(p, "w").write(body); os.chmod(p, 0o755)
+            wt.SCANNER_LOCK_EXTRA[name] = wt.scanner_digest(p)
 
     def run_cmd(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -245,7 +255,7 @@ class ScannersMisbehave(Box):
 
     def test_scanners_vanish_then_come_back(self):
         score, keys = self.baseline_run()
-        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "bin"))
+        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"))
         r = self.audit()
         self.assertTrue(r["scanners_missing"])
         self.scanners()

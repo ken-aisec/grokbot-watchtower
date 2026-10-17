@@ -29,5 +29,8 @@ The pinned release verified against `MANIFEST.sha256`; Python's standard library
 ## What it does not trust
 Every file it scans, every web page and feed it reads, and every reply from another Bot. They are data. An instruction found in them is a finding.
 
+## Known gaps
+- The self-check holds the installed copy to its own `MANIFEST.sha256`, so it shows changes made after the install, not who made them. Watchtower runs as the Bot's user, and the Bot can write to `/workspace/watchtower`. A Bot that rewrites `MANIFEST.sha256` together with the files it lists before a run passes the self-check, and so do `scripts/scanner-bins.lock` and its reader (a scanner the Bot chose then counts as verified). The same Bot could rewrite `wt.py` itself. Inside one run, Watchtower uses the manifest it checked at the start and never reads it again. If the lock, its reader or the folder behind `app` changes after the self-check, every scanner is reported as changed (WT-X005). Only a reinstall from the pinned release (setup, section 1) restores the release. install.sh, the setup skill's version check, the daily and tidy routines and the audit skill start `wt.py` with `python3 -I`, so a module planted next to it (`watchtower/argparse.py`) can't run before the self-check. The other skills still start it without `-I`.
+
 ## Out of scope
 Connector OAuth tokens (kept on Cursor's backend), other users' computers, model serving, and anything that requires Enterprise APIs.

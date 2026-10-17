@@ -34,6 +34,17 @@ def tearDownModule():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def fake_scanner(name, body):
+    """Batch 3: a stand-in scanner in Watchtower's checked folder, registered for this process (SCANNER_LOCK_EXTRA)."""
+    b = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"); os.makedirs(b, exist_ok=True)
+    p = os.path.join(b, name)
+    with open(p, "w") as f:
+        f.write(body)
+    os.chmod(p, 0o755)
+    wt.SCANNER_LOCK_EXTRA[name] = wt.scanner_digest(p)
+    return p
+
+
 def fake_key(n, alphabet="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789", seed=7):
     """Realistic-looking random key, built at test time so no key-shaped string is committed."""
     import random
@@ -534,16 +545,13 @@ class Features(unittest.TestCase):
         self.assertIn("Auto-review", todo[1]["how"])
 
     def test_live_dead_keys_drive_severity_and_links(self):
-        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
         chat = os.path.join(self.tmp, "sessions", "a.jsonl"); old = os.path.join(self.tmp, "sessions", "b.jsonl")
         os.makedirs(os.path.dirname(chat))
         open(chat, "w").write("x"); open(old, "w").write("y")
         lines = [{"DetectorName": "AWS", "Verified": True, "Raw": "SECRET-1", "SourceMetadata": {"Data": {"Filesystem": {"file": chat, "line": 1}}},
                   "ExtraData": {"rotation_guide": "https://howtorotate.com/docs/tutorials/aws/"}},
                  {"DetectorName": "Github", "Verified": False, "Raw": "SECRET-2", "SourceMetadata": {"Data": {"Filesystem": {"file": old, "line": 1}}}}]
-        fake = os.path.join(bindir, "trufflehog")
-        open(fake, "w").write("#!/bin/sh\ncat <<'EOF'\n" + "\n".join(json.dumps(l) for l in lines) + "\nEOF\n")
-        os.chmod(fake, 0o755)
+        fake_scanner("trufflehog", "#!/bin/sh\ncat <<'EOF'\n" + "\n".join(json.dumps(l) for l in lines) + "\nEOF\n")
         F = wt.finding
         fs = [F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], chat + ":1", "1 hit(s): aws-access-token", "f"),
               F("WT-S002", "gitleaks: secrets in file", "critical", ["ASI03"], old + ":1", "1 hit(s): github-pat", "f")]
@@ -614,7 +622,6 @@ class Features(unittest.TestCase):
         self.assertIn("Watchtower itself changed here", page)
 
     def test_osv_one_finding_per_package_never_critical(self):
-        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
         def res(path, sev):
             return {"source": {"path": path}, "packages": [{"package": {"name": "dompurify", "version": "3.4.15", "ecosystem": "npm"},
                     "vulnerabilities": [{"id": "GHSA-p98j"}], "groups": [{"max_severity": sev}]}]}
@@ -622,8 +629,7 @@ class Features(unittest.TestCase):
                             res("/ws/.cursor/projects/x/package-lock.json", "9.8"),
                             {"source": {"path": "/ws/a/package-lock.json"}, "packages": [{"package": {"name": "esbuild", "version": "0.18.20", "ecosystem": "npm"},
                              "vulnerabilities": [{"id": "GHSA-67mh"}], "groups": [{"max_severity": "5.3"}]}]}]}
-        fake = os.path.join(bindir, "osv-scanner")
-        open(fake, "w").write("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(data) + "\nEOF\n"); os.chmod(fake, 0o755)
+        fake_scanner("osv-scanner", "#!/bin/sh\ncat <<'EOF'\n" + json.dumps(data) + "\nEOF\n")
         ws = os.path.join(self.tmp, "ws"); os.makedirs(ws)
         fs = wt.osv_findings([ws], [])
         by = {f["title"]: f for f in fs}
@@ -652,9 +658,7 @@ class Features(unittest.TestCase):
         self.assertEqual(wt.apply_key_status([live], {}, ran=False)[0]["severity"], "critical")
 
     def test_scanner_failure_is_reported_not_swallowed(self):
-        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir)
-        fake = os.path.join(bindir, "gitleaks")
-        open(fake, "w").write("#!/bin/sh\necho 'FTL Failed to load config error=bad' >&2\nexit 1\n"); os.chmod(fake, 0o755)
+        fake_scanner("gitleaks", "#!/bin/sh\necho 'FTL Failed to load config error=bad' >&2\nexit 1\n")
         ws = os.path.join(self.tmp, "ws2"); os.makedirs(ws)
         notes = []
         self.assertEqual(wt.gitleaks_findings([ws], notes), [])
@@ -749,9 +753,8 @@ class Features(unittest.TestCase):
         self.assertEqual(len(wt.ask_first_gaps("Ask first: before sending email")), 4)
 
     def _fake_engines(self, n_skills):
-        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin"); os.makedirs(bindir, exist_ok=True)
         for name, body in (("skillspector", '#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]; stage = a[1]; out = a[a.index("--output") + 1]\nopen(os.environ["FAKE_LOG"], "a").write("ss %d\\n" % len(os.listdir(stage)))\nskills = []\nfor n in sorted(os.listdir(stage)):\n    bad = "EVIL" in open(os.path.join(stage, n, "SKILL.md")).read()\n    skills.append({"path": n, "risk_assessment": {"score": 90 if bad else 5, "recommendation": "DO_NOT_INSTALL" if bad else "INSTALL"},\n                   "issues": [{"severity": "HIGH", "category": "Exfil", "pattern": "Network Upload"}] if bad else []})\njson.dump({"multi_skill": True, "skills": skills}, open(out, "w"))\n'), ("husk", '#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]\nif a[0] == "registry":\n    stage = a[-1]; names = sorted(os.listdir(stage))\n    open(os.environ["FAKE_LOG"], "a").write("hk %d\\n" % len(names))\n    flagged = {n: 1 for n in names if "HUSK" in open(os.path.join(stage, n, "SKILL.md")).read()}\n    print(json.dumps({"scanned": len(names), "from_cache": 0, "flagged": flagged})); sys.exit(1 if flagged else 0)\nif a[0] == "package":\n    json.dump({"runs": [{"results": [{"message": {"text": "obfuscated loader"}}]}]}, open(a[a.index("--output") + 1], "w")); sys.exit(1)\n')):
-            p = os.path.join(bindir, name); open(p, "w").write(body); os.chmod(p, 0o755)
+            fake_scanner(name, body)
         self.log = os.path.join(self.tmp, "engine.log"); open(self.log, "w").close(); os.environ["FAKE_LOG"] = self.log
         root = os.path.join(self.tmp, "sand-data", "workflows"); os.makedirs(root)
         dirs = []
@@ -809,9 +812,9 @@ class Features(unittest.TestCase):
     def test_budget_is_checked_inside_a_batch(self):
         import time
         dirs = self._fake_engines(6)
-        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
+        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin", "skillspector")
         fast = open(ss).read()
-        open(ss, "w").write("#!/bin/sh\nsleep 30\n")                       # an engine that hangs
+        fake_scanner("skillspector", "#!/bin/sh\nsleep 30\n")              # an engine that hangs
         notes, t0 = [], time.monotonic()
         wt.engine_findings(dirs, [], notes, budget=1)
         self.assertLess(time.monotonic() - t0, 5)                          # stopped at the budget, not after 30s (or the old 600s)
@@ -819,7 +822,7 @@ class Features(unittest.TestCase):
         self.assertFalse(any("failed" in n for n in notes), notes)          # out of time is not a scanner failure
         self.assertEqual(wt.load_json(wt.state_path("engine_cache.json"), {}), {})   # never remembered as clean
         self.assertEqual(wt.load_json(wt.state_path("engine_tune.json"), {})["chunk"], 3)   # next try uses a smaller batch
-        open(ss, "w").write(fast)
+        fake_scanner("skillspector", fast)
         wt.engine_findings(dirs, [], [])
         self.assertEqual([l for l in self._launches() if l[0] == "ss"], [["ss", "3"], ["ss", "3"]])
         self.assertEqual(len(wt.load_json(wt.state_path("engine_cache.json"), {})), 6)
@@ -828,9 +831,9 @@ class Features(unittest.TestCase):
         dirs = self._fake_engines(3)
         for d in dirs:
             open(os.path.join(d, "SKILL.md"), "a").write("HUSK loader\n")
-        hk = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "husk")
+        hk = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin", "husk")
         body = open(hk).read()
-        open(hk, "w").write(body.replace('if a[0] == "package":', 'if a[0] == "package":\n    import time; time.sleep(1.2)'))
+        fake_scanner("husk", body.replace('if a[0] == "package":', 'if a[0] == "package":\n    import time; time.sleep(1.2)'))
         stage = os.path.join(self.tmp, "stage"); os.makedirs(stage)
         res, err = wt.husk_batch(hk, stage, wt.stage_skills(dirs, stage), timeout=2)
         self.assertIsNone(err)
@@ -885,8 +888,7 @@ class Features(unittest.TestCase):
         dirs = self._audited()
         open(os.path.join(dirs[0], "SKILL.md"), "a").write("One more line.\n")
         self.out("audit", "--roots", self.tmp, "--budget", "0")
-        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
-        open(ss, "w").write("#!/bin/sh\nexit 3\n")                                               # the engine is broken
+        fake_scanner("skillspector", "#!/bin/sh\nexit 3\n")                                      # the engine is broken
         r = wt.revet([dirs[0]], approve=True)[0]
         self.assertEqual(r["result"], "not finished")
         self.assertNotEqual(wt.load_json(wt.state_path("baseline.json"), {})[os.path.join(dirs[0], "SKILL.md")], wt.sha256_file(os.path.join(dirs[0], "SKILL.md")))
@@ -947,9 +949,9 @@ class Features(unittest.TestCase):
         import time
         dirs = self._fake_engines(6)
         open(os.path.join(dirs[4], "SKILL.md"), "a").write("JAM\n")
-        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "bin", "skillspector")
+        ss = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin", "skillspector")
         body = open(ss).read()
-        open(ss, "w").write(body.replace("skills = []", 'import time\nif any("JAM" in open(os.path.join(stage, n, "SKILL.md")).read() for n in os.listdir(stage)): time.sleep(30)\nskills = []'))
+        fake_scanner("skillspector", body.replace("skills = []", 'import time\nif any("JAM" in open(os.path.join(stage, n, "SKILL.md")).read() for n in os.listdir(stage)): time.sleep(30)\nskills = []'))
         old = (wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT); wt.ENGINE_LAUNCH_BASE, wt.ENGINE_LAUNCH_PER_SKILL, wt.ENGINE_SOLO_LIMIT = 1, 0, 1
         try:
             notes, t0 = [], time.monotonic()
@@ -1023,7 +1025,7 @@ class Features(unittest.TestCase):
 
     def test_skills_are_never_remembered_as_scanned_when_no_scanner_ran(self):
         dirs = self._fake_engines(5)
-        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "bin")
+        bindir = os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin")
         os.rename(bindir, bindir + ".gone")                                  # the scanners disappear (lost venv)
         notes = []
         self.assertEqual(wt.engine_findings(dirs, [], notes), [])
@@ -1046,7 +1048,7 @@ class Features(unittest.TestCase):
         self._fake_engines(2)
         code, o = self.out("audit", "--roots", self.tmp)
         self.assertNotIn("scanners_missing", json.loads(o))
-        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "bin"))
+        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"))
         for _ in range(2):                                                   # keeps saying so until they are back
             code, o = self.out("audit", "--roots", self.tmp)
             r = json.loads(o)
@@ -1068,7 +1070,7 @@ class Features(unittest.TestCase):
     def test_daily_says_when_scanners_are_gone(self):
         self._fake_engines(2)
         self.out("audit", "--roots", self.tmp)
-        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "bin"))
+        shutil.rmtree(os.path.join(os.environ["WATCHTOWER_HOME"], "scanners", "bin"))
         code, o = self.out("daily", "--roots", self.tmp)
         self.assertTrue(o.startswith("SCANNERS_MISSING SkillSpector, husk"), o)
 
@@ -1225,7 +1227,8 @@ def allowed(rule, target, text):
                for a in gitleaks_allowlists())
 
 
-REAL_GITLEAKS = shutil.which("gitleaks") or "/workspace/watchtower/bin/gitleaks"   # run, never changed
+REAL_GITLEAKS = shutil.which("gitleaks") or next((p for p in ("/workspace/watchtower/scanners/bin/gitleaks", "/workspace/watchtower/bin/gitleaks")
+                                                  if os.access(p, os.X_OK)), "/workspace/watchtower/bin/gitleaks")   # run, never changed
 
 
 class GitleaksFalseAlarms(unittest.TestCase):

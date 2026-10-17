@@ -7,7 +7,7 @@ description: Full security posture audit of this Grok Bot computer and roster - 
 
 1. Check the tools exist: `test -f /workspace/watchtower/app/watchtower/wt.py`. If missing, say so and offer to run setup (the watchtower-setup skill). Never reinstall silently from an unpinned source.
 1b. Save the roster you can see now (every Bot and group room) to `/workspace/watchtower/exports/roster.json` as `[{"name": "...", "kind": "bot"}, {"name": "...", "kind": "room"}]`. Roll-call findings for Bots that are no longer there are then dropped.
-2. Run `python3 /workspace/watchtower/app/watchtower/wt.py audit`. Output is compact JSON (under 4 KB): score, new findings, fixed findings, open counts by severity, top fixes, coverage notes.
+2. Run `python3 -I /workspace/watchtower/app/watchtower/wt.py audit`. Output is compact JSON (under 4 KB): score, new findings, fixed findings, open counts by severity, top fixes, coverage notes. `scanner_alerts` (never cut short) lists each of Watchtower's own scanners whose copy isn't the one it installed: say each in the reply, with its fix, whatever else is new.
 3. If the JSON has `scanners_missing`, the scanners the user agreed to at setup are gone (the computer was reset or cleaned). Say so in one line, run `bash /workspace/watchtower/app/scripts/install.sh --scanners`, and run the audit again before reporting. Never report a score from a partial scan as a drop or a gain.
 4. Reply in at most 10 lines:
    - Lead with `status` ("Act now", "Check this week" or "All good"), then the score and grade, and the change since last run. If the JSON has `why_it_dropped`, say it in one line right after the score.

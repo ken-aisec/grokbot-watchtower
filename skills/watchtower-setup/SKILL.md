@@ -10,7 +10,7 @@ The owner's first yes covers everything in sections 1 to 4: the install, the six
 Say once, up front: "Setup only writes inside /workspace/watchtower, plus three decoy files in /tmp and /var/tmp."
 
 ## 1. Install the pinned release
-Skip this section if `/workspace/watchtower/app/watchtower/wt.py` already exists and `wt.py --version` prints 0.7.1.
+Skip this section only if `/workspace/watchtower/app/watchtower/wt.py` already exists and `python3 -I /workspace/watchtower/app/watchtower/wt.py --version` exits 0 and its whole output is exactly 0.7.1 (run it with `-I`, exactly as written). Any other exit code or any other output (SELF-CHECK FAILED, an error, extra words) means install it again.
 ```bash
 mkdir -p /workspace/watchtower && cd /workspace/watchtower
 # With the commit ID from your Setup check memory (preferred: the script itself is then pinned):
